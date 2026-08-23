@@ -1,13 +1,16 @@
+use crate::tor::TorManager;
 use crate::transfer::{DownloadOffer, TransferService};
 use chrono::Utc;
 use futures_util::{stream, StreamExt};
 use keyring::Entry;
+use nostr_sdk::prelude::Connection as RelayConnection;
 use nostr_sdk::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    net::SocketAddr,
     path::PathBuf,
     str::FromStr,
     sync::{
@@ -49,6 +52,7 @@ pub struct NetworkStatus {
     pub npub: String,
     pub pubkey: String,
     pub relay_count: usize,
+    pub relays_via_tor: bool,
     pub tor_running: bool,
     pub tor_starting: bool,
     pub tor_progress: u8,
@@ -138,6 +142,7 @@ enum SignalMessage {
 pub struct NetworkService {
     db_path: PathBuf,
     transfers: Arc<TransferService>,
+    tor: Arc<TorManager>,
     app_handle: tauri::AppHandle,
     client: RwLock<Option<Client>>,
     keys: RwLock<Option<Keys>>,
@@ -145,6 +150,7 @@ pub struct NetworkService {
     trollbox_cache_lock: Mutex<()>,
     track_discussion_subscription_lock: Mutex<()>,
     connected: AtomicBool,
+    relays_via_tor: AtomicBool,
     generation: AtomicU64,
     last_error: RwLock<String>,
     trollbox_profiles: RwLock<HashMap<String, String>>,
@@ -154,11 +160,13 @@ impl NetworkService {
     pub fn new(
         db_path: PathBuf,
         transfers: Arc<TransferService>,
+        tor: Arc<TorManager>,
         app_handle: tauri::AppHandle,
     ) -> Arc<Self> {
         Arc::new(Self {
             db_path,
             transfers,
+            tor,
             app_handle,
             client: RwLock::new(None),
             keys: RwLock::new(None),
@@ -166,6 +174,7 @@ impl NetworkService {
             trollbox_cache_lock: Mutex::new(()),
             track_discussion_subscription_lock: Mutex::new(()),
             connected: AtomicBool::new(false),
+            relays_via_tor: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             last_error: RwLock::new(String::new()),
             trollbox_profiles: RwLock::new(HashMap::new()),
@@ -187,9 +196,20 @@ impl NetworkService {
         if relays.is_empty() {
             return Err("at least one Nostr relay is required".into());
         }
+        let relays_over_tor = super::get_setting(&connection, "relays_over_tor")
+            .map(|value| value == "on")
+            .unwrap_or(false);
         drop(connection);
 
-        let client = nostr_client(keys.clone());
+        let proxy = if relays_over_tor {
+            let socks_port = self.tor.start().await.map_err(|error| {
+                format!("private connection mode needs the built-in Tor: {error}")
+            })?;
+            Some(SocketAddr::from(([127, 0, 0, 1], socks_port)))
+        } else {
+            None
+        };
+        let client = nostr_client(keys.clone(), proxy);
         // Chat history is an optional local acceleration layer and must never
         // prevent the Nostr client itself from connecting.
         let _ = self.hydrate_trollbox_cache(&client).await;
@@ -228,6 +248,7 @@ impl NetworkService {
         *self.client.write().await = Some(client.clone());
         *self.keys.write().await = Some(keys);
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.relays_via_tor.store(relays_over_tor, Ordering::SeqCst);
         self.connected.store(true, Ordering::SeqCst);
         *self.last_error.write().await = String::new();
 
@@ -347,6 +368,8 @@ impl NetworkService {
             npub,
             pubkey,
             relay_count,
+            relays_via_tor: self.connected.load(Ordering::SeqCst)
+                && self.relays_via_tor.load(Ordering::SeqCst),
             tor_running: false,
             tor_starting: false,
             tor_progress: 0,
@@ -1240,12 +1263,20 @@ fn trollbox_filter(limit: usize) -> Filter {
     public_chat_filter(TROLLBOX_HASHTAG, limit)
 }
 
-fn nostr_client(keys: Keys) -> Client {
+fn nostr_client(keys: Keys, proxy: Option<SocketAddr>) -> Client {
     let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
         events: true,
         max_events: Some(LIVE_NOSTR_EVENT_LIMIT),
     });
-    Client::builder().signer(keys).database(database).build()
+    let mut builder = Client::builder().signer(keys).database(database);
+    if let Some(address) = proxy {
+        builder = builder.opts(ClientOptions::new().connection(
+            RelayConnection::new()
+                .proxy(address)
+                .target(ConnectionTarget::All),
+        ));
+    }
+    builder.build()
 }
 
 fn public_chat_filter(topic: &str, limit: usize) -> Filter {
@@ -1667,7 +1698,7 @@ mod tests {
     #[tokio::test]
     async fn public_chat_events_are_queryable_without_a_relay_echo() {
         let keys = Keys::generate();
-        let client = nostr_client(keys.clone());
+        let client = nostr_client(keys.clone(), None);
         let event = EventBuilder::new(Kind::from(TROLLBOX_MESSAGE_KIND), "hello")
             .tag(Tag::hashtag(TROLLBOX_HASHTAG))
             .sign_with_keys(&keys)

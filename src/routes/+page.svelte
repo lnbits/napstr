@@ -54,9 +54,9 @@
 
   type NativeFile = { fileId: string; filename: string; path: string; folder: string; size: number; format: string; status: string; title: string; artist: string; album: string; mime: string; license: string; description: string; tags: string };
   type NativeTransfer = { id: number; fileId: string; filename: string; size: number; progress: number; status: string; speed: string; destination: string };
-  type NativeSettings = { napstrFolder: string; nostrRelays: string; displayName: string; profileAbout: string; profilePicture: string };
+  type NativeSettings = { napstrFolder: string; nostrRelays: string; displayName: string; profileAbout: string; profilePicture: string; relaysOverTor: boolean };
   type Snapshot = { files: NativeFile[]; transfers: NativeTransfer[]; settings: NativeSettings; indexedBytes: number; native: boolean };
-  type NetworkStatus = { connected: boolean; npub: string; pubkey: string; relayCount: number; torRunning: boolean; torStarting: boolean; torProgress: number; torError: string; error: string };
+  type NetworkStatus = { connected: boolean; npub: string; pubkey: string; relayCount: number; relaysViaTor: boolean; torRunning: boolean; torStarting: boolean; torProgress: number; torError: string; error: string };
   type NetworkResult = { fileId: string; filename: string; title: string; artist: string; album: string; format: string; mime: string; size: number; license: string; description: string; tags: string; sources: SourceDetail[] };
   type PlayerTrack = { fileId: string; name: string; folder: string; artist: string; mime: string };
   type PlaybackStatus = { fileId: string; currentTime: number; duration: number; playing: boolean; ended: boolean; error: string };
@@ -90,6 +90,7 @@
   let activityMessage = 'Starting Napstr…';
   let napstrFolder = '';
   let nostrRelays = 'wss://relay.damus.io, wss://nos.lol, wss://relay.nostr.com, wss://relay.primal.net, wss://relay.snort.social, wss://nostr.mom';
+  let relaysOverTor = false;
   let displayName = 'napstr-user';
   let profileAbout = 'Sharing files privately with Napstr. napstr.net';
   let profilePicture = '';
@@ -501,6 +502,7 @@
     indexedBytes = snapshot.indexedBytes;
     napstrFolder = snapshot.settings.napstrFolder;
     nostrRelays = snapshot.settings.nostrRelays;
+    relaysOverTor = snapshot.settings.relaysOverTor;
     displayName = snapshot.settings.displayName;
     profileAbout = snapshot.settings.profileAbout;
     profilePicture = snapshot.settings.profilePicture;
@@ -760,7 +762,9 @@
     try {
       const status = await invoke<NetworkStatus>('start_network');
       applyNetworkStatus(status);
-      activityMessage = `Nostr connected · loading the most available audio from ${status.relayCount} relay(s)…`;
+      activityMessage = status.relaysViaTor
+        ? `Connected privately through Tor · loading the most available audio from ${status.relayCount} relay(s)…`
+        : `Nostr connected · loading the most available audio from ${status.relayCount} relay(s)…`;
       await search();
       if (status.torError) activityMessage = `Tor failed: ${status.torError} · click the connection panel to retry`;
     } catch (error) {
@@ -1038,7 +1042,7 @@
   async function persistSettings() {
     if (!nativeReady) return;
     try {
-      applySnapshot(await invoke<Snapshot>('save_settings', { settings: { napstrFolder, nostrRelays, displayName, profileAbout, profilePicture } }));
+      applySnapshot(await invoke<Snapshot>('save_settings', { settings: { napstrFolder, nostrRelays, displayName, profileAbout, profilePicture, relaysOverTor } }));
       if (networkConnected) await invoke('publish_profile');
       activityMessage = networkConnected ? 'Settings saved and profile published' : 'Settings saved';
     } catch (error) { activityMessage = `Could not save settings: ${String(error)}`; }
@@ -1448,7 +1452,7 @@
       {:else}
         <section class="full-panel settings-view">
           <div class="panel-title"><span></span><b>Napstr Settings</b><span></span></div>
-          <fieldset><legend>Network</legend><label><input type="checkbox" checked disabled /> Connect automatically at startup</label><label><input type="checkbox" checked disabled /> Never allow direct-IP file transfer</label><label>Nostr relays <input bind:value={nostrRelays} /></label><label>Tor <input value="Bundled, managed automatically" readonly /></label></fieldset>
+          <fieldset><legend>Network</legend><label><input type="checkbox" checked disabled /> Connect automatically at startup</label><label><input type="checkbox" checked disabled /> Never allow direct-IP file transfer</label><label><input type="checkbox" bind:checked={relaysOverTor} /> Extra privacy: reach the music network only through Tor (connecting takes longer; applies the next time you connect)</label><label>Nostr relays <input bind:value={nostrRelays} /></label><label>Tor <input value="Bundled, managed automatically" readonly /></label></fieldset>
           <fieldset><legend>Files</legend><label>Downloads and shared audio <input value={napstrFolder} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>Browse…</button></label><label>Transfer mode <select disabled><option>Whole file</option></select></label><label><input type="checkbox" checked disabled /> Downloaded audio is automatically shared</label><label><input type="checkbox" checked disabled /> Verify the complete file with SHA-256</label></fieldset>
           <div class="settings-actions"><button class="classic-button primary" onclick={persistSettings}>OK</button><button class="classic-button" onclick={refreshSnapshot}>Cancel</button><button class="classic-button" onclick={persistSettings}>Apply</button></div>
         </section>

@@ -86,6 +86,7 @@ struct Settings {
     display_name: String,
     profile_about: String,
     profile_picture: String,
+    relays_over_tor: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,6 +202,7 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         ),
         ("profile_picture", "".to_string()),
         ("profile_event_fingerprint", "".to_string()),
+        ("relays_over_tor", "off".to_string()),
     ] {
         connection
             .execute(
@@ -259,6 +261,9 @@ fn load_settings(connection: &Connection) -> Result<Settings, String> {
         display_name: get_setting(connection, "display_name")?,
         profile_about: get_setting(connection, "profile_about")?,
         profile_picture: get_setting(connection, "profile_picture")?,
+        relays_over_tor: get_setting(connection, "relays_over_tor")
+            .map(|value| value == "on")
+            .unwrap_or(false),
     })
 }
 
@@ -733,6 +738,10 @@ fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result<AppSn
         ("display_name", settings.display_name),
         ("profile_about", settings.profile_about),
         ("profile_picture", settings.profile_picture),
+        (
+            "relays_over_tor",
+            if settings.relays_over_tor { "on" } else { "off" }.to_string(),
+        ),
     ] {
         connection
             .execute(
@@ -1278,8 +1287,12 @@ pub fn run() {
             initialise_database(&db_path, &app_data)?;
             let tor = Arc::new(tor::TorManager::new(app_data, resource_dir));
             let transfers = Arc::new(transfer::TransferService::new(db_path.clone(), tor.clone()));
-            let network =
-                network::NetworkService::new(db_path.clone(), transfers, app.handle().clone());
+            let network = network::NetworkService::new(
+                db_path.clone(),
+                transfers,
+                tor.clone(),
+                app.handle().clone(),
+            );
             *setup_shutdown_services
                 .lock()
                 .map_err(|_| "shutdown service lock was poisoned")? = Some(ShutdownServices {
@@ -1492,6 +1505,21 @@ mod tests {
             get_setting(&connection, "profile_event_fingerprint").unwrap(),
             ""
         );
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn relay_privacy_defaults_to_clearnet_and_round_trips() {
+        let directory = test_directory("relay-privacy-test");
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        assert!(!load_settings(&connection).unwrap().relays_over_tor);
+        connection
+            .execute("UPDATE settings SET value='on' WHERE key='relays_over_tor'", [])
+            .unwrap();
+        assert!(load_settings(&connection).unwrap().relays_over_tor);
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }
