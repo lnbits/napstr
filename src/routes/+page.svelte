@@ -4,7 +4,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { open } from '@tauri-apps/plugin-dialog';
+  import { open, save } from '@tauri-apps/plugin-dialog';
 
   let appVersion = '…';
   const SEARCH_PAGE_SIZE = 100;
@@ -99,6 +99,12 @@
   let displayName = 'napstr-user';
   let profileAbout = 'Sharing files privately with Napstr. napstr.net';
   let profilePicture = '';
+  let backupDialog: 'export' | 'import' | null = null;
+  let backupPassphrase = '';
+  let backupPassphraseRepeat = '';
+  let backupImportPath = '';
+  let backupBusy = false;
+  let backupError = '';
   let indexedBytes = 0;
   let networkConnected = false;
   let torRunning = false;
@@ -1128,6 +1134,61 @@
     } catch (error) { activityMessage = `Could not save settings: ${String(error)}`; }
   }
 
+  function startBackupExport() {
+    if (!nativeReady) { activityMessage = 'Account backup is available in the packaged desktop app'; return; }
+    backupDialog = 'export';
+    backupPassphrase = '';
+    backupPassphraseRepeat = '';
+    backupError = '';
+  }
+
+  async function startBackupImport() {
+    if (!nativeReady) { activityMessage = 'Account restore is available in the packaged desktop app'; return; }
+    const selectedPath = await open({ multiple: false, title: 'Choose your Napstr account backup', filters: [{ name: 'Napstr backup', extensions: ['ncryptsec', 'txt'] }] });
+    if (!selectedPath || Array.isArray(selectedPath)) return;
+    backupImportPath = selectedPath;
+    backupDialog = 'import';
+    backupPassphrase = '';
+    backupError = '';
+  }
+
+  function closeBackupDialog() {
+    if (backupBusy) return;
+    backupDialog = null;
+    backupPassphrase = '';
+    backupPassphraseRepeat = '';
+    backupError = '';
+  }
+
+  async function submitBackup() {
+    backupError = '';
+    if (backupDialog === 'export') {
+      if (backupPassphrase.length < 8) { backupError = 'Use at least 8 characters.'; return; }
+      if (backupPassphrase !== backupPassphraseRepeat) { backupError = 'The passphrases do not match.'; return; }
+      const path = await save({ title: 'Save your account backup', defaultPath: 'napstr-account.ncryptsec' });
+      if (!path) return;
+      backupBusy = true;
+      try {
+        await invoke('export_identity_backup', { path, passphrase: backupPassphrase });
+        backupBusy = false;
+        closeBackupDialog();
+        activityMessage = 'Backup saved. Keep the file and the passphrase safe — there is no reset.';
+      } catch (error) { backupError = String(error); }
+      finally { backupBusy = false; }
+    } else if (backupDialog === 'import') {
+      backupBusy = true;
+      try {
+        const npub = await invoke<string>('import_identity_backup', { path: backupImportPath, passphrase: backupPassphrase });
+        identityNpub = npub;
+        backupBusy = false;
+        closeBackupDialog();
+        activityMessage = 'Account restored — reconnecting with the restored identity…';
+        await refreshSnapshot();
+      } catch (error) { backupError = String(error); }
+      finally { backupBusy = false; }
+    }
+  }
+
   const windowCommand = async (command: 'minimise_window' | 'toggle_maximise' | 'close_window') => {
     if (nativeReady) await invoke(command);
   };
@@ -1538,7 +1599,7 @@
         <section class="full-panel profile-view">
           <div class="panel-title"><span></span><b>Napstr Profile</b><span></span></div>
           <div class="profile-card"><div class="avatar"><img src="/napstr-logo.png" alt="Napstr mascot" /></div><div><h2>{displayName}</h2><p>Your dedicated Napstr Nostr identity.</p><code>{identityNpub || 'Connect to create identity'}</code><div class="profile-stats"><span><b>{sharedFiles.length}</b> shared files</span><span><b>{transfers.length}</b> transfers</span><span><b>{networkConnected ? 'Nostr online' : 'Offline'}</b></span></div></div></div>
-          <fieldset class="edit-profile"><legend>Profile</legend><label>Display name <input bind:value={displayName} /></label><label>About <input bind:value={profileAbout} /></label><label>Picture URL <input bind:value={profilePicture} placeholder="https://…" /></label><button class="classic-button primary" onclick={persistSettings}>Save profile</button></fieldset>
+          <fieldset class="edit-profile"><legend>Profile</legend><label>Display name <input bind:value={displayName} /></label><label>About <input bind:value={profileAbout} /></label><label>Picture URL <input bind:value={profilePicture} placeholder="https://…" /></label><button class="classic-button primary" onclick={persistSettings}>Save profile</button><div class="backup-actions"><button class="classic-button" onclick={startBackupExport}>Back up account…</button><button class="classic-button" onclick={() => void startBackupImport()}>Restore backup…</button></div></fieldset>
           <div class="public-panel">
             <fieldset><legend>What everyone can see</legend>
               <ul>
@@ -1606,6 +1667,27 @@
         <header class="titlebar"><div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>Public Napstr Profile</span></div><div class="window-controls"><button onclick={() => (sourceProfile = null)}>×</button></div></header>
         <div class="dialog-body"><div class="about-logo">☺</div><div><h2>{sourceProfile.displayName}</h2><p>{sourceProfile.about || 'No profile description published.'}</p><code>{sourceProfile.npub}</code></div></div>
         <div class="dialog-actions">{#if networkConnected}<button class="classic-button primary" onclick={() => sourceProfile && showSourceCatalogue(sourceProfile)}>Show their shared music</button>{/if}<button class="classic-button" onclick={() => (sourceProfile = null)}>OK</button></div>
+      </dialog>
+    </div>
+  {/if}
+
+  {#if backupDialog}
+    <div class="modal-backdrop" role="presentation" onclick={closeBackupDialog}>
+      <dialog class="dialog confirm-dialog" open aria-label={backupDialog === 'export' ? 'Back up account' : 'Restore account'} onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') closeBackupDialog(); }}>
+        <header class="titlebar"><div class="title-left"><span class="app-icon">🔑</span><span>{backupDialog === 'export' ? 'Back up account' : 'Restore account'}</span></div><div class="window-controls"><button disabled={backupBusy} onclick={closeBackupDialog}>×</button></div></header>
+        <div class="dialog-body"><div class="backup-body">
+          {#if backupDialog === 'export'}
+            <p>Choose a passphrase for the backup file. The file is useless without it.</p>
+            <label>Passphrase <input type="password" bind:value={backupPassphrase} minlength="8" autocomplete="new-password" /></label>
+            <label>Repeat <input type="password" bind:value={backupPassphraseRepeat} autocomplete="new-password" /></label>
+            <p class="backup-warning">There is no reset. If you lose the file or the passphrase, this account cannot be recovered — by anyone.</p>
+          {:else}
+            <p>This replaces the account on this computer. The current account survives only in its own backup files.</p>
+            <label>Passphrase <input type="password" bind:value={backupPassphrase} autocomplete="current-password" /></label>
+          {/if}
+          {#if backupError}<p class="backup-error">{backupError}</p>{/if}
+        </div></div>
+        <div class="dialog-actions"><button class="classic-button primary" disabled={backupBusy} onclick={() => void submitBackup()}>{backupBusy ? 'Working…' : backupDialog === 'export' ? 'Encrypt and save' : 'Replace account'}</button><button class="classic-button" disabled={backupBusy} onclick={closeBackupDialog}>Cancel</button></div>
       </dialog>
     </div>
   {/if}

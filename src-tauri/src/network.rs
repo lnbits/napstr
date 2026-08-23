@@ -331,6 +331,10 @@ impl NetworkService {
         }
     }
 
+    pub async fn clear_cached_identity(&self) {
+        *self.keys.write().await = None;
+    }
+
     pub async fn restart(self: &Arc<Self>) -> Result<NetworkStatus, String> {
         self.stop().await;
         match self.start().await {
@@ -1506,6 +1510,57 @@ pub fn load_network_transfers(connection: &Connection) -> Result<Vec<super::Tran
         .map_err(|error| error.to_string())
 }
 
+const BACKUP_SCRYPT_LOG_N: u8 = 16;
+
+pub fn encrypt_identity_backup(keys: &Keys, passphrase: &str) -> Result<String, String> {
+    encrypt_identity_backup_with_log_n(keys, passphrase, BACKUP_SCRYPT_LOG_N)
+}
+
+fn encrypt_identity_backup_with_log_n(
+    keys: &Keys,
+    passphrase: &str,
+    log_n: u8,
+) -> Result<String, String> {
+    EncryptedSecretKey::new(keys.secret_key(), passphrase, log_n, KeySecurity::Medium)
+        .map_err(|error| error.to_string())?
+        .to_bech32()
+        .map_err(|error| error.to_string())
+}
+
+pub fn decrypt_identity_backup(ncryptsec: &str, passphrase: &str) -> Result<Keys, String> {
+    let encrypted = EncryptedSecretKey::from_bech32(ncryptsec)
+        .map_err(|_| "this is not a Napstr account backup".to_string())?;
+    let secret = encrypted
+        .decrypt(passphrase)
+        .map_err(|_| "wrong passphrase for this backup".to_string())?;
+    Ok(Keys::new(secret))
+}
+
+pub fn export_identity(passphrase: &str) -> Result<String, String> {
+    let keys = load_or_create_identity()?;
+    encrypt_identity_backup(&keys, passphrase)
+}
+
+pub fn import_identity(ncryptsec: &str, passphrase: &str) -> Result<String, String> {
+    let keys = decrypt_identity_backup(ncryptsec, passphrase)?;
+    store_identity(&keys)?;
+    keys.public_key()
+        .to_bech32()
+        .map_err(|error| error.to_string())
+}
+
+fn store_identity(keys: &Keys) -> Result<(), String> {
+    let account = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref())?;
+    let entry = Entry::new("social.napstr.desktop", &account).map_err(|error| error.to_string())?;
+    let nsec = keys
+        .secret_key()
+        .to_bech32()
+        .map_err(|error| error.to_string())?;
+    entry.set_password(&nsec).map_err(|error| {
+        format!("could not store the restored identity in the operating-system keyring: {error}")
+    })
+}
+
 fn load_or_create_identity() -> Result<Keys, String> {
     if let Ok(nsec) = std::env::var("NAPSTR_NSEC") {
         return Keys::parse(&nsec).map_err(|error| error.to_string());
@@ -1673,6 +1728,21 @@ fn mime_for_format(format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_backup_round_trips_only_with_the_right_passphrase() {
+        let keys = Keys::generate();
+
+        // log_n 10 keeps the suite fast; the production wrapper only changes the work factor.
+        let backup =
+            encrypt_identity_backup_with_log_n(&keys, "correct horse battery", 10).unwrap();
+
+        assert!(backup.starts_with("ncryptsec1"));
+        let restored = decrypt_identity_backup(&backup, "correct horse battery").unwrap();
+        assert_eq!(restored.public_key(), keys.public_key());
+        assert!(decrypt_identity_backup(&backup, "wrong passphrase").is_err());
+        assert!(decrypt_identity_backup("nsec1notabackup", "correct horse battery").is_err());
+    }
 
     #[test]
     fn trollbox_uses_a_separate_public_chat_kind_and_indexed_topic() {
