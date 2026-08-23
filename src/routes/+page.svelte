@@ -121,7 +121,7 @@
   let trackDiscussionPollPending = false;
   let trackDiscussionRefreshAgain = false;
   let trackDiscussionLog: HTMLDivElement;
-  let searchAction: 'search' | 'surprise' | null = null;
+  let searchAction: 'search' | 'surprise' | 'source' | null = null;
   let rescanPending = false;
   let selectedSource = 0;
   let selectedShared: NativeFile | null = null;
@@ -877,6 +877,33 @@
     }
   }
 
+  async function showSourceCatalogue(profile: SourceDetail) {
+    if (searchAction || !networkConnected) return;
+    searchAction = 'source';
+    const label = profile.displayName || `${profile.npub.slice(0, 12)}…`;
+    searchedQuery = `Music shared by ${label}`;
+    activityMessage = `Loading everything shared by ${label}…`;
+    try {
+      const matches = await invoke<NetworkResult[]>('network_search', { query: '' });
+      const shared = matches
+        .filter((item) => item.sources.some((source) => source.pubkey === profile.pubkey))
+        .sort((left, right) => left.filename.localeCompare(right.filename));
+      results = mapNetworkFiles(shared);
+      resultsAreNetwork = true;
+      resultPage = 0;
+      selectResult(results[0] ?? null, true);
+      sourceProfile = null;
+      activeView = 'Search';
+      activityMessage = shared.length
+        ? `${shared.length} track${shared.length === 1 ? '' : 's'} shared by ${label}`
+        : `${label} is not sharing anything right now`;
+    } catch (error) {
+      activityMessage = `Could not load their shared music: ${String(error)}`;
+    } finally {
+      searchAction = null;
+    }
+  }
+
   async function startDownload() {
     const target = selected;
     if (!target) return;
@@ -1506,7 +1533,7 @@
       <dialog class="dialog" open aria-label="Napstr public profile" onclick={(e) => e.stopPropagation()}>
         <header class="titlebar"><div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>Public Napstr Profile</span></div><div class="window-controls"><button onclick={() => (sourceProfile = null)}>×</button></div></header>
         <div class="dialog-body"><div class="about-logo">☺</div><div><h2>{sourceProfile.displayName}</h2><p>{sourceProfile.about || 'No profile description published.'}</p><code>{sourceProfile.npub}</code></div></div>
-        <div class="dialog-actions"><button class="classic-button primary" onclick={() => (sourceProfile = null)}>OK</button></div>
+        <div class="dialog-actions">{#if networkConnected}<button class="classic-button primary" onclick={() => sourceProfile && showSourceCatalogue(sourceProfile)}>Show their shared music</button>{/if}<button class="classic-button" onclick={() => (sourceProfile = null)}>OK</button></div>
       </dialog>
     </div>
   {/if}
