@@ -19,6 +19,7 @@
     name: string;
     format: string;
     size: string;
+    bytes: number;
     sources: number;
     speed: string;
     length: string;
@@ -72,6 +73,8 @@
   let resultPage = 0;
   let query = '';
   let format = 'Audio only';
+  let sortKey: 'name' | 'format' | 'bytes' | 'sources' | null = null;
+  let sortDirection: 1 | -1 = 1;
   let minimumSources = 1;
   let maximumSize = '';
   let searchedQuery = 'All audio';
@@ -156,7 +159,7 @@
 
   function mapFiles(files: NativeFile[]): Result[] {
     return files.map((file, index) => ({
-      id: index + 1, name: file.filename, format: file.format, size: readableSize(file.size), sources: 1,
+      id: index + 1, name: file.filename, format: file.format, size: readableSize(file.size), bytes: file.size, sources: 1,
       speed: 'Local', length: '—', fileId: file.fileId, artist: file.artist, album: file.album, license: file.license, description: file.description, tags: file.tags
     }));
   }
@@ -167,7 +170,7 @@
       const local = localFileIds.has(file.fileId);
       return {
         id: index + 1, name: file.title || file.filename, format: file.format, size: readableSize(file.size),
-        sources: file.sources.length, speed: local ? 'Local' : 'Tor', length: '—', fileId: file.fileId,
+        bytes: file.size, sources: file.sources.length, speed: local ? 'Local' : 'Tor', length: '—', fileId: file.fileId,
         sourceDetails: file.sources, remote: !local, artist: file.artist, album: file.album,
         license: file.license, description: file.description, tags: file.tags
       };
@@ -176,6 +179,10 @@
 
   function matchesType(mime: string, fileFormat: string) {
     return mime.startsWith('audio/') && ['MP3', 'FLAC', 'WAV', 'OGG', 'OPUS'].includes(fileFormat.toUpperCase());
+  }
+
+  function matchesSelectedFormat(fileFormat: string) {
+    return format === 'Audio only' || fileFormat.toUpperCase() === format;
   }
 
   function maximumBytes() {
@@ -190,6 +197,7 @@
       item.sources.length >= minimumSources
       && item.size <= maximumBytes()
       && matchesType(item.mime, item.format)
+      && matchesSelectedFormat(item.format)
     );
   }
 
@@ -252,9 +260,37 @@
     return Math.max(1, Math.ceil(results.length / SEARCH_PAGE_SIZE));
   }
 
+  function toggleSort(key: 'name' | 'format' | 'bytes' | 'sources') {
+    if (sortKey !== key) {
+      sortKey = key;
+      sortDirection = 1;
+    } else if (sortDirection === 1) {
+      sortDirection = -1;
+    } else {
+      sortKey = null;
+      sortDirection = 1;
+    }
+    resultPage = 0;
+  }
+
+  function sortIndicator(key: 'name' | 'format' | 'bytes' | 'sources') {
+    if (sortKey !== key) return '';
+    return sortDirection === 1 ? ' ▲' : ' ▼';
+  }
+
+  function sortedResults(): Result[] {
+    const key = sortKey;
+    if (!key) return results;
+    const direction = sortDirection;
+    return [...results].sort((left, right) => {
+      if (key === 'bytes' || key === 'sources') return (left[key] - right[key]) * direction;
+      return left[key].localeCompare(right[key]) * direction;
+    });
+  }
+
   function paginatedResults() {
     const start = resultPage * SEARCH_PAGE_SIZE;
-    return results.slice(start, start + SEARCH_PAGE_SIZE);
+    return sortedResults().slice(start, start + SEARCH_PAGE_SIZE);
   }
 
   function resultRange() {
@@ -838,7 +874,7 @@
       } else if (nativeReady) {
         try {
           const matches = await invoke<NativeFile[]>('search_catalog', { query: query.trim() });
-          results = mapFiles(matches.filter((item) => minimumSources <= 1 && item.size <= maximumBytes() && matchesType(item.mime, item.format)));
+          results = mapFiles(matches.filter((item) => minimumSources <= 1 && item.size <= maximumBytes() && matchesType(item.mime, item.format) && matchesSelectedFormat(item.format)));
           resultsAreNetwork = false;
           activityMessage = `${results.length} local match(es) found`;
         } catch (error) { activityMessage = `Search failed: ${String(error)}`; }
@@ -1348,7 +1384,7 @@
             <label for="search-query">Search:</label>
             <input id="search-query" bind:value={query} placeholder="punk, rock, jazz, audiobook" />
             <label for="format">File type:</label>
-            <select id="format" bind:value={format} disabled><option>Audio only</option></select>
+            <select id="format" bind:value={format}><option>Audio only</option><option>FLAC</option><option>MP3</option><option>WAV</option><option>OGG</option><option>OPUS</option></select>
             <button class="classic-button primary search-button" type="submit" disabled={searchAction !== null} aria-busy={searchAction === 'search'}>
               {#if searchAction === 'search'}<span class="search-spinner" aria-hidden="true"></span>{/if}
               {searchAction === 'search' ? 'Searching' : 'Search'}
@@ -1369,7 +1405,7 @@
             <div class="section-caption"><span>Search results for “{searchedQuery}”</span><small>{results.length} track{results.length === 1 ? '' : 's'} found</small></div>
             <div class="table-wrap">
               <table class="file-table">
-                <thead><tr><th class="name-col">Name</th><th>Type</th><th class="number">Size</th><th class="number">Seeders</th><th>Line speed</th><th>Length</th></tr></thead>
+                <thead><tr><th class="name-col"><button class="sort-header" onclick={() => toggleSort('name')}>Name{sortIndicator('name')}</button></th><th><button class="sort-header" onclick={() => toggleSort('format')}>Type{sortIndicator('format')}</button></th><th class="number"><button class="sort-header" onclick={() => toggleSort('bytes')}>Size{sortIndicator('bytes')}</button></th><th class="number"><button class="sort-header" onclick={() => toggleSort('sources')}>Seeders{sortIndicator('sources')}</button></th><th>Line speed</th><th>Length</th></tr></thead>
                 <tbody>
                   {#each paginatedResults() as item}
                     <tr class:selected={selected?.id === item.id} onclick={() => selectResult(item)} ondblclick={activateSelected}>

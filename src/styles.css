@@ -141,6 +141,8 @@ input:focus, select:focus { outline: 1px dotted #333; outline-offset: -4px; }
 .file-table { width: 100%; border-collapse: collapse; table-layout: fixed; background: white; }
 .table-wrap .file-table thead { position: sticky; top: 0; z-index: 1; }
 .file-table th { height: 22px; padding: 3px 6px; text-align: left; font-weight: 400; color: #444; background: #d5d5d5; border: 1px solid; border-color: white #777 #777 white; white-space: nowrap; }
+.file-table th .sort-header { all: unset; display: block; width: 100%; cursor: pointer; font: inherit; color: inherit; text-align: inherit; }
+.file-table th .sort-header:focus-visible { outline: 1px dotted #444; }
 .file-table td { height: 23px; padding: 2px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-bottom: 1px solid #e4e4e4; }
 .file-table tbody tr:nth-child(even) { background: #f4f4f4; }
 .file-table tbody tr:hover { background: #d8e6ea; }
