@@ -11,7 +11,7 @@
   const VISIBLE_SEEDER_LIMIT = 100;
 
   type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox';
-  type PlayerMode = 'single' | 'folder' | 'all';
+  type PlayerMode = 'single' | 'folder' | 'all' | 'shuffle';
   type PlayerOrigin = 'search' | 'downloads' | 'shared' | 'direct';
   type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
   type Result = {
@@ -368,15 +368,21 @@
     return queue.some((item) => item.fileId === track.fileId) ? queue : [track];
   }
 
+  function shuffledQueueFrom(tracks: PlayerTrack[], current: PlayerTrack) {
+    return [current, ...shuffled(tracks.filter((item) => item.fileId !== current.fileId))];
+  }
+
   function queueForTrack(track: PlayerTrack, mode: PlayerMode, origin: PlayerOrigin = playerOrigin) {
     const library = sortedLibraryTracks();
     if (!library.some((item) => item.fileId === track.fileId)) return [track];
     const contextualQueue = contextualPlayerQueue(track, origin);
     if (origin !== 'direct') {
       if (mode === 'folder') return contextualQueue.filter((item) => item.folder === track.folder);
+      if (mode === 'shuffle') return shuffledQueueFrom(contextualQueue, track);
       return contextualQueue;
     }
     if (mode === 'all') return library;
+    if (mode === 'shuffle') return shuffledQueueFrom(library, track);
     if (mode === 'folder') return library.filter((item) => item.folder === track.folder);
     return [track];
   }
@@ -1177,7 +1183,7 @@
     desktopRuntime = '__TAURI_INTERNALS__' in window;
     if (!desktopRuntime) return;
     const savedPlayerMode = window.localStorage.getItem('napstr-player-mode');
-    if (savedPlayerMode === 'single' || savedPlayerMode === 'folder' || savedPlayerMode === 'all') playerMode = savedPlayerMode;
+    if (savedPlayerMode === 'single' || savedPlayerMode === 'folder' || savedPlayerMode === 'all' || savedPlayerMode === 'shuffle') playerMode = savedPlayerMode;
     const savedPlayerVolume = Number(window.localStorage.getItem('napstr-player-volume'));
     if (Number.isFinite(savedPlayerVolume) && savedPlayerVolume >= 0 && savedPlayerVolume <= 1) playerVolume = savedPlayerVolume;
     const savedTransferHeight = Number(window.localStorage.getItem('napstr-transfer-pane-height'));
@@ -1378,6 +1384,7 @@
           <option value="single">Stop</option>
           <option value="folder">Play folder</option>
           <option value="all">Play all</option>
+          <option value="shuffle">Shuffle</option>
         </select>
       </label>
       <label class="player-volume">Vol <input aria-label="Volume" type="range" min="0" max="1" step="0.05" value={playerVolume} oninput={changePlayerVolume} /></label>
