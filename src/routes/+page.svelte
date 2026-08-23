@@ -564,6 +564,15 @@
       const cached = JSON.parse(window.localStorage.getItem(cacheKey) ?? 'null') as { checkedAt?: number; release?: GitHubRelease | null } | null;
       cachedRelease = cached?.release ?? null;
     } catch { /* ignore invalid old cache data */ }
+    if (relaysOverTor) {
+      // The update check is a direct clearnet request; in privacy mode rely on the cache only.
+      release = cachedRelease;
+      if (typeof release?.tag_name !== 'string' || !validNapstrReleaseUrl(release.html_url)) return;
+      if (compareSemver(release.tag_name, appVersion) > 0) {
+        newRelease = { version: release.tag_name.replace(/^v/, ''), url: release.html_url };
+      }
+      return;
+    }
     try {
       const response = await fetch('https://api.github.com/repos/lnbits/napstr/releases/latest', {
         headers: { Accept: 'application/vnd.github+json' }
@@ -1110,10 +1119,12 @@
     setTransferPaneHeight(Number.isFinite(savedTransferHeight) && savedTransferHeight > 0 ? savedTransferHeight : window.innerHeight < 700 ? 94 : 119);
     const clampTransferPane = () => setTransferPaneHeight(transferPaneHeight);
     window.addEventListener('resize', clampTransferPane);
-    refreshSnapshot().then(connectNetwork);
+    const snapshotReady = refreshSnapshot();
+    void snapshotReady.then(connectNetwork);
     void getVersion()
-      .then((version) => {
+      .then(async (version) => {
         appVersion = version;
+        await snapshotReady.catch(() => undefined);
         return checkForNewRelease();
       })
       .catch(() => {
