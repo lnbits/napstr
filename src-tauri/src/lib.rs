@@ -159,6 +159,11 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
          CREATE TABLE IF NOT EXISTS blocked_pubkeys (
            pubkey TEXT PRIMARY KEY, reason TEXT NOT NULL, created_at TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS upload_stats (
+           file_id TEXT PRIMARY KEY,
+           delivered INTEGER NOT NULL DEFAULT 0,
+           last_delivered_at TEXT
+         );
          DROP TABLE IF EXISTS download_chunks;"
     ).map_err(|error| error.to_string())?;
     // Pre-release databases used these transfer fields in the library table.
@@ -1054,6 +1059,11 @@ fn save_file_tags(
 }
 
 #[tauri::command]
+async fn get_seeding_stats(state: State<'_, AppState>) -> Result<Vec<transfer::SeedingStat>, String> {
+    state.network.transfers().seeding_stats().await
+}
+
+#[tauri::command]
 async fn start_network(state: State<'_, AppState>) -> Result<network::NetworkStatus, String> {
     let tor = state.tor.clone();
     tauri::async_runtime::spawn(async move {
@@ -1334,6 +1344,7 @@ pub fn run() {
             save_settings,
             remove_transfer,
             get_transfers,
+            get_seeding_stats,
             open_napstr_folder,
             open_release_url,
             player::play_audio,
