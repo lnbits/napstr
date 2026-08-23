@@ -767,13 +767,13 @@
   async function connectNetwork() {
     if (!nativeReady || networkConnectPending) return;
     networkConnectPending = true;
-    activityMessage = 'Connecting to Nostr relays and opening encrypted inbox…';
+    activityMessage = 'Connecting to the music network and opening your encrypted inbox…';
     try {
       const status = await invoke<NetworkStatus>('start_network');
       applyNetworkStatus(status);
       activityMessage = status.relaysViaTor
-        ? `Connected privately through Tor · loading the most available audio from ${status.relayCount} relay(s)…`
-        : `Nostr connected · loading the most available audio from ${status.relayCount} relay(s)…`;
+        ? 'Connected privately through Tor · loading the most available music…'
+        : 'Connected · loading the most available music…';
       await search();
       if (status.torError) activityMessage = `Tor failed: ${status.torError} · click the connection panel to retry`;
     } catch (error) {
@@ -833,7 +833,7 @@
             .sort((left, right) => right.sources.length - left.sources.length || left.filename.localeCompare(right.filename));
           results = mapNetworkFiles(ranked);
           resultsAreNetwork = true;
-          activityMessage = `${results.length} globally aggregated file ID(s), ranked by active seeders`;
+          activityMessage = `${results.length} track(s) found across the network, most available first`;
         } catch (error) { activityMessage = `Global search failed: ${String(error)}`; }
       } else if (nativeReady) {
         try {
@@ -853,7 +853,7 @@
   async function surpriseMe() {
     if (searchAction) return;
     if (!networkConnected) {
-      activityMessage = 'Connect to Nostr before asking for a surprise';
+      activityMessage = 'Connect first, then ask for a surprise';
       return;
     }
     searchAction = 'surprise';
@@ -922,10 +922,10 @@
       startingDownloads = new Set(startingDownloads).add(target.fileId);
       transfers = [{
         id: Date.now(), fileId: target.fileId, name: target.name, size: target.size,
-        speed: 'Contacting seeders…', progress: 0, status: 'Sending encrypted NIP-17 request', destination: ''
+        speed: 'Contacting sources…', progress: 0, status: 'Sending encrypted request', destination: ''
       }, ...transfers];
       const candidateCount = Math.min(sources.length, 3);
-      activityMessage = `Racing ${candidateCount} seeder${candidateCount === 1 ? '' : 's'} for the fastest Tor connection…`;
+      activityMessage = `Asking ${candidateCount} source${candidateCount === 1 ? '' : 's'} for this track · the fastest private connection wins…`;
       try {
         await invoke('request_network_download', { fileId: target.fileId, sourcePubkeys: sources.map((source) => source.pubkey) });
         transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers'));
@@ -1303,7 +1303,7 @@
         </button>
       {/if}
       <button class="connection-box" onclick={connectNetwork} title={torError || networkError || 'Reconnect Nostr and Tor'}>
-        <span class="connection-status"><i class:amber={!networkConnected} class="led"></i><strong>{networkConnected ? 'Nostr connected' : 'Connect Nostr'}</strong></span>
+        <span class="connection-status"><i class:amber={!networkConnected} class="led"></i><strong>{networkConnected ? 'Connected' : 'Connect'}</strong></span>
         <span class="connection-status"><i class:amber={!torRunning} class:error={Boolean(torError)} class="led"></i><strong>{torStatusLabel()}</strong></span>
       </button>
       <button class="tool-button help-button" onclick={() => (aboutOpen = true)}><span class="tool-icon">?</span><span>About</span></button>
@@ -1366,7 +1366,7 @@
 
         <div class="split-content">
           <section class="results-pane" aria-label="Search results">
-            <div class="section-caption"><span>Search results for “{searchedQuery}”</span><small>{results.length} file IDs found</small></div>
+            <div class="section-caption"><span>Search results for “{searchedQuery}”</span><small>{results.length} track{results.length === 1 ? '' : 's'} found</small></div>
             <div class="table-wrap">
               <table class="file-table">
                 <thead><tr><th class="name-col">Name</th><th>Type</th><th class="number">Size</th><th class="number">Seeders</th><th>Line speed</th><th>Length</th></tr></thead>
@@ -1378,6 +1378,9 @@
                   {/each}
                 </tbody>
               </table>
+              {#if results.length === 0}
+                <p class="empty-state">{networkConnected ? 'Nothing found — try fewer or different words.' : nativeReady ? 'You are only seeing your own files. Press “Connect” at the top right to search everyone’s shared music.' : 'Starting up…'}</p>
+              {/if}
             </div>
             <div class="results-pager">
               <button onclick={() => changeResultPage(resultPage - 1)} disabled={resultPage === 0}>◀ Previous</button>
@@ -1423,7 +1426,7 @@
                   <button class="classic-button primary" type="button" disabled={!networkConnected || trackDiscussionSending || !trackDiscussionDraft.trim()} onclick={() => void sendTrackDiscussionMessage()}>{trackDiscussionSending ? '…' : 'Send'}</button>
                 </div>
               </section>
-            {:else}<p class="empty-state">Select a result to see active seeders.</p>{/if}
+            {:else}<p class="empty-state">{networkConnected ? 'Select a result to see who is sharing it right now.' : 'Not connected yet — press “Connect” at the top right to see who is sharing music.'}</p>{/if}
           </aside>
         </div>
       {:else if activeView === 'Downloads'}
