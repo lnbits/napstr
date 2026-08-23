@@ -55,7 +55,7 @@
 
   type NativeFile = { fileId: string; filename: string; path: string; folder: string; size: number; format: string; status: string; title: string; artist: string; album: string; mime: string; license: string; description: string; tags: string };
   type NativeTransfer = { id: number; fileId: string; filename: string; size: number; progress: number; status: string; speed: string; destination: string };
-  type SeedingStat = { fileId: string; delivered: number; activeGrants: number };
+  type SeedingStat = { fileId: string; delivered: number; activeGrants: number; otherSeeders: number };
   type NativeSettings = { napstrFolder: string; nostrRelays: string; displayName: string; profileAbout: string; profilePicture: string; relaysOverTor: boolean };
   type Snapshot = { files: NativeFile[]; transfers: NativeTransfer[]; settings: NativeSettings; indexedBytes: number; native: boolean };
   type NetworkStatus = { connected: boolean; npub: string; pubkey: string; relayCount: number; relaysViaTor: boolean; torRunning: boolean; torStarting: boolean; torProgress: number; torError: string; error: string };
@@ -150,7 +150,7 @@
   let stopTransferResize = () => {};
   let transfers: Transfer[] = [];
 
-  let sharedFiles: Array<NativeFile & { name: string; readableSize: string; peers: number; delivered: number }> = [];
+  let sharedFiles: Array<NativeFile & { name: string; readableSize: string; peers: number; delivered: number; otherSeeders: number }> = [];
 
   const readableSize = (bytes: number) => {
     if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
@@ -550,7 +550,7 @@
     displayName = snapshot.settings.displayName;
     profileAbout = snapshot.settings.profileAbout;
     profilePicture = snapshot.settings.profilePicture;
-    sharedFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: seedingStats[file.fileId]?.activeGrants ?? 0, delivered: seedingStats[file.fileId]?.delivered ?? 0 }));
+    sharedFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: seedingStats[file.fileId]?.activeGrants ?? 0, delivered: seedingStats[file.fileId]?.delivered ?? 0, otherSeeders: seedingStats[file.fileId]?.otherSeeders ?? 0 }));
     if (selectedShared) selectedShared = snapshot.files.find((file) => file.fileId === selectedShared?.fileId) ?? null;
     results = mapFiles(snapshot.files);
     resultPage = 0;
@@ -782,7 +782,7 @@
     try {
       const snapshot = await invoke<Snapshot>('get_snapshot');
       indexedBytes = snapshot.indexedBytes;
-      const nextFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: seedingStats[file.fileId]?.activeGrants ?? 0, delivered: seedingStats[file.fileId]?.delivered ?? 0 }));
+      const nextFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: seedingStats[file.fileId]?.activeGrants ?? 0, delivered: seedingStats[file.fileId]?.delivered ?? 0, otherSeeders: seedingStats[file.fileId]?.otherSeeders ?? 0 }));
       const removedCurrentTrack = currentTrack && !nextFiles.some((file) => file.fileId === currentTrack?.fileId);
       sharedFiles = nextFiles;
       if (selectedShared) selectedShared = nextFiles.find((file) => file.fileId === selectedShared?.fileId) ?? null;
@@ -1263,7 +1263,7 @@
         try {
           const stats = await invoke<SeedingStat[]>('get_seeding_stats');
           seedingStats = Object.fromEntries(stats.map((stat) => [stat.fileId, stat]));
-          sharedFiles = sharedFiles.map((file) => ({ ...file, peers: seedingStats[file.fileId]?.activeGrants ?? 0, delivered: seedingStats[file.fileId]?.delivered ?? 0 }));
+          sharedFiles = sharedFiles.map((file) => ({ ...file, peers: seedingStats[file.fileId]?.activeGrants ?? 0, delivered: seedingStats[file.fileId]?.delivered ?? 0, otherSeeders: seedingStats[file.fileId]?.otherSeeders ?? 0 }));
         } catch { /* seeding stats are cosmetic; the next poll retries */ }
         const previouslyComplete = new Set(transfers.filter(isCompleteTransfer).map((transfer) => transfer.fileId));
         const updated = mapTransfers(items);
@@ -1513,8 +1513,9 @@
           <div class="actionbar"><button class="classic-button" onclick={rescanSharedFolder} disabled={rescanPending}>{rescanPending ? '… Rescanning' : '↻ Rescan'}</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button><button class="classic-button" onclick={playSelectedSharedAudio} disabled={!selectedShared}>▶ Play</button><button class="classic-button" onclick={playSelectedFolder} disabled={!selectedShared}>▶ Play folder</button><button class="classic-button primary" onclick={playAllSongs} disabled={!sharedFiles.length}>▶ Play all</button><div class="spacer"></div><span>Sharing {sharedFiles.length} files · {readableSize(indexedBytes)}</span></div>
           <div class="folder-path"><b>Napstr folder:</b><input value={napstrFolder || 'No folder selected'} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>Browse…</button></div>
           <div class="library-filter"><label>View folder: <select bind:value={libraryFolderView}><option value="*">All folders</option>{#each libraryFolders() as folder}<option value={folder}>{folderName(folder)}</option>{/each}</select></label><span>{visibleSharedFiles().length} song{visibleSharedFiles().length === 1 ? '' : 's'} shown</span></div>
-          <table class="file-table shared-table"><thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Catalogue</th><th>Uploads</th></tr></thead><tbody>{#each visibleSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? 'Published' : 'Indexed'}</td><td>{file.delivered || file.peers ? `${file.delivered} delivered${file.peers ? ` · ${file.peers} active` : ''}` : '—'}</td></tr>{/each}</tbody></table>
+          <table class="file-table shared-table"><thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Catalogue</th><th>Uploads</th></tr></thead><tbody>{#each visibleSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? `Published${file.otherSeeders ? ` · +${file.otherSeeders} others` : ''}` : 'Indexed'}</td><td>{file.delivered || file.peers ? `${file.delivered} delivered${file.peers ? ` · ${file.peers} active` : ''}` : '—'}</td></tr>{/each}</tbody></table>
           <p class="privacy-note wide"><span>♜</span> Only validated MP3, FLAC, WAV, Ogg Vorbis, and Opus audio is indexed recursively. Subfolders become player folders; folder names remain local and are not published. Embedded cover artwork is allowed.</p>
+          <p class="privacy-note wide"><span>i</span> Removing a file from your folder removes only your own listing. Copies that other people already share stay available — “+N others” shows who else is offering the same file right now.</p>
         </section>
       {:else if activeView === 'Trollbox'}
         <section class="full-panel trollbox-view">

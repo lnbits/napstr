@@ -32,6 +32,7 @@ pub struct SeedingStat {
     pub file_id: String,
     pub delivered: u32,
     pub active_grants: u32,
+    pub other_seeders: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +129,7 @@ impl TransferService {
                     file_id: file_id.clone(),
                     delivered: delivered.max(0) as u32,
                     active_grants: 0,
+                    other_seeders: 0,
                 };
                 (file_id, stat)
             })
@@ -139,6 +141,7 @@ impl TransferService {
                     file_id,
                     delivered: 0,
                     active_grants: 0,
+                    other_seeders: 0,
                 })
                 .active_grants = count;
         }

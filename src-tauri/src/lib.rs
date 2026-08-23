@@ -1058,9 +1058,52 @@ fn save_file_tags(
     snapshot(&connection)
 }
 
+fn other_seeder_counts(
+    connection: &Connection,
+    own_pubkey: &str,
+) -> Result<Vec<(String, i64)>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT file_id, COUNT(DISTINCT source_pubkey) FROM remote_catalogue
+             WHERE source_pubkey != ?1 AND file_id IN (SELECT file_id FROM files)
+             GROUP BY file_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let counts = statement
+        .query_map([own_pubkey], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(counts)
+}
+
 #[tauri::command]
 async fn get_seeding_stats(state: State<'_, AppState>) -> Result<Vec<transfer::SeedingStat>, String> {
-    state.network.transfers().seeding_stats().await
+    let mut stats = state.network.transfers().seeding_stats().await?;
+    let own_pubkey = state
+        .network
+        .status()
+        .await
+        .map(|status| status.pubkey)
+        .unwrap_or_default();
+    let connection = open_db(&state)?;
+    let by_id: HashMap<String, usize> = stats
+        .iter()
+        .enumerate()
+        .map(|(index, stat)| (stat.file_id.clone(), index))
+        .collect();
+    for (file_id, count) in other_seeder_counts(&connection, &own_pubkey)? {
+        match by_id.get(&file_id) {
+            Some(&index) => stats[index].other_seeders = count.max(0) as u32,
+            None => stats.push(transfer::SeedingStat {
+                file_id,
+                delivered: 0,
+                active_grants: 0,
+                other_seeders: count.max(0) as u32,
+            }),
+        }
+    }
+    Ok(stats)
 }
 
 #[tauri::command]
@@ -1531,6 +1574,39 @@ mod tests {
             .execute("UPDATE settings SET value='on' WHERE key='relays_over_tor'", [])
             .unwrap();
         assert!(load_settings(&connection).unwrap().relays_over_tor);
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn withdrawal_reality_counts_only_foreign_seeders_of_own_files() {
+        let directory = test_directory("other-seeders-test");
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files(file_id,filename,path,size,format,indexed_at,mime)
+                 VALUES('own-file','song.flac','/tmp/song.flac',10,'FLAC','now','audio/flac')",
+                [],
+            )
+            .unwrap();
+        for (file_id, pubkey) in [
+            ("own-file", "me"),
+            ("own-file", "peer-a"),
+            ("own-file", "peer-b"),
+            ("foreign-file", "peer-a"),
+        ] {
+            connection.execute(
+                "INSERT INTO remote_catalogue(file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,event_id,seen_at)
+                 VALUES(?1,?2,'song.flac','','','','FLAC','audio/flac',10,'unspecified','event','now')",
+                params![file_id, pubkey],
+            ).unwrap();
+        }
+
+        let counts = other_seeder_counts(&connection, "me").unwrap();
+
+        assert_eq!(counts, vec![("own-file".to_string(), 2)]);
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }
