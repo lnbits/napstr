@@ -1539,7 +1539,25 @@
           <div class="panel-title"><span></span><b>Napstr Profile</b><span></span></div>
           <div class="profile-card"><div class="avatar"><img src="/napstr-logo.png" alt="Napstr mascot" /></div><div><h2>{displayName}</h2><p>Your dedicated Napstr Nostr identity.</p><code>{identityNpub || 'Connect to create identity'}</code><div class="profile-stats"><span><b>{sharedFiles.length}</b> shared files</span><span><b>{transfers.length}</b> transfers</span><span><b>{networkConnected ? 'Nostr online' : 'Offline'}</b></span></div></div></div>
           <fieldset class="edit-profile"><legend>Profile</legend><label>Display name <input bind:value={displayName} /></label><label>About <input bind:value={profileAbout} /></label><label>Picture URL <input bind:value={profilePicture} placeholder="https://…" /></label><button class="classic-button primary" onclick={persistSettings}>Save profile</button></fieldset>
-          <p class="privacy-note wide"><span>i</span> Your profile and shared catalogue are public on Nostr. Transfer addresses and credentials are never published.</p>
+          <div class="public-panel">
+            <fieldset><legend>What everyone can see</legend>
+              <ul>
+                <li>Your account key, display name, about text, and picture link</li>
+                <li>Names, sizes, formats, and tags of every file you share — downloads you keep in the Napstr folder are shared too</li>
+                <li>That you are online while the app is sharing</li>
+                <li>Every chat message, signed by this account</li>
+              </ul>
+            </fieldset>
+            <fieldset><legend>What is never published</legend>
+              <ul>
+                <li>Your internet address — transfers run through Tor</li>
+                <li>The music itself, until someone you granted downloads it</li>
+                <li>Download requests and transfer credentials — encrypted end to end</li>
+                <li>Your folder names and anything outside the Napstr folder</li>
+              </ul>
+            </fieldset>
+          </div>
+          <p class="privacy-note wide"><span>i</span> Everything public above is tied to this one account: your chat, your shared music, and your profile can be linked to each other by anyone.</p>
         </section>
       {:else}
         <section class="full-panel settings-view">
