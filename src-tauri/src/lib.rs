@@ -1047,7 +1047,7 @@ fn index_path_with_progress(
     // Small commits make verified tracks visible without holding the database
     // while the rest of a large collection is scanned.
     for entry in WalkDir::new(folder)
-        .follow_links(false)
+        .follow_links(true)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file() && supported_audio_path(entry.path()))
