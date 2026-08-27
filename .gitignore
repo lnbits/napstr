@@ -12,3 +12,14 @@ android/src-tauri/target/
 android/src-tauri/gen/
 remote-protocol/Cargo.lock
 remote-protocol/target/
+
+# Local secret hygiene
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*secrets*

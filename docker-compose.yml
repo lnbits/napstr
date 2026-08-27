@@ -1,0 +1,24 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: napstr_server_1
+      APP_PORT: 30421
+
+  server:
+    image: lnbits/napstr-umbrel:v0.1.0
+    restart: on-failure
+    stop_grace_period: 30s
+    environment:
+      - PORT=30421
+      - HOST=0.0.0.0
+      - DATA_DIR=/data
+      - MUSIC_DIR=/music
+      - STATIC_DIR=/app/build
+      - RUST_LOG=info
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+      - ${UMBREL_ROOT}/data/storage/downloads/music:/music:rw
+    ports:
+      - "30421:30421"
