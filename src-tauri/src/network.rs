@@ -9,15 +9,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::PathBuf,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::Emitter;
 use tokio::sync::{Mutex, RwLock};
@@ -25,14 +25,38 @@ use uuid::Uuid;
 
 pub const CATALOGUE_KIND: u16 = 30421;
 pub const AVAILABILITY_KIND: u16 = 30422;
+pub const AUDIOBOOK_KIND: u16 = 30423;
 const TROLLBOX_HASHTAG: &str = "napstr-trollbox";
 const TROLLBOX_MESSAGE_KIND: u16 = 9;
 const TRACK_DISCUSSION_PREFIX: &str = "napstr-";
 const TRACK_DISCUSSION_SUBSCRIPTION: &str = "napstr-track-discussion";
 const PUBLIC_CHAT_EVENT: &str = "napstr-public-chat";
+const TRANSFERS_CHANGED_EVENT: &str = "napstr-transfers-changed";
 const TROLLBOX_CACHE_LIMIT: usize = 200;
 const LIVE_NOSTR_EVENT_LIMIT: usize = 35_000;
 const MAX_SEEDER_CANDIDATES: usize = 3;
+const CATALOGUE_EVENT_PACE: Duration = Duration::from_millis(75);
+const AVAILABILITY_QUERY_LIMIT: usize = 1_000;
+const AVAILABILITY_FILE_LIMIT: usize = 50_000;
+const AVAILABILITY_CACHE_LIFETIME: Duration = Duration::from_secs(5);
+const EMPTY_SEARCH_RESULT_LIMIT: usize = 10_000;
+const EMPTY_SEARCH_PAGE_LIMIT: usize = 500;
+const CATALOGUE_IDENTIFIER_BATCH_SIZE: usize = 75;
+const CATALOGUE_IDENTIFIER_CONCURRENCY: usize = 8;
+const CATALOGUE_BROWSE_SESSION_LIFETIME: Duration = Duration::from_secs(10 * 60);
+const CATALOGUE_BROWSE_SESSION_LIMIT: usize = 8;
+const NETWORK_SEARCH_RESULT_LIMIT: usize = 500;
+const CATALOGUE_CACHE_SCAN_LIMIT: usize = 25_000;
+const CATALOGUE_SEARCH_TOKEN_LIMIT: usize = 20;
+const CATALOGUE_SEARCH_TOKEN_LENGTH: usize = 32;
+const CATALOGUE_QUERY_TOKEN_LIMIT: usize = 4;
+const AUDIOBOOK_RESULT_LIMIT: usize = 250;
+const AUDIOBOOK_CHAPTER_LIMIT: usize = 500;
+const AUDIOBOOK_MANIFEST_BYTE_LIMIT: usize = 128 * 1024;
+const CATALOGUE_SEARCH_STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "audio", "be", "by", "flac", "for", "from", "in", "is",
+    "it", "mp3", "of", "ogg", "on", "opus", "or", "the", "to", "wav", "with",
+];
 
 pub fn validate_profile_picture(value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
@@ -89,6 +113,66 @@ pub struct CatalogueResult {
     pub sources: Vec<CatalogueSource>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudiobookChapter {
+    pub position: usize,
+    pub file_id: String,
+    pub filename: String,
+    pub title: String,
+    pub format: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudiobookResult {
+    pub audiobook_id: String,
+    pub title: String,
+    pub author: String,
+    pub narrator: String,
+    pub total_size: u64,
+    pub chapters: Vec<AudiobookChapter>,
+    pub sources: Vec<CatalogueSource>,
+    pub local: bool,
+    pub local_folder: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudiobookContent {
+    protocol: String,
+    audiobook_id: String,
+    title: String,
+    author: String,
+    narrator: String,
+    total_size: u64,
+    chapters: Vec<AudiobookChapter>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogueBrowseCursor {
+    session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogueBrowsePage {
+    pub results: Vec<CatalogueResult>,
+    pub cursor: Option<CatalogueBrowseCursor>,
+    pub total_available: usize,
+}
+
+struct CatalogueBrowseSession {
+    created_at: Instant,
+    online: HashSet<(String, String)>,
+    available_by_file: HashMap<String, HashSet<String>>,
+    pending_file_ids: VecDeque<String>,
+    total_available: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrollboxMessage {
@@ -119,6 +203,21 @@ struct CatalogueContent {
     tags: String,
 }
 
+#[derive(Debug)]
+struct CachedCatalogueRecord {
+    file_id: String,
+    source_pubkey: String,
+    filename: String,
+    title: String,
+    artist: String,
+    album: String,
+    format: String,
+    mime: String,
+    size: u64,
+    tags: String,
+    event_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum SignalMessage {
@@ -139,6 +238,320 @@ enum SignalMessage {
     },
 }
 
+fn availability_search_filter() -> Filter {
+    Filter::new()
+        .kind(Kind::from(AVAILABILITY_KIND))
+        .hashtag("napstr-availability")
+        .since(Timestamp::from(
+            Utc::now().timestamp().saturating_sub(12 * 60) as u64,
+        ))
+        .limit(AVAILABILITY_QUERY_LIMIT)
+}
+
+fn catalogue_name_search_filter(query: &str) -> Filter {
+    Filter::new()
+        .kind(Kind::from(CATALOGUE_KIND))
+        .hashtag("napstr")
+        .search(query)
+        .limit(NETWORK_SEARCH_RESULT_LIMIT)
+}
+
+fn catalogue_identifier_filter(file_ids: &[String]) -> Filter {
+    Filter::new()
+        .kind(Kind::from(CATALOGUE_KIND))
+        .hashtag("napstr")
+        .identifiers(file_ids.iter().cloned())
+        .limit(file_ids.len().saturating_mul(8).clamp(1, 1_000))
+}
+
+async fn fetch_catalogue_identifiers(
+    client: &Client,
+    file_ids: &[String],
+) -> Result<(Vec<Event>, Vec<String>), String> {
+    let batches = file_ids
+        .chunks(CATALOGUE_IDENTIFIER_BATCH_SIZE)
+        .map(|batch| batch.to_vec())
+        .collect::<Vec<_>>();
+    let fetched = stream::iter(batches)
+        .map(|batch| {
+            let client = client.clone();
+            async move {
+                let result = client
+                    .fetch_events(catalogue_identifier_filter(&batch), Duration::from_secs(8))
+                    .await;
+                (batch, result)
+            }
+        })
+        .buffer_unordered(CATALOGUE_IDENTIFIER_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut successful_batches = 0usize;
+    let mut failures = Vec::new();
+    let mut retry_file_ids = Vec::new();
+    let mut events_by_id = HashMap::new();
+    for (batch, result) in fetched {
+        match result {
+            Ok(events) => {
+                successful_batches += 1;
+                for event in events.iter() {
+                    events_by_id.insert(event.id, event.clone());
+                }
+            }
+            Err(error) => {
+                failures.push(error.to_string());
+                retry_file_ids.extend(batch);
+            }
+        }
+    }
+    if successful_batches == 0 && !file_ids.is_empty() {
+        return Err(format!(
+            "catalogue identifier lookup failed: {}",
+            failures
+                .first()
+                .map(String::as_str)
+                .unwrap_or("all relay queries failed")
+        ));
+    }
+    Ok((events_by_id.into_values().collect(), retry_file_ids))
+}
+
+fn catalogue_search_tokens(fields: &[&str]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let field_tokens = fields
+        .iter()
+        .map(|field| {
+            super::search_tokens(field)
+                .into_iter()
+                .filter(|token| {
+                    token != "napstr" && !CATALOGUE_SEARCH_STOP_WORDS.contains(&token.as_str())
+                })
+                .filter(|token| token.chars().count() <= CATALOGUE_SEARCH_TOKEN_LENGTH)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    for index in 0..field_tokens.iter().map(Vec::len).max().unwrap_or(0) {
+        for field in &field_tokens {
+            if let Some(token) = field.get(index) {
+                if seen.insert(token.clone()) {
+                    tokens.push(token.clone());
+                    if tokens.len() == CATALOGUE_SEARCH_TOKEN_LIMIT {
+                        return tokens;
+                    }
+                }
+            }
+        }
+    }
+    tokens
+}
+
+fn catalogue_tag_search_filters(query: &str) -> Vec<Filter> {
+    let mut tokens = catalogue_search_tokens(&[query]);
+    tokens.sort_by(|left, right| {
+        right
+            .chars()
+            .count()
+            .cmp(&left.chars().count())
+            .then_with(|| left.cmp(right))
+    });
+    tokens
+        .into_iter()
+        .take(CATALOGUE_QUERY_TOKEN_LIMIT)
+        .map(|token| {
+            Filter::new()
+                .kind(Kind::from(CATALOGUE_KIND))
+                .custom_tag(SingleLetterTag::lowercase(Alphabet::T), token)
+                .limit(NETWORK_SEARCH_RESULT_LIMIT)
+        })
+        .collect()
+}
+
+fn catalogue_event_fingerprint(content_json: &str, search_tokens: &[String]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"napstr-catalogue-event-v1\0");
+    digest.update(content_json.as_bytes());
+    for token in search_tokens {
+        digest.update((token.len() as u64).to_be_bytes());
+        digest.update(token.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn audiobook_event_fingerprint(content_json: &str, search_tokens: &[String]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"napstr-audiobook-event-v1\0");
+    digest.update(content_json.as_bytes());
+    for token in search_tokens {
+        digest.update((token.len() as u64).to_be_bytes());
+        digest.update(token.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn audiobook_id(chapters: &[AudiobookChapter]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"napstr-audiobook-v1\0");
+    for chapter in chapters {
+        digest.update(chapter.file_id.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn valid_audiobook_event(event: &Event, content: &AudiobookContent) -> bool {
+    if event.kind != Kind::from(AUDIOBOOK_KIND)
+        || event.verify().is_err()
+        || event.tags.identifier() != Some(content.audiobook_id.as_str())
+        || !event.tags.hashtags().any(|tag| tag == "napstr-audiobook")
+        || content.protocol != "napstr/1"
+        || event.content.len() > AUDIOBOOK_MANIFEST_BYTE_LIMIT
+        || content.chapters.is_empty()
+        || content.chapters.len() > AUDIOBOOK_CHAPTER_LIMIT
+        || content.audiobook_id != audiobook_id(&content.chapters)
+        || !valid_catalogue_metadata(&[&content.title, &content.author, &content.narrator])
+        || content.title.is_empty()
+    {
+        return false;
+    }
+    let mut ids = HashSet::new();
+    let mut total_size = 0u64;
+    for (index, chapter) in content.chapters.iter().enumerate() {
+        if chapter.position != index + 1
+            || !valid_file_id(&chapter.file_id)
+            || chapter.size == 0
+            || !ids.insert(chapter.file_id.as_str())
+            || chapter.filename.contains('/')
+            || chapter.filename.contains('\\')
+            || !audio_claim_valid(&chapter.filename, &chapter.format, &chapter.mime)
+            || PathBuf::from(&chapter.filename)
+                .file_name()
+                .and_then(|value| value.to_str())
+                != Some(chapter.filename.as_str())
+            || !valid_catalogue_metadata(&[&chapter.filename, &chapter.title])
+        {
+            return false;
+        }
+        let Some(next_total) = total_size.checked_add(chapter.size) else {
+            return false;
+        };
+        total_size = next_total;
+    }
+    total_size == content.total_size
+}
+
+fn catalogue_publication_is_current(existing: Option<&String>, fingerprint: &str) -> bool {
+    existing.is_some_and(|existing| !existing.is_empty() && existing == fingerprint)
+}
+
+fn valid_file_id(file_id: &str) -> bool {
+    hex::decode(file_id)
+        .map(|bytes| bytes.len() == 32)
+        .unwrap_or(false)
+}
+
+fn valid_catalogue_metadata(values: &[&str]) -> bool {
+    values.iter().all(|value| {
+        value.chars().count() <= 256 && !value.chars().any(is_unsafe_public_chat_character)
+    })
+}
+
+fn valid_catalogue_event(event: &Event, content: &CatalogueContent) -> bool {
+    event.kind == Kind::from(CATALOGUE_KIND)
+        && event.verify().is_ok()
+        && event.tags.identifier() == Some(content.file_id.as_str())
+        && event.tags.hashtags().any(|tag| tag == "napstr")
+}
+
+fn merge_availability_events<'a>(
+    events: impl IntoIterator<Item = &'a Event>,
+    online: &mut HashSet<(String, String)>,
+    available_by_file: &mut HashMap<String, HashSet<String>>,
+) {
+    for event in events {
+        if event.kind != Kind::from(AVAILABILITY_KIND)
+            || event.verify().is_err()
+            || !event
+                .tags
+                .hashtags()
+                .any(|tag| tag == "napstr-availability")
+            || event
+                .tags
+                .expiration()
+                .map(|expires| *expires <= Timestamp::now())
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        let Ok(ids) = serde_json::from_str::<Vec<String>>(&event.content) else {
+            continue;
+        };
+        if ids.len() > 400 {
+            continue;
+        }
+        let pubkey = event.pubkey.to_hex();
+        for id in ids {
+            if !valid_file_id(&id) {
+                continue;
+            }
+            if online.len() >= AVAILABILITY_FILE_LIMIT {
+                return;
+            }
+            online.insert((pubkey.clone(), id.clone()));
+            available_by_file
+                .entry(id)
+                .or_default()
+                .insert(pubkey.clone());
+        }
+    }
+}
+
+fn merge_catalogue_result(
+    aggregated: &mut HashMap<String, CatalogueResult>,
+    content: CatalogueContent,
+    catalogue_tags: String,
+    source: CatalogueSource,
+) {
+    let catalogue_name = content.filename.clone();
+    let catalogue_title = if content.title.is_empty() {
+        catalogue_name.clone()
+    } else {
+        content.title.clone()
+    };
+    aggregated
+        .entry(content.file_id.clone())
+        .and_modify(|item| {
+            if !item
+                .sources
+                .iter()
+                .any(|existing| existing.pubkey == source.pubkey)
+            {
+                item.sources.push(source.clone());
+            }
+            if item.tags.is_empty() {
+                item.tags = catalogue_tags.clone();
+            }
+        })
+        .or_insert(CatalogueResult {
+            file_id: content.file_id,
+            filename: catalogue_name,
+            title: catalogue_title,
+            artist: content.artist,
+            album: content.album,
+            format: content.format,
+            mime: content.mime,
+            size: content.size,
+            license: "unspecified".into(),
+            description: String::new(),
+            tags: catalogue_tags,
+            sources: vec![source],
+        });
+}
+
+struct AvailabilitySnapshot {
+    fetched_at: Instant,
+    online: HashSet<(String, String)>,
+    available_by_file: HashMap<String, HashSet<String>>,
+}
+
 pub struct NetworkService {
     db_path: PathBuf,
     transfers: Arc<TransferService>,
@@ -147,6 +560,15 @@ pub struct NetworkService {
     client: RwLock<Option<Client>>,
     keys: RwLock<Option<Keys>>,
     start_lock: Mutex<()>,
+    catalogue_publish_lock: Mutex<()>,
+    catalogue_publish_requested: AtomicBool,
+    catalogue_availability_requested: AtomicBool,
+    catalogue_reconcile_requested: AtomicBool,
+    catalogue_pending_ids: StdMutex<HashSet<String>>,
+    catalogue_publish_worker_running: AtomicBool,
+    catalogue_browse_sessions: Mutex<HashMap<String, CatalogueBrowseSession>>,
+    availability_cache: RwLock<Option<Arc<AvailabilitySnapshot>>>,
+    availability_fetch_lock: Mutex<()>,
     trollbox_cache_lock: Mutex<()>,
     track_discussion_subscription_lock: Mutex<()>,
     connected: AtomicBool,
@@ -171,6 +593,15 @@ impl NetworkService {
             client: RwLock::new(None),
             keys: RwLock::new(None),
             start_lock: Mutex::new(()),
+            catalogue_publish_lock: Mutex::new(()),
+            catalogue_publish_requested: AtomicBool::new(false),
+            catalogue_availability_requested: AtomicBool::new(false),
+            catalogue_reconcile_requested: AtomicBool::new(false),
+            catalogue_pending_ids: StdMutex::new(HashSet::new()),
+            catalogue_publish_worker_running: AtomicBool::new(false),
+            catalogue_browse_sessions: Mutex::new(HashMap::new()),
+            availability_cache: RwLock::new(None),
+            availability_fetch_lock: Mutex::new(()),
             trollbox_cache_lock: Mutex::new(()),
             track_discussion_subscription_lock: Mutex::new(()),
             connected: AtomicBool::new(false),
@@ -183,6 +614,134 @@ impl NetworkService {
 
     pub fn transfers(&self) -> &Arc<TransferService> {
         &self.transfers
+    }
+
+    async fn availability_snapshot(
+        &self,
+        client: &Client,
+    ) -> Result<Arc<AvailabilitySnapshot>, String> {
+        if let Some(snapshot) = self.availability_cache.read().await.as_ref() {
+            if snapshot.fetched_at.elapsed() < AVAILABILITY_CACHE_LIFETIME {
+                return Ok(snapshot.clone());
+            }
+        }
+        // Coalesce track and audiobook searches started by the same UI action
+        // into one relay heartbeat query.
+        let _fetch_guard = self.availability_fetch_lock.lock().await;
+        if let Some(snapshot) = self.availability_cache.read().await.as_ref() {
+            if snapshot.fetched_at.elapsed() < AVAILABILITY_CACHE_LIFETIME {
+                return Ok(snapshot.clone());
+            }
+        }
+        let events = client
+            .fetch_events(availability_search_filter(), Duration::from_secs(6))
+            .await
+            .map_err(|error| format!("availability search failed: {error}"))?;
+        let mut snapshot = AvailabilitySnapshot {
+            fetched_at: Instant::now(),
+            online: HashSet::new(),
+            available_by_file: HashMap::new(),
+        };
+        merge_availability_events(
+            events.iter(),
+            &mut snapshot.online,
+            &mut snapshot.available_by_file,
+        );
+        let snapshot = Arc::new(snapshot);
+        *self.availability_cache.write().await = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub fn queue_catalogue_publish(self: &Arc<Self>, force_availability: bool) {
+        self.catalogue_reconcile_requested
+            .store(true, Ordering::SeqCst);
+        self.queue_catalogue_work(std::iter::empty(), force_availability);
+    }
+
+    pub fn queue_catalogue_files(self: &Arc<Self>, file_ids: impl IntoIterator<Item = String>) {
+        self.queue_catalogue_work(file_ids, false);
+    }
+
+    fn queue_catalogue_work(
+        self: &Arc<Self>,
+        file_ids: impl IntoIterator<Item = String>,
+        force_availability: bool,
+    ) {
+        if let Ok(mut pending) = self.catalogue_pending_ids.lock() {
+            pending.extend(file_ids);
+        } else {
+            self.catalogue_reconcile_requested
+                .store(true, Ordering::SeqCst);
+        }
+        self.catalogue_publish_requested
+            .store(true, Ordering::SeqCst);
+        if force_availability {
+            self.catalogue_availability_requested
+                .store(true, Ordering::SeqCst);
+        }
+        if !self.connected.load(Ordering::SeqCst)
+            || self
+                .catalogue_publish_worker_running
+                .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let service = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut retry_delay = 1u64;
+            while service.connected.load(Ordering::SeqCst)
+                && service
+                    .catalogue_publish_requested
+                    .swap(false, Ordering::SeqCst)
+            {
+                let force_availability = service
+                    .catalogue_availability_requested
+                    .swap(false, Ordering::SeqCst);
+                let reconcile = service
+                    .catalogue_reconcile_requested
+                    .swap(false, Ordering::SeqCst);
+                let pending_ids = service
+                    .catalogue_pending_ids
+                    .lock()
+                    .map(|mut pending| pending.drain().collect::<HashSet<_>>())
+                    .unwrap_or_default();
+                match service
+                    .publish_catalogue_once(&pending_ids, reconcile, force_availability)
+                    .await
+                {
+                    Ok(_) => {
+                        retry_delay = 1;
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                    Err(_) => {
+                        if let Ok(mut pending) = service.catalogue_pending_ids.lock() {
+                            pending.extend(pending_ids);
+                        }
+                        if reconcile {
+                            service
+                                .catalogue_reconcile_requested
+                                .store(true, Ordering::SeqCst);
+                        }
+                        service
+                            .catalogue_publish_requested
+                            .store(true, Ordering::SeqCst);
+                        service
+                            .catalogue_availability_requested
+                            .store(true, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(retry_delay)).await;
+                        retry_delay = (retry_delay * 2).min(30);
+                    }
+                }
+            }
+            service
+                .catalogue_publish_worker_running
+                .store(false, Ordering::SeqCst);
+            if service.connected.load(Ordering::SeqCst)
+                && service.catalogue_publish_requested.load(Ordering::SeqCst)
+            {
+                service.queue_catalogue_work(std::iter::empty(), false);
+            }
+        });
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<NetworkStatus, String> {
@@ -306,7 +865,7 @@ impl NetworkService {
             }
         });
 
-        self.publish_catalogue().await?;
+        self.queue_catalogue_publish(true);
         let heartbeat = self.clone();
         tokio::spawn(async move {
             while heartbeat.connected.load(Ordering::SeqCst)
@@ -382,25 +941,73 @@ impl NetworkService {
         })
     }
 
-    pub async fn publish_catalogue(&self) -> Result<usize, String> {
+    async fn publish_catalogue_once(
+        &self,
+        pending_ids: &HashSet<String>,
+        reconcile: bool,
+        force_availability: bool,
+    ) -> Result<usize, String> {
+        let _publish_guard = self.catalogue_publish_lock.lock().await;
         let client = self
             .client
             .read()
             .await
             .clone()
             .ok_or("Nostr is not connected")?;
-        let files = load_publish_files(&self.db_path)?;
+        let db_path = self.db_path.clone();
+        let pending_ids = pending_ids.clone();
+        let (files, published_fingerprints, audiobooks, published_audiobooks) =
+            tauri::async_runtime::spawn_blocking(move || {
+                let files = if reconcile {
+                    load_publish_files(&db_path)?
+                } else {
+                    load_publish_files_by_id(&db_path, &pending_ids)?
+                };
+                let published_fingerprints = if reconcile {
+                    load_published_fingerprints(&db_path)?
+                } else {
+                    load_published_fingerprints_by_id(&db_path, &pending_ids)?
+                };
+                // File events can be published progressively while a scan is
+                // running. Collection manifests describe the complete ordered
+                // set, so rebuilding them for every 50-file batch only creates
+                // transient editions and relay churn. The scan's final
+                // reconciliation (and explicit audiobook edits) handles them.
+                let (audiobooks, published_audiobooks) = if reconcile {
+                    let connection = super::open_connection(&db_path)?;
+                    (
+                        super::build_local_audiobooks(&connection)?,
+                        load_published_audiobooks(&connection)?,
+                    )
+                } else {
+                    (Vec::new(), HashMap::new())
+                };
+                Ok::<_, String>((
+                    files,
+                    published_fingerprints,
+                    audiobooks,
+                    published_audiobooks,
+                ))
+            })
+            .await
+            .map_err(|error| format!("catalogue preparation task failed: {error}"))??;
         if !files.is_empty() {
             let transfers = self.transfers.clone();
             tokio::spawn(async move {
                 let _ = transfers.warm_for_sharing().await;
             });
         }
+        let publication_db = super::open_connection(&self.db_path)?;
         let current_ids: HashSet<String> = files.iter().map(|file| file.0.clone()).collect();
-        let stale = load_published_ids(&self.db_path)?
-            .into_iter()
-            .filter(|id| !current_ids.contains(id))
-            .collect::<Vec<_>>();
+        let stale = if reconcile {
+            published_fingerprints
+                .keys()
+                .filter(|id| !current_ids.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         for file_id in stale {
             let tags = vec![
                 Tag::parse(["d", file_id.as_str()]),
@@ -419,22 +1026,26 @@ impl NetworkService {
                 )
                 .await
                 .map_err(|error| format!("catalogue withdrawal failed: {error}"))?;
-            super::open_connection(&self.db_path)?
+            publication_db
                 .execute(
                     "DELETE FROM published_catalogue WHERE file_id=?1",
                     [&file_id],
                 )
                 .map_err(|error| error.to_string())?;
+            tokio::time::sleep(CATALOGUE_EVENT_PACE).await;
         }
         let mut published = 0;
-        for (file_id, filename, size, format, mime, catalogue_tags) in files {
+        let mut published_ids = Vec::new();
+        for (file_id, filename, size, format, mime, catalogue_tags, title, artist, album) in files {
+            let search_tokens =
+                catalogue_search_tokens(&[&filename, &title, &artist, &album, &catalogue_tags]);
             let content = CatalogueContent {
                 protocol: "napstr/1".into(),
                 file_id: file_id.clone(),
                 filename: filename.clone(),
-                title: filename.clone(),
-                artist: String::new(),
-                album: String::new(),
+                title,
+                artist,
+                album,
                 format: format.clone(),
                 mime: if mime.is_empty() || mime == "application/octet-stream" {
                     mime_for_format(&format)
@@ -446,7 +1057,14 @@ impl NetworkService {
                 description: String::new(),
                 tags: catalogue_tags,
             };
-            let tags = vec![
+            let content_json =
+                serde_json::to_string(&content).map_err(|error| error.to_string())?;
+            let fingerprint = catalogue_event_fingerprint(&content_json, &search_tokens);
+            if catalogue_publication_is_current(published_fingerprints.get(&file_id), &fingerprint)
+            {
+                continue;
+            }
+            let mut tags = vec![
                 Tag::parse(["d", file_id.as_str()]),
                 Tag::parse(["t", "napstr"]),
                 Tag::parse(["x", file_id.as_str()]),
@@ -458,20 +1076,135 @@ impl NetworkService {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
+            for token in search_tokens {
+                tags.push(Tag::parse(["t", token.as_str()]).map_err(|error| error.to_string())?);
+            }
+            client
+                .send_event_builder(
+                    EventBuilder::new(Kind::from(CATALOGUE_KIND), content_json).tags(tags),
+                )
+                .await
+                .map_err(|error| format!("catalogue publication failed for {filename}: {error}"))?;
+            publication_db.execute("INSERT OR REPLACE INTO published_catalogue(file_id,published_at,fingerprint) VALUES (?1,?2,?3)", params![file_id, Utc::now().to_rfc3339(), fingerprint]).map_err(|error| error.to_string())?;
+            published += 1;
+            published_ids.push(file_id);
+            tokio::time::sleep(CATALOGUE_EVENT_PACE).await;
+        }
+        let current_folders = audiobooks
+            .iter()
+            .map(|book| book.local_folder.clone())
+            .collect::<HashSet<_>>();
+        for (folder, (audiobook_id, _)) in published_audiobooks
+            .iter()
+            .filter(|(folder, _)| !current_folders.contains(*folder))
+        {
+            let tags = vec![
+                Tag::parse(["d", audiobook_id.as_str()]),
+                Tag::parse(["t", "napstr-audiobook"]),
+            ]
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
             client
                 .send_event_builder(
                     EventBuilder::new(
-                        Kind::from(CATALOGUE_KIND),
-                        serde_json::to_string(&content).map_err(|error| error.to_string())?,
+                        Kind::from(AUDIOBOOK_KIND),
+                        r#"{"protocol":"napstr/1","deleted":true}"#,
                     )
                     .tags(tags),
                 )
                 .await
-                .map_err(|error| format!("catalogue publication failed for {filename}: {error}"))?;
-            super::open_connection(&self.db_path)?.execute("INSERT OR REPLACE INTO published_catalogue(file_id,published_at) VALUES (?1,?2)", params![file_id, Utc::now().to_rfc3339()]).map_err(|error| error.to_string())?;
-            published += 1;
+                .map_err(|error| format!("audiobook withdrawal failed: {error}"))?;
+            publication_db
+                .execute("DELETE FROM published_audiobooks WHERE folder=?1", [folder])
+                .map_err(|error| error.to_string())?;
         }
-        self.publish_availability().await?;
+        for book in audiobooks {
+            if let Some((old_id, _)) = published_audiobooks.get(&book.local_folder) {
+                if old_id != &book.audiobook_id {
+                    let tags = vec![
+                        Tag::parse(["d", old_id.as_str()]),
+                        Tag::parse(["t", "napstr-audiobook"]),
+                    ]
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                    client
+                        .send_event_builder(
+                            EventBuilder::new(
+                                Kind::from(AUDIOBOOK_KIND),
+                                r#"{"protocol":"napstr/1","deleted":true}"#,
+                            )
+                            .tags(tags),
+                        )
+                        .await
+                        .map_err(|error| {
+                            format!("old audiobook edition withdrawal failed: {error}")
+                        })?;
+                }
+            }
+            let content = AudiobookContent {
+                protocol: "napstr/1".into(),
+                audiobook_id: book.audiobook_id.clone(),
+                title: book.title.clone(),
+                author: book.author.clone(),
+                narrator: book.narrator.clone(),
+                total_size: book.total_size,
+                chapters: book.chapters.clone(),
+            };
+            let content_json =
+                serde_json::to_string(&content).map_err(|error| error.to_string())?;
+            let mut search_values = vec![
+                book.title.as_str(),
+                book.author.as_str(),
+                book.narrator.as_str(),
+            ];
+            search_values.extend(
+                book.chapters
+                    .iter()
+                    .flat_map(|chapter| [chapter.title.as_str(), chapter.filename.as_str()]),
+            );
+            let search_tokens = catalogue_search_tokens(&search_values);
+            let fingerprint = audiobook_event_fingerprint(&content_json, &search_tokens);
+            if published_audiobooks
+                .get(&book.local_folder)
+                .is_some_and(|(id, existing)| id == &book.audiobook_id && existing == &fingerprint)
+            {
+                continue;
+            }
+            let mut tags = vec![
+                Tag::parse(["d", book.audiobook_id.as_str()]),
+                Tag::parse(["t", "napstr-audiobook"]),
+                Tag::parse(["x", book.audiobook_id.as_str()]),
+                Tag::parse(["title", book.title.as_str()]),
+                Tag::parse(["alt", "Napstr audiobook manifest"]),
+            ]
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+            for token in search_tokens {
+                tags.push(Tag::parse(["t", token.as_str()]).map_err(|error| error.to_string())?);
+            }
+            client
+                .send_event_builder(
+                    EventBuilder::new(Kind::from(AUDIOBOOK_KIND), content_json).tags(tags),
+                )
+                .await
+                .map_err(|error| {
+                    format!("audiobook publication failed for {}: {error}", book.title)
+                })?;
+            publication_db.execute(
+                "INSERT OR REPLACE INTO published_audiobooks(folder,audiobook_id,fingerprint,published_at) VALUES(?1,?2,?3,?4)",
+                params![book.local_folder, book.audiobook_id, fingerprint, Utc::now().to_rfc3339()],
+            ).map_err(|error| error.to_string())?;
+            tokio::time::sleep(CATALOGUE_EVENT_PACE).await;
+        }
+        if force_availability {
+            self.publish_availability().await?;
+        } else if !published_ids.is_empty() {
+            self.publish_availability_delta(&client, &published_ids)
+                .await?;
+        }
         Ok(published)
     }
 
@@ -799,10 +1532,17 @@ impl NetworkService {
             .await
             .clone()
             .ok_or("Nostr is not connected")?;
-        let ids = load_publish_files(&self.db_path)?
-            .into_iter()
-            .map(|file| file.0)
-            .collect::<Vec<_>>();
+        let db_path = self.db_path.clone();
+        let ids = tauri::async_runtime::spawn_blocking(move || {
+            Ok::<_, String>(
+                load_publish_files(&db_path)?
+                    .into_iter()
+                    .map(|file| file.0)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await
+        .map_err(|error| format!("availability preparation task failed: {error}"))??;
         let expiration = (Utc::now().timestamp() + 10 * 60).to_string();
         let batches: Vec<&[String]> = if ids.is_empty() {
             vec![&[]]
@@ -829,80 +1569,615 @@ impl NetworkService {
                 )
                 .await
                 .map_err(|error| format!("availability heartbeat failed: {error}"))?;
+            tokio::time::sleep(CATALOGUE_EVENT_PACE).await;
+        }
+        Ok(())
+    }
+
+    async fn publish_availability_delta(
+        &self,
+        client: &Client,
+        ids: &[String],
+    ) -> Result<(), String> {
+        let expiration = (Utc::now().timestamp() + 10 * 60).to_string();
+        let delta_id = Uuid::new_v4().to_string();
+        for (index, batch) in ids.chunks(400).enumerate() {
+            let batch_id = format!("availability-delta-{delta_id}-{index:04}");
+            let tags = vec![
+                Tag::parse(["d", batch_id.as_str()]),
+                Tag::parse(["t", "napstr-availability"]),
+                Tag::parse(["expiration", expiration.as_str()]),
+            ]
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+            client
+                .send_event_builder(
+                    EventBuilder::new(
+                        Kind::from(AVAILABILITY_KIND),
+                        serde_json::to_string(batch).map_err(|error| error.to_string())?,
+                    )
+                    .tags(tags),
+                )
+                .await
+                .map_err(|error| format!("incremental availability failed: {error}"))?;
+            tokio::time::sleep(CATALOGUE_EVENT_PACE).await;
         }
         Ok(())
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<CatalogueResult>, String> {
+        let browse = query.trim().is_empty().then_some((
+            None,
+            EMPTY_SEARCH_PAGE_LIMIT,
+            EMPTY_SEARCH_RESULT_LIMIT,
+        ));
+        self.search_inner(query, browse)
+            .await
+            .map(|(results, _, _)| results)
+    }
+
+    pub async fn browse(
+        &self,
+        cursor: Option<CatalogueBrowseCursor>,
+        limit: usize,
+        cache_limit: usize,
+    ) -> Result<CatalogueBrowsePage, String> {
+        let (results, cursor, total_available) = self
+            .search_inner("", Some((cursor, limit, cache_limit)))
+            .await?;
+        Ok(CatalogueBrowsePage {
+            results,
+            cursor,
+            total_available,
+        })
+    }
+
+    pub async fn search_audiobooks(&self, query: &str) -> Result<Vec<AudiobookResult>, String> {
         let client = self
             .client
             .read()
             .await
             .clone()
             .ok_or("Nostr is not connected")?;
-        let catalogue_query = client.fetch_events(
-            Filter::new()
-                .kind(Kind::from(CATALOGUE_KIND))
-                .hashtag("napstr")
-                .limit(10_000),
-            Duration::from_secs(10),
-        );
-        let availability_query = client.fetch_events(
-            Filter::new()
-                .kind(Kind::from(AVAILABILITY_KIND))
-                .hashtag("napstr-availability")
-                .since(Timestamp::from(
-                    Utc::now().timestamp().saturating_sub(12 * 60) as u64,
-                ))
-                .limit(5_000),
-            Duration::from_secs(6),
-        );
-        let (events, availability) = tokio::join!(catalogue_query, availability_query);
-        let events = events.map_err(|error| format!("catalogue search failed: {error}"))?;
-        let availability =
-            availability.map_err(|error| format!("availability search failed: {error}"))?;
-        let mut online: HashSet<(String, String)> = HashSet::new();
-        for event in availability.iter() {
-            if event
-                .tags
-                .expiration()
-                .map(|expires| *expires <= Timestamp::now())
-                .unwrap_or(true)
+        let query = query.trim();
+        // Treat the singular/plural media name as a type browse rather than a
+        // literal title query. This makes searches for "audiobook" and
+        // "audiobooks" return the audiobook catalogue itself.
+        let query = if query.eq_ignore_ascii_case("audiobook")
+            || query.eq_ignore_ascii_case("audiobooks")
+        {
+            ""
+        } else {
+            query
+        };
+        let mut filters = Vec::new();
+        if query.is_empty() {
+            filters.push(
+                Filter::new()
+                    .kind(Kind::from(AUDIOBOOK_KIND))
+                    .hashtag("napstr-audiobook")
+                    .limit(AUDIOBOOK_RESULT_LIMIT),
+            );
+        } else {
+            filters.push(
+                Filter::new()
+                    .kind(Kind::from(AUDIOBOOK_KIND))
+                    .search(query)
+                    .limit(AUDIOBOOK_RESULT_LIMIT),
+            );
+            filters.extend(
+                catalogue_search_tokens(&[query])
+                    .into_iter()
+                    .take(CATALOGUE_QUERY_TOKEN_LIMIT)
+                    .map(|token| {
+                        Filter::new()
+                            .kind(Kind::from(AUDIOBOOK_KIND))
+                            .custom_tag(SingleLetterTag::lowercase(Alphabet::T), token)
+                            .limit(AUDIOBOOK_RESULT_LIMIT)
+                    }),
+            );
+        }
+        let manifest_query = stream::iter(filters)
+            .map(|filter| {
+                let client = client.clone();
+                async move {
+                    client
+                        .fetch_events(filter, Duration::from_secs(8))
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            })
+            .buffer_unordered(CATALOGUE_QUERY_TOKEN_LIMIT + 2)
+            .collect::<Vec<_>>();
+        let availability_query = self.availability_snapshot(&client);
+        let (manifest_results, availability) = tokio::join!(manifest_query, availability_query);
+        let mut events_by_id = HashMap::new();
+        let mut failures = Vec::new();
+        for result in manifest_results {
+            match result {
+                Ok(events) => {
+                    for event in events.iter() {
+                        events_by_id.insert(event.id, event.clone());
+                    }
+                }
+                Err(error) => failures.push(error),
+            }
+        }
+        if events_by_id.is_empty() && !failures.is_empty() {
+            return Err(format!("audiobook search failed: {}", failures[0]));
+        }
+        let availability = availability
+            .map_err(|error| format!("audiobook availability search failed: {error}"))?;
+        let online = &availability.online;
+        let mut connection = super::open_connection(&self.db_path)?;
+        let blocked_files = load_blocked_values(&connection, "blocked_files", "file_id")?;
+        let blocked_pubkeys = load_blocked_values(&connection, "blocked_pubkeys", "pubkey")?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let mut aggregated: HashMap<String, AudiobookResult> = HashMap::new();
+        for event in events_by_id.values() {
+            let Ok(content) = serde_json::from_str::<AudiobookContent>(&event.content) else {
+                continue;
+            };
+            if !valid_audiobook_event(event, &content)
+                || content
+                    .chapters
+                    .iter()
+                    .any(|chapter| blocked_files.contains(&chapter.file_id))
+                || (!query.is_empty()
+                    && !super::search_matches(
+                        query,
+                        &content
+                            .chapters
+                            .iter()
+                            .flat_map(|chapter| [chapter.title.as_str(), chapter.filename.as_str()])
+                            .chain([
+                                content.title.as_str(),
+                                content.author.as_str(),
+                                content.narrator.as_str(),
+                            ])
+                            .collect::<Vec<_>>(),
+                    ))
             {
                 continue;
             }
-            if let Ok(ids) = serde_json::from_str::<Vec<String>>(&event.content) {
-                for id in ids {
-                    online.insert((event.pubkey.to_hex(), id));
+            let pubkey = event.pubkey.to_hex();
+            if blocked_pubkeys.contains(&pubkey)
+                || !content
+                    .chapters
+                    .iter()
+                    .all(|chapter| online.contains(&(pubkey.clone(), chapter.file_id.clone())))
+            {
+                continue;
+            }
+            let source = CatalogueSource {
+                pubkey: pubkey.clone(),
+                npub: event.pubkey.to_bech32().unwrap_or_else(|_| pubkey.clone()),
+                display_name: short_key(&pubkey),
+                relay: String::new(),
+                about: String::new(),
+                picture: String::new(),
+                event_id: event.id.to_hex(),
+            };
+            let content_json =
+                serde_json::to_string(&content).map_err(|error| error.to_string())?;
+            transaction.execute(
+                "INSERT OR REPLACE INTO remote_audiobooks(audiobook_id,source_pubkey,content,event_id,seen_at) VALUES(?1,?2,?3,?4,?5)",
+                params![content.audiobook_id, pubkey, content_json, event.id.to_hex(), Utc::now().to_rfc3339()],
+            ).map_err(|error| error.to_string())?;
+            for chapter in &content.chapters {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO remote_catalogue(file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'unspecified','','audiobook',?10,?11)",
+                    params![chapter.file_id, pubkey, chapter.filename, chapter.title, content.author, content.title, chapter.format, chapter.mime, chapter.size as i64, event.id.to_hex(), Utc::now().to_rfc3339()],
+                ).map_err(|error| error.to_string())?;
+            }
+            aggregated
+                .entry(content.audiobook_id.clone())
+                .and_modify(|book| {
+                    if !book
+                        .sources
+                        .iter()
+                        .any(|existing| existing.pubkey == source.pubkey)
+                    {
+                        book.sources.push(source.clone());
+                    }
+                })
+                .or_insert(AudiobookResult {
+                    audiobook_id: content.audiobook_id,
+                    title: content.title,
+                    author: content.author,
+                    narrator: content.narrator,
+                    total_size: content.total_size,
+                    chapters: content.chapters,
+                    sources: vec![source],
+                    local: false,
+                    local_folder: String::new(),
+                });
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        let mut books = aggregated.into_values().collect::<Vec<_>>();
+        books.sort_by(|left, right| {
+            right
+                .sources
+                .len()
+                .cmp(&left.sources.len())
+                .then_with(|| left.title.cmp(&right.title))
+        });
+        Ok(books)
+    }
+
+    async fn search_inner(
+        &self,
+        query: &str,
+        browse: Option<(Option<CatalogueBrowseCursor>, usize, usize)>,
+    ) -> Result<(Vec<CatalogueResult>, Option<CatalogueBrowseCursor>, usize), String> {
+        let client = self
+            .client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?;
+        let query = query.trim();
+        let browse_result_limit = browse.as_ref().map(|(_, limit, _)| *limit);
+        let mut requested_file_ids = HashSet::new();
+        let mut requested_file_id_order = Vec::new();
+        let mut events_by_id: HashMap<EventId, Event> = HashMap::new();
+        let mut catalogue_search_error = None;
+        let mut next_browse_cursor = None;
+        let mut online: HashSet<(String, String)>;
+        let mut available_by_file: HashMap<String, HashSet<String>>;
+        let mut continuation_session: Option<(String, CatalogueBrowseSession)> = None;
+        let mut initial_browse_cache_limit = EMPTY_SEARCH_RESULT_LIMIT;
+        let is_initial_browse = query.is_empty()
+            && browse
+                .as_ref()
+                .map(|(cursor, _, _)| cursor.is_none())
+                .unwrap_or(true);
+
+        if query.is_empty() {
+            let (cursor, limit, cache_limit) =
+                browse.unwrap_or((None, EMPTY_SEARCH_PAGE_LIMIT, EMPTY_SEARCH_RESULT_LIMIT));
+            initial_browse_cache_limit = cache_limit.clamp(1, EMPTY_SEARCH_RESULT_LIMIT);
+            if let Some(cursor) = cursor {
+                Uuid::parse_str(&cursor.session_id)
+                    .map_err(|_| "invalid catalogue browse cursor".to_string())?;
+                let mut sessions = self.catalogue_browse_sessions.lock().await;
+                sessions.retain(|_, session| {
+                    session.created_at.elapsed() < CATALOGUE_BROWSE_SESSION_LIFETIME
+                });
+                let mut session = sessions.remove(&cursor.session_id).ok_or_else(|| {
+                    "catalogue browse session expired; run the empty search again".to_string()
+                })?;
+                drop(sessions);
+                let page_size = limit.clamp(1, EMPTY_SEARCH_PAGE_LIMIT);
+                while requested_file_id_order.len() < page_size {
+                    let Some(file_id) = session.pending_file_ids.pop_front() else {
+                        break;
+                    };
+                    requested_file_ids.insert(file_id.clone());
+                    requested_file_id_order.push(file_id);
+                }
+                online = session.online.clone();
+                available_by_file = session.available_by_file.clone();
+                match fetch_catalogue_identifiers(&client, &requested_file_id_order).await {
+                    Ok((events, retry_file_ids)) => {
+                        for event in events {
+                            events_by_id.insert(event.id, event);
+                        }
+                        session.pending_file_ids.extend(retry_file_ids);
+                    }
+                    Err(error) => {
+                        for file_id in requested_file_id_order.iter().rev() {
+                            session.pending_file_ids.push_front(file_id.clone());
+                        }
+                        self.catalogue_browse_sessions
+                            .lock()
+                            .await
+                            .insert(cursor.session_id, session);
+                        return Err(error);
+                    }
+                }
+                continuation_session = Some((cursor.session_id, session));
+            } else {
+                let availability = self.availability_snapshot(&client).await?;
+                online = availability.online.clone();
+                available_by_file = availability.available_by_file.clone();
+            }
+        } else {
+            let availability_query = self.availability_snapshot(&client);
+            let mut filters = vec![catalogue_name_search_filter(query)];
+            filters.extend(catalogue_tag_search_filters(query));
+            let search_query = stream::iter(filters)
+                .map(|filter| {
+                    let client = client.clone();
+                    async move {
+                        client
+                            .fetch_events(filter, Duration::from_secs(8))
+                            .await
+                            .map_err(|error| error.to_string())
+                    }
+                })
+                .buffer_unordered(CATALOGUE_QUERY_TOKEN_LIMIT + 1)
+                .collect::<Vec<_>>();
+            let (availability, fetched) = tokio::join!(availability_query, search_query);
+            let mut successful_queries = 0usize;
+            let mut failures = Vec::new();
+            for result in fetched {
+                match result {
+                    Ok(events) => {
+                        successful_queries += 1;
+                        for event in events.iter() {
+                            events_by_id.insert(event.id, event.clone());
+                        }
+                    }
+                    Err(error) => failures.push(error),
+                }
+            }
+            if successful_queries == 0 {
+                catalogue_search_error = Some(format!(
+                    "catalogue search failed: {}",
+                    failures
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("all relay queries failed")
+                ));
+            }
+            let availability = availability?;
+            online = availability.online.clone();
+            available_by_file = availability.available_by_file.clone();
+            let authors = events_by_id
+                .values()
+                .map(|event| event.pubkey)
+                .collect::<HashSet<_>>();
+            if !authors.is_empty() {
+                let targeted_limit = (authors.len() * 8).clamp(8, AVAILABILITY_QUERY_LIMIT);
+                if let Ok(targeted) = client
+                    .fetch_events(
+                        availability_search_filter()
+                            .authors(authors)
+                            .limit(targeted_limit),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                {
+                    merge_availability_events(targeted.iter(), &mut online, &mut available_by_file);
                 }
             }
         }
+
         let mut aggregated: HashMap<String, CatalogueResult> = HashMap::new();
         let connection = super::open_connection(&self.db_path)?;
-        for event in events.iter() {
+        let blocked_files = {
+            let mut statement = connection
+                .prepare("SELECT file_id FROM blocked_files")
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        let blocked_pubkeys = {
+            let mut statement = connection
+                .prepare("SELECT pubkey FROM blocked_pubkeys")
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        let mut total_available = available_by_file
+            .iter()
+            .filter(|(file_id, sources)| {
+                !blocked_files.contains(*file_id)
+                    && sources
+                        .iter()
+                        .any(|source| !blocked_pubkeys.contains(source))
+            })
+            .count();
+        if let Some((_, session)) = &continuation_session {
+            total_available = session.total_available;
+        } else if is_initial_browse {
+            let mut ranked_ids = available_by_file
+                .iter()
+                .filter(|(file_id, sources)| {
+                    !blocked_files.contains(*file_id)
+                        && sources
+                            .iter()
+                            .any(|source| !blocked_pubkeys.contains(source))
+                })
+                .map(|(file_id, sources)| {
+                    let active_sources = sources
+                        .iter()
+                        .filter(|source| !blocked_pubkeys.contains(*source))
+                        .count();
+                    (file_id.clone(), active_sources)
+                })
+                .collect::<Vec<_>>();
+            ranked_ids.sort_by(|(left_id, left_sources), (right_id, right_sources)| {
+                right_sources
+                    .cmp(left_sources)
+                    .then_with(|| left_id.cmp(right_id))
+            });
+            requested_file_id_order = ranked_ids
+                .into_iter()
+                .take(initial_browse_cache_limit)
+                .map(|(file_id, _)| file_id)
+                .collect();
+            requested_file_ids.extend(requested_file_id_order.iter().cloned());
+            available_by_file.retain(|file_id, _| requested_file_ids.contains(file_id));
+            online.retain(|(_, file_id)| requested_file_ids.contains(file_id));
+        }
+
+        // Previously verified relay events are an acceleration cache, not the
+        // source of availability truth. Only rows paired with a fresh heartbeat
+        // are eligible, and named searches are verified locally again.
+        let cached = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT file_id,source_pubkey,filename,title,artist,album,format,mime,size,tags,event_id
+                 FROM remote_catalogue ORDER BY seen_at DESC LIMIT ?1",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([CATALOGUE_CACHE_SCAN_LIMIT as i64], |row| {
+                    let size = row.get::<_, i64>(8)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        size,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.filter_map(|row| match row {
+                Ok((
+                    file_id,
+                    source_pubkey,
+                    filename,
+                    title,
+                    artist,
+                    album,
+                    format,
+                    mime,
+                    size,
+                    tags,
+                    event_id,
+                )) if size >= 0 => Some(Ok(CachedCatalogueRecord {
+                    file_id,
+                    source_pubkey,
+                    filename,
+                    title,
+                    artist,
+                    album,
+                    format,
+                    mime,
+                    size: size as u64,
+                    tags,
+                    event_id,
+                })),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+        };
+        let mut cached_source_pairs = HashSet::new();
+        for cached in cached {
+            if blocked_files.contains(&cached.file_id)
+                || blocked_pubkeys.contains(&cached.source_pubkey)
+                || !online.contains(&(cached.source_pubkey.clone(), cached.file_id.clone()))
+                || (!query.is_empty()
+                    && !super::search_matches(
+                        query,
+                        &[
+                            &cached.filename,
+                            &cached.title,
+                            &cached.artist,
+                            &cached.album,
+                            &cached.tags,
+                        ],
+                    ))
+                || (query.is_empty() && !requested_file_ids.contains(&cached.file_id))
+                || !valid_file_id(&cached.file_id)
+                || cached.size == 0
+                || !audio_claim_valid(&cached.filename, &cached.format, &cached.mime)
+                || !valid_catalogue_metadata(&[
+                    &cached.filename,
+                    &cached.title,
+                    &cached.artist,
+                    &cached.album,
+                    &cached.tags,
+                ])
+            {
+                continue;
+            }
+            let Ok(catalogue_tags) = super::normalise_tags(&cached.tags) else {
+                continue;
+            };
+            let Ok(public_key) = PublicKey::from_str(&cached.source_pubkey) else {
+                continue;
+            };
+            let source = CatalogueSource {
+                pubkey: cached.source_pubkey.clone(),
+                npub: public_key
+                    .to_bech32()
+                    .unwrap_or_else(|_| cached.source_pubkey.clone()),
+                display_name: short_key(&cached.source_pubkey),
+                relay: String::new(),
+                about: String::new(),
+                picture: String::new(),
+                event_id: cached.event_id,
+            };
+            cached_source_pairs.insert((cached.source_pubkey.clone(), cached.file_id.clone()));
+            merge_catalogue_result(
+                &mut aggregated,
+                CatalogueContent {
+                    protocol: "napstr/1".into(),
+                    file_id: cached.file_id,
+                    filename: cached.filename.clone(),
+                    title: cached.title,
+                    artist: cached.artist,
+                    album: cached.album,
+                    format: cached.format,
+                    mime: cached.mime,
+                    size: cached.size,
+                    license: "unspecified".into(),
+                    description: String::new(),
+                    tags: catalogue_tags.clone(),
+                },
+                catalogue_tags,
+                source,
+            );
+        }
+
+        for event in events_by_id.values() {
             let Ok(content) = serde_json::from_str::<CatalogueContent>(&event.content) else {
                 continue;
             };
-            if content.protocol != "napstr/1"
-                || !hex::decode(&content.file_id)
-                    .map(|bytes| bytes.len() == 32)
-                    .unwrap_or(false)
+            if !valid_catalogue_event(event, &content)
+                || content.protocol != "napstr/1"
+                || !valid_file_id(&content.file_id)
+                || content.size == 0
                 || !audio_claim_valid(&content.filename, &content.format, &content.mime)
+                || !valid_catalogue_metadata(&[
+                    &content.filename,
+                    &content.title,
+                    &content.artist,
+                    &content.album,
+                    &content.tags,
+                ])
             {
                 continue;
             }
             let Ok(catalogue_tags) = super::normalise_tags(&content.tags) else {
                 continue;
             };
-            if !super::search_matches(query, &[&content.filename, &catalogue_tags]) {
+            if !super::search_matches(
+                query,
+                &[
+                    &content.filename,
+                    &content.title,
+                    &content.artist,
+                    &content.album,
+                    &catalogue_tags,
+                ],
+            ) {
                 continue;
             }
             let pubkey = event.pubkey.to_hex();
-            let blocked: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1) OR EXISTS(SELECT 1 FROM blocked_pubkeys WHERE pubkey=?2)",
-                params![content.file_id, pubkey], |row| row.get(0),
-            ).map_err(|error| error.to_string())?;
-            if blocked {
+            if blocked_files.contains(&content.file_id) || blocked_pubkeys.contains(&pubkey) {
                 continue;
             }
             if !online.contains(&(pubkey.clone(), content.file_id.clone())) {
@@ -921,45 +2196,77 @@ impl NetworkService {
             let catalogue_name = content.filename.clone();
             connection.execute(
                 "INSERT OR REPLACE INTO remote_catalogue (file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-                params![content.file_id, pubkey, catalogue_name, catalogue_name, "", "", content.format, content.mime, content.size as i64, "unspecified", "", catalogue_tags, event.id.to_hex(), Utc::now().to_rfc3339()],
+                params![content.file_id, pubkey, catalogue_name, content.title, content.artist, content.album, content.format, content.mime, content.size as i64, "unspecified", "", catalogue_tags, event.id.to_hex(), Utc::now().to_rfc3339()],
             ).map_err(|error| error.to_string())?;
-            aggregated
-                .entry(content.file_id.clone())
-                .and_modify(|item| {
-                    if !item
-                        .sources
-                        .iter()
-                        .any(|existing| existing.pubkey == source.pubkey)
-                    {
-                        item.sources.push(source.clone());
-                    }
-                    if item.tags.is_empty() {
-                        item.tags = catalogue_tags.clone();
-                    }
+            cached_source_pairs.insert((pubkey, content.file_id.clone()));
+            merge_catalogue_result(&mut aggregated, content, catalogue_tags, source);
+        }
+        if is_initial_browse {
+            let pending_file_ids = requested_file_id_order
+                .iter()
+                .filter(|file_id| {
+                    available_by_file.get(*file_id).is_some_and(|sources| {
+                        sources.iter().any(|source| {
+                            !blocked_pubkeys.contains(source)
+                                && !cached_source_pairs
+                                    .contains(&(source.clone(), (*file_id).clone()))
+                        })
+                    })
                 })
-                .or_insert(CatalogueResult {
-                    file_id: content.file_id,
-                    filename: catalogue_name.clone(),
-                    title: catalogue_name,
-                    artist: String::new(),
-                    album: String::new(),
-                    format: content.format,
-                    mime: content.mime,
-                    size: content.size,
-                    license: "unspecified".into(),
-                    description: String::new(),
-                    tags: catalogue_tags,
-                    sources: vec![source],
+                .cloned()
+                .collect::<VecDeque<_>>();
+            if !pending_file_ids.is_empty() {
+                let session_id = Uuid::new_v4().to_string();
+                let session = CatalogueBrowseSession {
+                    created_at: Instant::now(),
+                    online,
+                    available_by_file,
+                    pending_file_ids,
+                    total_available,
+                };
+                let mut sessions = self.catalogue_browse_sessions.lock().await;
+                sessions.retain(|_, session| {
+                    session.created_at.elapsed() < CATALOGUE_BROWSE_SESSION_LIFETIME
                 });
+                if sessions.len() >= CATALOGUE_BROWSE_SESSION_LIMIT {
+                    if let Some(oldest) = sessions
+                        .iter()
+                        .max_by_key(|(_, session)| session.created_at.elapsed())
+                        .map(|(session_id, _)| session_id.clone())
+                    {
+                        sessions.remove(&oldest);
+                    }
+                }
+                sessions.insert(session_id.clone(), session);
+                next_browse_cursor = Some(CatalogueBrowseCursor { session_id });
+            }
+        } else if let Some((session_id, session)) = continuation_session {
+            if !session.pending_file_ids.is_empty() {
+                self.catalogue_browse_sessions
+                    .lock()
+                    .await
+                    .insert(session_id.clone(), session);
+                next_browse_cursor = Some(CatalogueBrowseCursor { session_id });
+            }
         }
         let mut results: Vec<_> = aggregated.into_values().collect();
-        let profile_keys = results
-            .iter()
-            .flat_map(|result| result.sources.iter())
-            .filter_map(|source| PublicKey::from_str(&source.pubkey).ok())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .take(128);
+        if results.is_empty() {
+            if let Some(error) = catalogue_search_error {
+                return Err(error);
+            }
+        }
+        let profile_keys = (!query.is_empty())
+            .then(|| {
+                results
+                    .iter()
+                    .flat_map(|result| result.sources.iter())
+                    .filter_map(|source| PublicKey::from_str(&source.pubkey).ok())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .take(128)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let profiles: HashMap<String, Metadata> = stream::iter(profile_keys)
             .map(|public_key| {
                 let client = client.clone();
@@ -998,13 +2305,21 @@ impl NetworkService {
                 .cmp(&left.sources.len())
                 .then_with(|| left.filename.cmp(&right.filename))
         });
-        Ok(results)
+        results.truncate(if is_initial_browse {
+            initial_browse_cache_limit
+        } else if let Some(limit) = browse_result_limit {
+            limit.clamp(1, EMPTY_SEARCH_PAGE_LIMIT)
+        } else {
+            NETWORK_SEARCH_RESULT_LIMIT
+        });
+        Ok((results, next_browse_cursor, total_available))
     }
 
     pub async fn request_download(
         &self,
         file_id: String,
         source_pubkeys: Vec<String>,
+        destination_folder: Option<String>,
     ) -> Result<String, String> {
         let client = self
             .client
@@ -1077,15 +2392,42 @@ impl NetworkService {
             ));
         }
         let (filename, size) = file_record.ok_or("catalogue record disappeared")?;
+        let destination_folder = destination_folder
+            .map(|value| {
+                value
+                    .chars()
+                    .map(|character| {
+                        if character.is_control()
+                            || matches!(
+                                character,
+                                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+                            )
+                        {
+                            '_'
+                        } else {
+                            character
+                        }
+                    })
+                    .collect::<String>()
+                    .trim_matches(|character: char| character == '.' || character.is_whitespace())
+                    .chars()
+                    .take(100)
+                    .collect::<String>()
+            })
+            .filter(|value| !value.is_empty());
         let request_id = Uuid::new_v4().to_string();
         connection.execute(
-            "INSERT INTO network_downloads (request_id,file_id,source_pubkey,filename,size,progress,status,speed,destination,onion,updated_at) VALUES (?1,?2,?3,?4,?5,0,'Racing responsive Tor seeders','—','','',?6)",
-            params![request_id, file_id, unique[0], filename, size, Utc::now().to_rfc3339()],
+            "INSERT INTO network_downloads (request_id,file_id,source_pubkey,filename,size,progress,status,speed,destination,onion,updated_at,destination_folder) VALUES (?1,?2,?3,?4,?5,0,'Racing responsive Tor seeders','—','','',?6,?7)",
+            params![request_id, file_id, unique[0], filename, size, Utc::now().to_rfc3339(), destination_folder.unwrap_or_default()],
         ).map_err(|error| error.to_string())?;
         for (source, _) in &receivers {
             connection.execute("INSERT INTO download_sources(request_id,source_pubkey,status,updated_at) VALUES(?1,?2,'Requested',?3)", params![request_id, source, Utc::now().to_rfc3339()]).map_err(|error| error.to_string())?;
         }
         drop(connection);
+        // A download can be requested by Napstrfy rather than by the desktop
+        // UI. Wake the UI immediately so it discovers the new database row and
+        // starts its normal high-frequency progress polling.
+        let _ = self.app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
         let message = SignalMessage::DownloadRequest {
             protocol: "napstr/1".into(),
             request_id: request_id.clone(),
@@ -1123,6 +2465,7 @@ impl NetworkService {
                     params![Utc::now().to_rfc3339(), request_id],
                 )
                 .map_err(|error| error.to_string())?;
+            let _ = self.app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
             return Err("NIP-17 request could not be delivered to any seeder".into());
         }
         Ok(request_id)
@@ -1420,6 +2763,29 @@ fn safe_trollbox_name(value: &str) -> String {
     name.chars().take(40).collect()
 }
 
+fn load_blocked_values(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<HashSet<String>, String> {
+    let allowed = matches!(
+        (table, column),
+        ("blocked_files", "file_id") | ("blocked_pubkeys", "pubkey")
+    );
+    if !allowed {
+        return Err("invalid blocked-value query".into());
+    }
+    let mut statement = connection
+        .prepare(&format!("SELECT {column} FROM {table}"))
+        .map_err(|error| error.to_string())?;
+    let values = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(values)
+}
+
 fn is_unsafe_public_chat_character(character: char) -> bool {
     character.is_control()
         || matches!(
@@ -1470,14 +2836,26 @@ pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> 
          CREATE TABLE IF NOT EXISTS network_downloads (
            request_id TEXT PRIMARY KEY, file_id TEXT NOT NULL, source_pubkey TEXT NOT NULL, filename TEXT NOT NULL,
            size INTEGER NOT NULL, progress REAL NOT NULL, status TEXT NOT NULL, speed TEXT NOT NULL,
-           destination TEXT NOT NULL, onion TEXT NOT NULL, updated_at TEXT NOT NULL
+           destination TEXT NOT NULL, onion TEXT NOT NULL, updated_at TEXT NOT NULL,
+           destination_folder TEXT NOT NULL DEFAULT ''
          );
          CREATE TABLE IF NOT EXISTS download_sources (
            request_id TEXT NOT NULL, source_pubkey TEXT NOT NULL, status TEXT NOT NULL, updated_at TEXT NOT NULL,
            PRIMARY KEY(request_id, source_pubkey),
            FOREIGN KEY(request_id) REFERENCES network_downloads(request_id) ON DELETE CASCADE
          );
-         CREATE TABLE IF NOT EXISTS published_catalogue (file_id TEXT PRIMARY KEY, published_at TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS published_catalogue (
+           file_id TEXT PRIMARY KEY, published_at TEXT NOT NULL, fingerprint TEXT NOT NULL DEFAULT ''
+         );
+         CREATE TABLE IF NOT EXISTS published_audiobooks (
+           folder TEXT PRIMARY KEY, audiobook_id TEXT NOT NULL,
+           fingerprint TEXT NOT NULL, published_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS remote_audiobooks (
+           audiobook_id TEXT NOT NULL, source_pubkey TEXT NOT NULL,
+           content TEXT NOT NULL, event_id TEXT NOT NULL, seen_at TEXT NOT NULL,
+           PRIMARY KEY(audiobook_id, source_pubkey)
+         );
          CREATE TABLE IF NOT EXISTS trollbox_events (
            event_id TEXT PRIMARY KEY, pubkey TEXT NOT NULL, event_json TEXT NOT NULL, created_at INTEGER NOT NULL
          );
@@ -1486,6 +2864,8 @@ pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> 
     ).map_err(|error| error.to_string())
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "description", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "tags", "TEXT NOT NULL DEFAULT ''"))
+    .and_then(|_| super::ensure_column(connection, "published_catalogue", "fingerprint", "TEXT NOT NULL DEFAULT ''"))
+    .and_then(|_| super::ensure_column(connection, "network_downloads", "destination_folder", "TEXT NOT NULL DEFAULT ''"))
 }
 
 pub fn load_network_transfers(connection: &Connection) -> Result<Vec<super::Transfer>, String> {
@@ -1684,54 +3064,173 @@ fn profile_fingerprint(
     hex::encode(digest.finalize())
 }
 
-type PublishFile = (String, String, u64, String, String, String);
+type PublishFile = (
+    String,
+    String,
+    u64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+type PublishFileRecord = (
+    String,
+    String,
+    u64,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+);
+
+fn publish_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublishFileRecord> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get::<_, i64>(2)? as u64,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+fn current_publish_file(record: PublishFileRecord) -> Option<PublishFile> {
+    let (
+        file_id,
+        filename,
+        size,
+        format,
+        mime,
+        path,
+        tags,
+        indexed_modified_ns,
+        title,
+        artist,
+        album,
+    ) = record;
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() != size || super::modified_ns(&metadata) != indexed_modified_ns {
+        return None;
+    }
+    Some((
+        file_id, filename, size, format, mime, tags, title, artist, album,
+    ))
+}
 
 fn load_publish_files(db_path: &PathBuf) -> Result<Vec<PublishFile>, String> {
     let connection = super::open_connection(db_path)?;
     let mut statement = connection.prepare(
-        "SELECT file_id, filename, size, format, mime, path, tags
+        "SELECT file_id, filename, size, format, mime, path, tags, modified_ns, title, artist, album
          FROM files WHERE NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)
-         ORDER BY filename"
+         ORDER BY filename,file_id"
     ).map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })
+        .query_map([], publish_file_from_row)
         .map_err(|error| error.to_string())?;
     let mut files = Vec::new();
     for row in rows {
-        let (file_id, filename, size, format, mime, path, tags) =
-            row.map_err(|error| error.to_string())?;
-        let Ok(validated) = crate::audio::validate_audio(std::path::Path::new(&path)) else {
-            continue;
-        };
-        if validated.format != format || validated.mime != mime {
-            continue;
+        if let Some(file) = current_publish_file(row.map_err(|error| error.to_string())?) {
+            files.push(file);
         }
-        files.push((file_id, filename, size, format, mime, tags));
     }
     Ok(files)
 }
 
-fn load_published_ids(db_path: &PathBuf) -> Result<Vec<String>, String> {
+fn load_publish_files_by_id(
+    db_path: &PathBuf,
+    file_ids: &HashSet<String>,
+) -> Result<Vec<PublishFile>, String> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let connection = super::open_connection(db_path)?;
     let mut statement = connection
-        .prepare("SELECT file_id FROM published_catalogue")
+        .prepare(
+            "SELECT file_id, filename, size, format, mime, path, tags, modified_ns, title, artist, album
+             FROM files
+             WHERE file_id=?1
+               AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)",
+        )
         .map_err(|error| error.to_string())?;
-    let ids = statement
-        .query_map([], |row| row.get(0))
+    let mut files = Vec::with_capacity(file_ids.len());
+    for file_id in file_ids {
+        let record = statement
+            .query_row([file_id], publish_file_from_row)
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(file) = record.and_then(current_publish_file) {
+            files.push(file);
+        }
+    }
+    files.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    Ok(files)
+}
+
+fn load_published_fingerprints(db_path: &PathBuf) -> Result<HashMap<String, String>, String> {
+    let connection = super::open_connection(db_path)?;
+    let mut statement = connection
+        .prepare("SELECT file_id,fingerprint FROM published_catalogue")
+        .map_err(|error| error.to_string())?;
+    let entries = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    Ok(ids)
+    Ok(entries.into_iter().collect())
+}
+
+fn load_published_fingerprints_by_id(
+    db_path: &PathBuf,
+    file_ids: &HashSet<String>,
+) -> Result<HashMap<String, String>, String> {
+    if file_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let connection = super::open_connection(db_path)?;
+    let mut statement = connection
+        .prepare("SELECT fingerprint FROM published_catalogue WHERE file_id=?1")
+        .map_err(|error| error.to_string())?;
+    let mut fingerprints = HashMap::with_capacity(file_ids.len());
+    for file_id in file_ids {
+        if let Some(fingerprint) = statement
+            .query_row([file_id], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(|error| error.to_string())?
+        {
+            fingerprints.insert(file_id.clone(), fingerprint);
+        }
+    }
+    Ok(fingerprints)
+}
+
+fn load_published_audiobooks(
+    connection: &Connection,
+) -> Result<HashMap<String, (String, String)>, String> {
+    let mut statement = connection
+        .prepare("SELECT folder,audiobook_id,fingerprint FROM published_audiobooks")
+        .map_err(|error| error.to_string())?;
+    let values = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(values)
 }
 
 fn relay_urls(value: &str) -> Vec<String> {
@@ -1821,6 +3320,179 @@ mod tests {
     }
 
     #[test]
+        fn catalogue_search_filters_are_server_side_and_bounded() {
+        let named = serde_json::to_value(catalogue_name_search_filter("metallica")).unwrap();
+        assert_eq!(named["kinds"], serde_json::json!([CATALOGUE_KIND]));
+        assert_eq!(named["#t"], serde_json::json!(["napstr"]));
+        assert_eq!(named["search"], "metallica");
+        assert_eq!(named["limit"], NETWORK_SEARCH_RESULT_LIMIT);
+
+        let indexed = catalogue_tag_search_filters("Metallica Enter Sandman")
+            .into_iter()
+            .map(|filter| serde_json::to_value(filter).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indexed
+                .iter()
+                .map(|filter| filter["#t"][0].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["metallica", "sandman", "enter"]
+        );
+        assert!(indexed
+            .iter()
+            .all(|filter| filter["limit"] == NETWORK_SEARCH_RESULT_LIMIT));
+        let many_words = format!(
+            "{}.mp3",
+            (0..40)
+                .map(|index| format!("word{index}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let bounded_tokens = catalogue_search_tokens(&[&many_words]);
+        assert_eq!(bounded_tokens.len(), CATALOGUE_SEARCH_TOKEN_LIMIT);
+        let balanced_tokens = catalogue_search_tokens(&[
+            &many_words,
+            "A Distinct Track Title",
+            "Specific Artist",
+            "Recognisable Album",
+            "favourite",
+        ]);
+        for expected in [
+            "distinct",
+            "track",
+            "title",
+            "specific",
+            "artist",
+            "recognisable",
+            "album",
+            "favourite",
+        ] {
+            assert!(balanced_tokens.contains(&expected.to_string()));
+        }
+        assert_eq!(
+            catalogue_search_tokens(&["The House of the Rising Sun"]),
+            vec!["house", "rising", "sun"]
+        );
+        assert_eq!(
+            catalogue_search_tokens(&["enter_sandman.mp3", "enter-sandman"]),
+            vec!["enter", "sandman"]
+        );
+
+        let identifiers = vec!["a".repeat(64), "b".repeat(64)];
+        let browse = serde_json::to_value(catalogue_identifier_filter(&identifiers)).unwrap();
+        assert_eq!(browse["kinds"], serde_json::json!([CATALOGUE_KIND]));
+        assert_eq!(browse["#t"], serde_json::json!(["napstr"]));
+        assert_eq!(browse["#d"], serde_json::json!(identifiers));
+        assert_eq!(browse["limit"], 16);
+
+        let availability = serde_json::to_value(availability_search_filter()).unwrap();
+        assert_eq!(
+            availability["kinds"],
+            serde_json::json!([AVAILABILITY_KIND])
+        );
+        assert_eq!(
+            availability["limit"],
+            serde_json::json!(AVAILABILITY_QUERY_LIMIT)
+        );
+
+        let old_empty_fingerprint = String::new();
+        let tokens = vec!["metallica".to_string()];
+        let fingerprint = catalogue_event_fingerprint("catalogue", &tokens);
+        assert!(!catalogue_publication_is_current(
+            Some(&old_empty_fingerprint),
+            &fingerprint
+        ));
+        assert!(catalogue_publication_is_current(
+            Some(&fingerprint),
+            &fingerprint
+        ));
+        assert_ne!(
+            fingerprint,
+            catalogue_event_fingerprint("catalogue", &["sandman".to_string()])
+        );
+    }
+
+    #[test]
+    fn audiobook_manifests_bind_order_and_reject_paths() {
+        let chapters = vec![
+            AudiobookChapter {
+                position: 1,
+                file_id: "11".repeat(32),
+                filename: "01 - Start.mp3".into(),
+                title: "Start".into(),
+                format: "MP3".into(),
+                mime: "audio/mpeg".into(),
+                size: 10,
+            },
+            AudiobookChapter {
+                position: 2,
+                file_id: "22".repeat(32),
+                filename: "02 - Finish.mp3".into(),
+                title: "Finish".into(),
+                format: "MP3".into(),
+                mime: "audio/mpeg".into(),
+                size: 20,
+            },
+        ];
+        let id = audiobook_id(&chapters);
+        let content = AudiobookContent {
+            protocol: "napstr/1".into(),
+            audiobook_id: id.clone(),
+            title: "A Book".into(),
+            author: "An Author".into(),
+            narrator: String::new(),
+            total_size: 30,
+            chapters,
+        };
+        let keys = Keys::generate();
+        let event = EventBuilder::new(
+            Kind::from(AUDIOBOOK_KIND),
+            serde_json::to_string(&content).unwrap(),
+        )
+        .tags(vec![
+            Tag::identifier(id.clone()),
+            Tag::hashtag("napstr-audiobook"),
+        ])
+        .sign_with_keys(&keys)
+        .unwrap();
+        assert!(valid_audiobook_event(&event, &content));
+
+        let single_chapter = content.chapters[0].clone();
+        let single_id = audiobook_id(std::slice::from_ref(&single_chapter));
+        let single_content = AudiobookContent {
+            protocol: "napstr/1".into(),
+            audiobook_id: single_id.clone(),
+            title: "A Complete Book in One File".into(),
+            author: "An Author".into(),
+            narrator: String::new(),
+            total_size: single_chapter.size,
+            chapters: vec![single_chapter],
+        };
+        let single_event = EventBuilder::new(
+            Kind::from(AUDIOBOOK_KIND),
+            serde_json::to_string(&single_content).unwrap(),
+        )
+        .tags(vec![
+            Tag::identifier(single_id),
+            Tag::hashtag("napstr-audiobook"),
+        ])
+        .sign_with_keys(&keys)
+        .unwrap();
+        assert!(valid_audiobook_event(&single_event, &single_content));
+
+        let mut unsafe_content = content.clone();
+        unsafe_content.chapters[0].filename = "../secret.mp3".into();
+        let unsafe_event = EventBuilder::new(
+            Kind::from(AUDIOBOOK_KIND),
+            serde_json::to_string(&unsafe_content).unwrap(),
+        )
+        .tags(vec![Tag::identifier(id), Tag::hashtag("napstr-audiobook")])
+        .sign_with_keys(&keys)
+        .unwrap();
+        assert!(!valid_audiobook_event(&unsafe_event, &unsafe_content));
+    }
+
+    #[test]
     fn trollbox_uses_a_separate_public_chat_kind_and_indexed_topic() {
         let filter = serde_json::to_value(trollbox_filter(TROLLBOX_CACHE_LIMIT)).unwrap();
         assert_eq!(filter["kinds"], serde_json::json!([9]));
@@ -1860,6 +3532,30 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events.first().map(|event| event.id), Some(event.id));
+    }
+
+    #[test]
+    fn catalogue_schema_migrates_publication_fingerprints() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE published_catalogue (
+                   file_id TEXT PRIMARY KEY, published_at TEXT NOT NULL
+                 );
+                 INSERT INTO published_catalogue(file_id,published_at) VALUES('abc','now');",
+            )
+            .unwrap();
+
+        initialise_network_schema(&connection).unwrap();
+
+        let fingerprint: String = connection
+            .query_row(
+                "SELECT fingerprint FROM published_catalogue WHERE file_id='abc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(fingerprint.is_empty());
     }
 
     #[test]

@@ -1,0 +1,36 @@
+[package]
+name = "nostrfy"
+version = "0.1.0"
+description = "Napstr companion player"
+authors = ["Napstr contributors"]
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "nostrfy_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "nostrfy"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+iroh = { version = "1.0.3", default-features = false, features = ["tls-ring", "portmapper"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+napstr-remote-protocol = { path = "../../remote-protocol" }
+sha2 = "0.10"
+hex = "0.4"
+tokio = { version = "1", features = ["fs", "io-util", "net", "rt", "sync", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["hickory-dns", "rustls-no-provider", "stream"] }
+futures-util = "0.3"
+quick-xml = "0.41"
+chrono = { version = "0.4", default-features = false }
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-barcode-scanner = "2.4.5"

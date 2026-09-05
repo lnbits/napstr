@@ -38,3 +38,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tokio-util = "0.7"
 notify = "8"
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "flac", "mp3", "vorbis", "wav"] }
+lofty = "0.25.1"
+iroh = { version = "1.0.3", default-features = false, features = ["tls-ring", "portmapper"] }
+napstr-remote-protocol = { path = "../remote-protocol" }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }

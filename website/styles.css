@@ -295,6 +295,7 @@ footer em { display: block; }
 
 .download-option p { font-size: 16px; line-height: 19px; }
 .download-option .version { margin-bottom: 16px; font-size: 13px; line-height: 14px; }
+.download-option.macos { grid-column: 1 / -1; }
 .download-link { display: inline-block; margin-top: -5px; font-size: 16px; font-weight: bold; }
 .release-link[aria-disabled="true"] { color: #666; cursor: wait; pointer-events: none; }
 
@@ -364,6 +365,19 @@ footer em { display: block; }
   font-size: 12px;
   line-height: 16px;
 }
+
+.napstrfy-panel .content-body { min-height: 650px; }
+.napstrfy-wordmark { margin: 4px 0 0; display: flex; align-items: center; justify-content: center; gap: 8px; }
+.napstrfy-wordmark img { width: 62px; height: 62px; }
+.napstrfy-wordmark strong { color: #fff; font: 900 italic 48px/.9 "Arial Black", Arial, sans-serif; letter-spacing: -4px; text-shadow: 1px 1px #444; -webkit-text-stroke: 1px #22245e; }
+.napstrfy-tagline { margin: 4px 0 15px; color: #29236d; font-size: 11px; letter-spacing: 3px; text-align: center; }
+.trust-warning { margin: 17px 0; padding: 8px 9px; color: #3c2100; background: #fff4b7; border: 2px ridge #c8b35c; }
+.trust-warning > strong { display: block; margin-bottom: 5px; color: #74110f; font-size: 15px; }
+.trust-warning p { margin: 3px 0 7px; font-size: 13px; line-height: 16px; }
+.napstrfy-download { padding: 8px; background: #fff; border: 2px inset #d4d4d4; }
+.napstrfy-download h3 { margin-bottom: 4px; }
+.napstrfy-download .version { margin-bottom: 8px; font-size: 13px; }
+.napstrfy-download p { font-size: 14px; line-height: 17px; }
 
 @media (max-width: 650px) {
   .site-shell { width: 100%; padding-right: 7px; }

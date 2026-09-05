@@ -83,13 +83,22 @@ impl NativePlayer {
         let builder = match DeviceSinkBuilder::from_default_device() {
             Ok(builder) => builder,
             Err(primary_error) => {
-                let mut output = DeviceSinkBuilder::open_default_sink().map_err(|fallback_error| {
-                    format!(
-                        "could not find a usable system audio output: {primary_error}; fallback: {fallback_error}"
-                    )
-                })?;
-                output.log_on_drop(false);
-                return Ok(output);
+                #[cfg(target_os = "linux")]
+                return Err(format!(
+                    "could not find the system default audio output: {primary_error}"
+                ));
+
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let mut output =
+                        DeviceSinkBuilder::open_default_sink().map_err(|fallback_error| {
+                            format!(
+                                "could not find a usable system audio output: {primary_error}; fallback: {fallback_error}"
+                            )
+                        })?;
+                    output.log_on_drop(false);
+                    return Ok(output);
+                }
             }
         }
         .with_error_callback(move |error| {
@@ -97,16 +106,28 @@ impl NativePlayer {
                     *current = Some(format!("system audio stream failed: {error}"));
                 }
             });
-        let mut output = match builder.open_sink_or_fallback() {
-            Ok(output) => output,
-            Err(primary_error) => DeviceSinkBuilder::open_default_sink().map_err(
-                |fallback_error| {
-                    format!(
-                        "could not open a usable system audio output: {primary_error}; fallback: {fallback_error}"
-                    )
-                },
-            )?,
-        };
+        let mut output = builder.open_sink_or_fallback().or_else(|primary_error| {
+            #[cfg(target_os = "linux")]
+            {
+                // CPAL's Linux default is the ALSA `default` PCM, which should
+                // route through the desktop mixer. Enumerating a different
+                // device here can select a raw hardware PCM and prevent other
+                // applications from using that output.
+                Err(format!(
+                    "could not open the system default audio output: {primary_error}"
+                ))
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                DeviceSinkBuilder::open_default_sink()
+                    .map_err(|fallback_error| {
+                        format!(
+                            "could not open a usable system audio output: {primary_error}; fallback: {fallback_error}"
+                        )
+                    })
+            }
+        })?;
         output.log_on_drop(false);
         Ok(output)
     }
@@ -206,17 +227,15 @@ pub fn toggle_audio(state: State<'_, AppState>) -> Result<PlaybackStatus, String
 
 #[tauri::command]
 pub fn stop_audio(state: State<'_, AppState>) -> Result<PlaybackStatus, String> {
-    let native = state
+    let mut native = state
         .player
         .inner
         .lock()
         .map_err(|_| "audio player lock poisoned")?;
-    if let Some(player) = native.player.as_ref() {
-        player.pause();
-        player
-            .try_seek(Duration::ZERO)
-            .map_err(|error| format!("could not rewind this track: {error}"))?;
+    if let Some(player) = native.player.take() {
+        player.stop();
     }
+    native.output.take();
     Ok(state.player.status_for(&native))
 }
 
@@ -258,12 +277,19 @@ pub fn set_audio_volume(volume: f32, state: State<'_, AppState>) -> Result<Playb
 
 #[tauri::command]
 pub fn audio_status(state: State<'_, AppState>) -> Result<PlaybackStatus, String> {
-    let native = state
+    let mut native = state
         .player
         .inner
         .lock()
         .map_err(|_| "audio player lock poisoned")?;
-    Ok(state.player.status_for(&native))
+    let status = state.player.status_for(&native);
+    if status.ended {
+        if let Some(player) = native.player.take() {
+            player.stop();
+        }
+        native.output.take();
+    }
+    Ok(status)
 }
 
 fn validate_file_id(file_id: &str) -> Result<(), String> {

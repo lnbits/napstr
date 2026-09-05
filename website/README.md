@@ -1,7 +1,7 @@
 # Napstr website
 
 This folder is a dependency-free static website styled like a circa-2000 music-sharing homepage.
-The Home, Download, Nostr, and Tor pages share the same static navigation and layout.
+The Home, Download, Napstrfy, Nostr, and Tor pages share the same static navigation and layout.
 
 Preview it locally from the repository root:
 
@@ -10,7 +10,8 @@ npx serve website
 ```
 
 The download page loads the latest published GitHub Release through GitHub's public API and
-matches the Tauri-generated `.exe` and `.AppImage` assets. On a
+matches the Tauri-generated desktop installers. The Napstrfy page uses the same release lookup
+to find an attached Android `.apk`. On a
 standard `owner.github.io/repository` Pages URL, `releases.js` derives the repository name from
 the page address automatically.
 

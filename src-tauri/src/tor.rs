@@ -137,6 +137,7 @@ impl TorManager {
             if let Some(parent) = tor.parent() {
                 prepend_library_path(&mut command, parent);
             }
+            hide_child_process_window(&mut command);
             command.kill_on_drop(true);
 
             let mut child = command
@@ -392,6 +393,17 @@ impl TorManager {
         PathBuf::from(executable)
     }
 }
+
+#[cfg(target_os = "windows")]
+fn hide_child_process_window(command: &mut Command) {
+    // Tor is a console executable. Napstr captures its output through pipes, so
+    // it does not need a visible terminal window when launched by the GUI app.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_child_process_window(_command: &mut Command) {}
 
 fn capture_process_output<R>(stream: R, destination: Arc<RwLock<Vec<String>>>)
 where

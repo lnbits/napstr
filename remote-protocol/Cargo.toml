@@ -1,0 +1,11 @@
+[package]
+name = "napstr-remote-protocol"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Small shared wire format for Napstr and Napstrfy"
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

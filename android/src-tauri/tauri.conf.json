@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Napstrfy",
+  "version": "0.1.0",
+  "identifier": "net.napstr.nostrfy",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1421",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{
+      "title": "Napstrfy",
+      "width": 430,
+      "height": 820,
+      "minWidth": 360,
+      "minHeight": 640,
+      "resizable": true
+    }],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; media-src 'self' https: http://127.0.0.1:*; connect-src 'self' ipc: http://ipc.localhost https://itunes.apple.com https://musicbrainz.org https://coverartarchive.org"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
+    "category": "Music",
+    "shortDescription": "Your Napstr music on your phone",
+    "longDescription": "Napstrfy securely connects to your own Napstr desktop over Iroh."
+  }
+}

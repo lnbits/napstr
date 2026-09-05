@@ -28,6 +28,7 @@ RUN apt-get update \
     gstreamer1.0-pulseaudio \
     gstreamer1.0-tools \
     libasound2-dev \
+    libasound2-plugins \
     libayatana-appindicator3-dev \
     libgirepository1.0-dev \
     librsvg2-dev \

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Napstrfy securely brings the music on your Napstr desktop to your phone." />
+    <link rel="canonical" href="https://napstr.net/napstrfy.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Napstr" />
+    <meta property="og:title" content="Napstrfy — the Napstr companion" />
+    <meta property="og:description" content="Pair your phone with your own Napstr desktop and take your music with you." />
+    <meta property="og:url" content="https://napstr.net/napstrfy.html" />
+    <meta property="og:image" content="https://napstr.net/assets/preview.png" />
+    <meta property="og:image:width" content="400" />
+    <meta property="og:image:height" content="260" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="github-repository" content="lnbits/napstr" />
+    <title>Napstr — Napstrfy</title>
+    <link rel="icon" type="image/png" href="assets/favicon.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body data-release-product="napstrfy">
+    <div class="site-shell">
+      <header class="masthead download-masthead">
+        <a class="brand" href="index.html" aria-label="Napstr home">
+          <img src="assets/napstr-logo.png" alt="Napstr" />
+        </a>
+        <div class="equalizer" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+        </div>
+      </header>
+
+      <div class="page-grid">
+        <aside class="sidebar">
+          <nav aria-label="Main navigation">
+            <a href="index.html">Home</a>
+            <a href="download.html">Download</a>
+            <a class="active" href="napstrfy.html">Napstrfy</a>
+            <a href="nostr.html">Nostr</a>
+            <a href="tor.html">Tor</a>
+          </nav>
+          <div class="sidebar-meta">
+            <span>Service Status</span>
+            <span>Community Build</span>
+            <span>Privacy First</span>
+          </div>
+        </aside>
+
+        <main class="content-panel napstrfy-panel">
+          <section class="content-body">
+            <div class="napstrfy-wordmark" aria-label="Napstrfy">
+              <img src="assets/favicon.png" alt="" />
+              <strong>napstrfy</strong>
+            </div>
+            <p class="napstrfy-tagline"><b>NAPSTR COMPANION</b></p>
+            <h1>Your music. Wherever you are.</h1>
+            <p>
+              Napstrfy is the phone companion for your own running Napstr desktop. It creates a
+              secure tunnel to stream data using
+              <a href="https://www.iroh.computer/">Iroh</a>. Napstrfy lets you browse and play the
+              music in your Napstr folder and ask Napstr to download a track while you are away
+              from the computer.
+            </p>
+
+            <section>
+              <h2>How it works</h2>
+              <ol class="flow-list">
+                <li>Open the <b>Mobile</b> page in Napstr and create a one-use QR code.</li>
+                <li>Scan it with Napstrfy to pair the phone over encrypted Iroh.</li>
+                <li>Napstr continues to handle Nostr discovery and private Tor downloads.</li>
+                <li>Verified audio already held by Napstr reaches the paired phone over Iroh.</li>
+              </ol>
+              <p class="small-print">
+                Napstr must remain open and connected while Napstrfy accesses your desktop library.
+                Podcasts are independent and come directly from their public publishers.
+              </p>
+            </section>
+
+            <aside class="trust-warning">
+              <strong>Only pair yourself and people you really trust.</strong>
+              <p>
+                A paired phone can browse your indexed music, fetch its audio, and ask your Napstr
+                desktop to download tracks. Treat pairing like giving someone access to your music
+                library. Remove a phone from Napstr’s Mobile page as soon as it should no longer connect.
+              </p>
+              <p>The QR secret expires after five minutes and can be used successfully only once.</p>
+            </aside>
+
+            <section>
+              <h2>Download Napstrfy</h2>
+              <article class="napstrfy-download">
+                <h3>Napstrfy for Android</h3>
+                <p class="version"><b>Latest Version:</b> <span data-release-version>checking…</span></p>
+                <p>Download the APK, open it on your Android phone, and approve installation when prompted.</p>
+                <a class="download-link release-link" data-release-platform="napstrfy-android" aria-disabled="true">download Android APK</a>
+              </article>
+              <div class="download-note" role="status" aria-live="polite">
+                <b>Release status:</b> <span id="release-status">Checking GitHub for the latest published release…</span>
+                <a id="release-page" hidden>View release</a>
+              </div>
+            </section>
+          </section>
+
+          <footer>
+            <div><a href="index.html">home</a> | <a href="download.html">download</a> | <a href="napstrfy.html">napstrfy</a> | <a href="nostr.html">nostr</a> | <a href="tor.html">tor</a></div>
+            <em><a href="https://github.com/lnbits/napstr/blob/main/LICENSE">Napstr is FLOSS — MIT License</a></em>
+          </footer>
+        </main>
+      </div>
+    </div>
+    <script src="releases.js" defer></script>
+  </body>
+</html>

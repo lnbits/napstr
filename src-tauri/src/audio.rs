@@ -1,3 +1,4 @@
+use lofty::{config::ParseOptions, file::TaggedFileExt, probe::Probe, tag::Accessor};
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -5,11 +6,22 @@ use std::{
 };
 
 const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PUBLIC_METADATA_CHARS: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioMetadata {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub track_number: u32,
+    pub disc_number: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioInfo {
     pub format: &'static str,
     pub mime: &'static str,
+    pub metadata: AudioMetadata,
 }
 
 pub fn validate_audio(path: &Path) -> Result<AudioInfo, String> {
@@ -31,7 +43,7 @@ pub fn validate_audio(path: &Path) -> Result<AudioInfo, String> {
     if size < 12 {
         return Err("not a valid supported audio file".into());
     }
-    let info = match extension.as_str() {
+    let mut info = match extension.as_str() {
         "mp3" => validate_mp3(&mut file, size)?,
         "flac" => validate_flac(&mut file, size)?,
         "wav" => validate_wav(&mut file, size)?,
@@ -43,7 +55,78 @@ pub fn validate_audio(path: &Path) -> Result<AudioInfo, String> {
             )
         }
     };
+    info.metadata = read_metadata(path);
     Ok(info)
+}
+
+pub fn read_metadata(path: &Path) -> AudioMetadata {
+    let options = ParseOptions::new()
+        .read_properties(false)
+        .read_cover_art(false);
+    let Ok(probe) = Probe::open(path) else {
+        return AudioMetadata::default();
+    };
+    let Ok(probe) = probe.options(options).guess_file_type() else {
+        return AudioMetadata::default();
+    };
+    let Ok(tagged_file) = probe.read() else {
+        return AudioMetadata::default();
+    };
+    AudioMetadata {
+        title: first_safe_metadata_value(&tagged_file, |tag| tag.title()),
+        artist: first_safe_metadata_value(&tagged_file, |tag| tag.artist()),
+        album: first_safe_metadata_value(&tagged_file, |tag| tag.album()),
+        track_number: tagged_file
+            .tags()
+            .iter()
+            .find_map(|tag| tag.track())
+            .unwrap_or_default(),
+        disc_number: tagged_file
+            .tags()
+            .iter()
+            .find_map(|tag| tag.disk())
+            .unwrap_or_default(),
+    }
+}
+
+fn first_safe_metadata_value<'a>(
+    tagged_file: &'a lofty::file::TaggedFile,
+    value: impl Fn(&'a lofty::tag::Tag) -> Option<std::borrow::Cow<'a, str>>,
+) -> String {
+    tagged_file
+        .tags()
+        .iter()
+        .find_map(value)
+        .map(|value| sanitise_public_text(&value))
+        .unwrap_or_default()
+}
+
+pub(crate) fn sanitise_public_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+            {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_PUBLIC_METADATA_CHARS)
+        .collect()
 }
 
 fn validate_mp3(file: &mut File, size: u64) -> Result<AudioInfo, String> {
@@ -83,6 +166,7 @@ fn validate_mp3(file: &mut File, size: u64) -> Result<AudioInfo, String> {
         Ok(AudioInfo {
             format: "MP3",
             mime: "audio/mpeg",
+            metadata: AudioMetadata::default(),
         })
     } else {
         Err("file does not contain a valid MPEG audio stream".into())
@@ -192,6 +276,7 @@ fn validate_flac(file: &mut File, size: u64) -> Result<AudioInfo, String> {
     Ok(AudioInfo {
         format: "FLAC",
         mime: "audio/flac",
+        metadata: AudioMetadata::default(),
     })
 }
 
@@ -275,6 +360,7 @@ fn validate_wav(file: &mut File, size: u64) -> Result<AudioInfo, String> {
     Ok(AudioInfo {
         format: "WAV",
         mime: "audio/wav",
+        metadata: AudioMetadata::default(),
     })
 }
 
@@ -358,11 +444,13 @@ fn validate_ogg(file: &mut File, size: u64, expect_opus: bool) -> Result<AudioIn
         AudioInfo {
             format: "OPUS",
             mime: "audio/ogg",
+            metadata: AudioMetadata::default(),
         }
     } else {
         AudioInfo {
             format: "OGG",
             mime: "audio/ogg",
+            metadata: AudioMetadata::default(),
         }
     })
 }
@@ -444,6 +532,24 @@ mod tests {
         page
     }
 
+    fn id3_text_frame(id: &[u8; 4], value: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(id);
+        frame.extend_from_slice(&((value.len() + 1) as u32).to_be_bytes());
+        frame.extend_from_slice(&[0, 0, 0]);
+        frame.extend_from_slice(value);
+        frame
+    }
+
+    fn synchsafe_bytes(value: usize) -> [u8; 4] {
+        [
+            ((value >> 21) & 0x7f) as u8,
+            ((value >> 14) & 0x7f) as u8,
+            ((value >> 7) & 0x7f) as u8,
+            (value & 0x7f) as u8,
+        ]
+    }
+
     #[test]
     fn validates_pcm_wav_by_content() {
         let file = path("valid.wav");
@@ -502,6 +608,32 @@ mod tests {
         for file in [mp3, flac, ogg, opus] {
             let _ = fs::remove_file(file);
         }
+    }
+
+    #[test]
+    fn extracts_bounded_safe_embedded_mp3_metadata() {
+        let mp3 = std::env::temp_dir().join(format!(
+            "napstr-audio-metadata-{}.mp3.part",
+            std::process::id()
+        ));
+        let mut tag = Vec::new();
+        tag.extend_from_slice(&id3_text_frame(b"TIT2", b"Enter\nSandman"));
+        tag.extend_from_slice(&id3_text_frame(b"TPE1", b"Metallica"));
+        tag.extend_from_slice(&id3_text_frame(b"TALB", b"Metallica (Black Album)"));
+        let mut bytes = b"ID3\x03\0\0".to_vec();
+        bytes.extend_from_slice(&synchsafe_bytes(tag.len()));
+        bytes.extend_from_slice(&tag);
+        let mut frame = vec![0u8; 417];
+        frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
+        bytes.extend_from_slice(&frame);
+        bytes.extend_from_slice(&frame);
+        fs::write(&mp3, bytes).unwrap();
+
+        let metadata = validate_audio(&mp3).unwrap().metadata;
+        assert_eq!(metadata.title, "Enter Sandman");
+        assert_eq!(metadata.artist, "Metallica");
+        assert_eq!(metadata.album, "Metallica (Black Album)");
+        let _ = fs::remove_file(mp3);
     }
 
     #[test]

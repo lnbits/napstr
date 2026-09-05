@@ -60,6 +60,76 @@ if [[ ! -e "$app_dir/usr/lib/libasound.so.2" ]]; then
   chmod 0644 "$app_dir/usr/lib/libasound.so.2"
 fi
 
+# libasound loads its configuration and output modules at runtime, so
+# linuxdeploy cannot discover them from ELF dependencies. Bundle the base
+# configuration and Pulse bridge explicitly. PipeWire exposes a compatible
+# Pulse socket on mainstream desktops, giving Napstr a shared output without
+# taking exclusive control of the physical ALSA device.
+alsa_config_source="/usr/share/alsa"
+if [[ ! -f "$alsa_config_source/alsa.conf" ]]; then
+  echo "The build host does not provide the ALSA configuration" >&2
+  exit 1
+fi
+mkdir -p "$app_dir/usr/share/alsa" "$app_dir/usr/lib/alsa-lib"
+cp -a "$alsa_config_source/." "$app_dir/usr/share/alsa/"
+
+for module in libasound_module_pcm_pulse.so libasound_module_ctl_pulse.so; do
+  module_path="$(find /usr/lib /lib -type f -path "*/alsa-lib/$module" -print -quit 2>/dev/null)"
+  if [[ -z "$module_path" || ! -f "$module_path" ]]; then
+    echo "The build host does not provide the ALSA Pulse module: $module" >&2
+    exit 1
+  fi
+  cp -L -- "$module_path" "$app_dir/usr/lib/alsa-lib/$module"
+  chmod 0644 "$app_dir/usr/lib/alsa-lib/$module"
+done
+
+# The Pulse ALSA module is loaded dynamically, so linuxdeploy does not walk its
+# dependency tree. Copy any remaining non-glibc runtime libraries now; otherwise
+# a check on the Ubuntu builder can pass by borrowing libraries from the runner
+# that are absent on the machine running the AppImage.
+pulse_module="$app_dir/usr/lib/alsa-lib/libasound_module_pcm_pulse.so"
+while read -r library resolved _; do
+  case "$library" in
+    libc.so.* | libdl.so.* | libm.so.* | libpthread.so.* | libresolv.so.* | librt.so.*) continue ;;
+    # GTK/WebKit already require the host's matching X11 stack. Bundling an
+    # older Xlib here can conflict with the host display connection.
+    libX11*.so.* | libxcb*.so.* | libXau.so.* | libXdmcp.so.*) continue ;;
+  esac
+  if [[ "$resolved" != /* || ! -f "$resolved" || -e "$app_dir/usr/lib/$library" ]]; then
+    continue
+  fi
+  cp -L -- "$resolved" "$app_dir/usr/lib/$library"
+  chmod 0644 "$app_dir/usr/lib/$library"
+done < <(
+  LD_LIBRARY_PATH="$app_dir/usr/lib:$app_dir/usr/lib/x86_64-linux-gnu" \
+    ldd "$pulse_module" | awk '$2 == "=>" { print $1, $3, $4 }'
+)
+
+# Do not base this file on the distribution's global alsa.conf: its startup
+# hooks import /etc/alsa/conf.d from the host. Those snippets may reference
+# host-only modules or syntax (notably NixOS's PipeWire `libs.*` entries).
+# The Pulse plugin only needs these two definitions.
+printf '# Napstr AppImage shared audio output\npcm.!default {\n  type pulse\n}\nctl.!default {\n  type pulse\n}\n' \
+  > "$app_dir/usr/share/alsa/napstr-pulse.conf"
+
+# Remove X11 libraries copied by an earlier post-processing pass. They belong
+# to the host graphics stack and are not part of the portable audio bridge.
+find "$app_dir/usr/lib" -maxdepth 1 -type f \
+  \( -name 'libX11*.so.*' -o -name 'libxcb*.so.*' -o -name 'libXau.so.*' -o -name 'libXdmcp.so.*' \) \
+  -delete
+
+# X11/XCB are intentionally supplied by the graphical host alongside GTK.
+# Everything else needed by the dynamically loaded audio bridge must resolve.
+unresolved="$({
+  LD_LIBRARY_PATH="$app_dir/usr/lib:$app_dir/usr/lib/x86_64-linux-gnu" \
+    ldd "$pulse_module" || true
+} | awk '/not found/ && $1 !~ /^(libX11|libxcb|libXau|libXdmcp)/ { print }')"
+if [[ -n "$unresolved" ]]; then
+  echo "The AppImage ALSA Pulse bridge has unresolved libraries" >&2
+  printf '%s\n' "$unresolved" >&2
+  exit 1
+fi
+
 gstreamer_plugins="$app_dir/usr/lib/gstreamer-1.0"
 if [[ ! -f "$gstreamer_plugins/libgstautodetect.so" ]]; then
   echo "The AppImage is missing GStreamer's autoaudiosink plugin" >&2

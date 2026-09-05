@@ -3,12 +3,12 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="Download Napstr for Windows or Linux." />
+    <meta name="description" content="Download Napstr for Windows, Linux, or macOS." />
     <link rel="canonical" href="https://napstr.net/download.html" />
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Napstr" />
     <meta property="og:title" content="Download Napstr" />
-    <meta property="og:description" content="Download Napstr for Windows or Linux." />
+    <meta property="og:description" content="Download Napstr for Windows, Linux, or macOS." />
     <meta property="og:url" content="https://napstr.net/download.html" />
     <meta property="og:image" content="https://napstr.net/assets/preview.png" />
     <meta property="og:image:width" content="400" />
@@ -16,7 +16,7 @@
     <meta property="og:image:alt" content="The Napstr homepage and classic desktop music-sharing app" />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="Download Napstr" />
-    <meta name="twitter:description" content="Download Napstr for Windows or Linux." />
+    <meta name="twitter:description" content="Download Napstr for Windows, Linux, or macOS." />
     <meta name="twitter:image" content="https://napstr.net/assets/preview.png" />
     <meta name="github-repository" content="lnbits/napstr" />
     <title>Napstr — Download</title>
@@ -39,6 +39,7 @@
           <nav aria-label="Main navigation">
             <a href="index.html">Home</a>
             <a class="active" href="download.html">Download</a>
+            <a href="napstrfy.html">Napstrfy</a>
             <a href="nostr.html">Nostr</a>
             <a href="tor.html">Tor</a>
           </nav>
@@ -82,6 +83,17 @@
                 </p>
                 <a class="download-link release-link" data-release-platform="linux" aria-disabled="true">download AppImage</a>
               </article>
+
+              <article class="download-option macos">
+                <h2>Napstr For macOS</h2>
+                <p class="version"><b>Latest Version:</b> <span data-release-version>checking…</span></p>
+                <p>
+                  Unnotarized community builds for Apple Silicon and Intel Macs. After the
+                  first blocked launch, use <b>System Settings → Privacy &amp; Security → Open Anyway</b>.
+                </p>
+                <a class="download-link release-link" data-release-platform="macos-arm64" aria-disabled="true">download Apple Silicon DMG</a><br />
+                <a class="download-link release-link" data-release-platform="macos-intel" aria-disabled="true">download Intel DMG</a>
+              </article>
             </div>
 
             <div class="download-note" role="status" aria-live="polite">
@@ -91,7 +103,7 @@
           </section>
 
           <footer>
-            <div><a href="index.html">home</a> | <a href="download.html">download</a> | <a href="nostr.html">nostr</a> | <a href="tor.html">tor</a></div>
+            <div><a href="index.html">home</a> | <a href="download.html">download</a> | <a href="napstrfy.html">napstrfy</a> | <a href="nostr.html">nostr</a> | <a href="tor.html">tor</a></div>
             <em><a href="https://github.com/lnbits/napstr/blob/main/LICENSE">Napstr is FLOSS — MIT License</a></em>
           </footer>
         </main>

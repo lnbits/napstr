@@ -35,7 +35,14 @@
 
     return {
       windows: safeAssets.find((asset) => /\.exe$/i.test(asset.name)),
-      linux: safeAssets.find((asset) => /\.appimage$/i.test(asset.name))
+      linux: safeAssets.find((asset) => /\.appimage$/i.test(asset.name)),
+      'macos-arm64': safeAssets.find((asset) =>
+        /\.dmg$/i.test(asset.name) && /(aarch64|arm64|apple[-_ ]?silicon)/i.test(asset.name)
+      ),
+      'macos-intel': safeAssets.find((asset) =>
+        /\.dmg$/i.test(asset.name) && /(x86_64|x64|amd64|intel)/i.test(asset.name)
+      ),
+      'napstrfy-android': safeAssets.find((asset) => /\.apk$/i.test(asset.name))
     };
   }
 
@@ -83,14 +90,21 @@
       });
 
       const matched = matchAssets(Array.isArray(release.assets) ? release.assets : []);
+      const napstrfyPage = document.body.dataset.releaseProduct === 'napstrfy';
+      const expectedPlatforms = napstrfyPage
+        ? ['napstrfy-android']
+        : ['windows', 'linux', 'macos-arm64', 'macos-intel'];
       const available = Object.entries(matched)
-        .filter(([platform, asset]) => enableLinks(platform, asset))
+        .filter(([platform, asset]) => expectedPlatforms.includes(platform) && enableLinks(platform, asset))
         .map(([platform]) => platform);
 
-      if (available.length === 2) {
-        status.textContent = `Napstr ${version} downloads are ready.`;
+      const productName = napstrfyPage ? 'Napstrfy' : 'Napstr';
+      if (available.length === expectedPlatforms.length) {
+        status.textContent = `${productName} ${version} downloads are ready.`;
       } else {
-        status.textContent = `Napstr ${version} is published, but one or more installers are still uploading.`;
+        status.textContent = napstrfyPage
+          ? `${productName} ${version} is published, but its Android installer is not attached yet.`
+          : `${productName} ${version} is published, but one or more installers are still uploading.`;
       }
     } catch (error) {
       status.textContent = 'The automatic download list is temporarily unavailable.';

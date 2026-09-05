@@ -7,3 +7,8 @@ src-tauri/resources/tor/
 .cache/
 *.log
 .DS_Store
+android/dist/
+android/src-tauri/target/
+android/src-tauri/gen/
+remote-protocol/Cargo.lock
+remote-protocol/target/

@@ -8,11 +8,12 @@
 
   let appVersion = '…';
   const SEARCH_PAGE_SIZE = 100;
+  const LOCAL_PAGE_SIZE = 100;
   const VISIBLE_SEEDER_LIMIT = 100;
 
-  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox';
+  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Mobile';
   type PlayerMode = 'single' | 'folder' | 'all' | 'shuffle';
-  type PlayerOrigin = 'search' | 'downloads' | 'shared' | 'direct';
+  type PlayerOrigin = 'search' | 'downloads' | 'shared' | 'audiobook' | 'direct';
   type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
   type Result = {
     id: number;
@@ -31,6 +32,7 @@
     license?: string;
     description?: string;
     tags?: string;
+    audiobook?: Audiobook;
   };
   type SourceDetail = { pubkey: string; npub: string; displayName: string; relay: string; about: string; picture: string; eventId: string };
   type Transfer = {
@@ -50,21 +52,31 @@
     { label: 'Shared', icon: '▤' },
     { label: 'Profile', icon: '☺' },
     { label: 'Settings', icon: '⚙' },
-    { label: 'Trollbox', icon: '▣' }
+    { label: 'Trollbox', icon: '▣' },
+    { label: 'Mobile', icon: '▯' }
   ];
 
   type NativeFile = { fileId: string; filename: string; path: string; folder: string; size: number; format: string; status: string; title: string; artist: string; album: string; mime: string; license: string; description: string; tags: string };
   type NativeTransfer = { id: number; fileId: string; filename: string; size: number; progress: number; status: string; speed: string; destination: string };
   type SeedingStat = { fileId: string; delivered: number; activeGrants: number; otherSeeders: number };
   type NativeSettings = { napstrFolder: string; nostrRelays: string; displayName: string; profileAbout: string; profilePicture: string; relaysOverTor: boolean };
-  type Snapshot = { files: NativeFile[]; transfers: NativeTransfer[]; settings: NativeSettings; indexedBytes: number; native: boolean };
+  type AudiobookChapter = { position: number; fileId: string; filename: string; title: string; format: string; mime: string; size: number };
+  type Audiobook = { audiobookId: string; title: string; author: string; narrator: string; totalSize: number; chapters: AudiobookChapter[]; sources: SourceDetail[]; local: boolean; localFolder: string };
+  type Snapshot = { files: NativeFile[]; audiobooks: Audiobook[]; transfers: NativeTransfer[]; settings: NativeSettings; indexedBytes: number; native: boolean };
   type NetworkStatus = { connected: boolean; npub: string; pubkey: string; relayCount: number; relaysViaTor: boolean; torRunning: boolean; torStarting: boolean; torProgress: number; torError: string; error: string };
   type NetworkResult = { fileId: string; filename: string; title: string; artist: string; album: string; format: string; mime: string; size: number; license: string; description: string; tags: string; sources: SourceDetail[] };
+  type CatalogueBrowseCursor = { sessionId: string };
+  type CatalogueBrowsePage = { results: NetworkResult[]; cursor: CatalogueBrowseCursor | null; totalAvailable: number };
   type PlayerTrack = { fileId: string; name: string; folder: string; artist: string; mime: string };
   type PlaybackStatus = { fileId: string; currentTime: number; duration: number; playing: boolean; ended: boolean; error: string };
   type ReleaseStatus = { version: string; url: string };
   type GitHubRelease = { tag_name?: unknown; html_url?: unknown };
   type TrollboxMessage = { eventId: string; pubkey: string; npub: string; displayName: string; content: string; createdAt: number };
+  type IndexProgress = { scanning: boolean; processedFiles: number; indexedFiles: number; message: string };
+  type IndexBatch = { files: NativeFile[]; fileCount: number; totalBytes: number };
+  type MobileDevice = { endpointId: string; name: string; pairedAt: string; lastSeen: string };
+  type MobileStatus = { running: boolean; online: boolean; endpointId: string; error: string; devices: MobileDevice[] };
+  type MobilePairingOffer = { ticket: string; qrSvg: string; expiresAt: number; endpointId: string };
   type BlockConfirmation =
     | { kind: 'file'; fileId: string; label: string }
     | { kind: 'user'; pubkey: string; label: string };
@@ -94,7 +106,7 @@
   let nativeReady = false;
   let activityMessage = 'Starting Napstr…';
   let napstrFolder = '';
-  let nostrRelays = 'wss://relay.damus.io, wss://nos.lol, wss://relay.nostr.com, wss://relay.primal.net, wss://relay.snort.social, wss://nostr.mom';
+  let nostrRelays = 'wss://relay.damus.io, wss://nos.lol, wss://relay.nostr.com, wss://relay.primal.net, wss://relay.snort.social, wss://nostr.mom, wss://relay.nostr.band';
   let relaysOverTor = false;
   let displayName = 'napstr-user';
   let profileAbout = 'Sharing files privately with Napstr. napstr.net';
@@ -128,6 +140,11 @@
   let trollboxError = '';
   let trollboxPollPending = false;
   let trollboxRefreshAgain = false;
+  let mobileStatusValue: MobileStatus | null = null;
+  let mobilePairing: MobilePairingOffer | null = null;
+  let mobileLoading = false;
+  let mobileStatusPending = false;
+  let mobileError = '';
   let trollboxLog: HTMLDivElement;
   let trackDiscussionFileId = '';
   let trackDiscussionMessages: TrollboxMessage[] = [];
@@ -139,15 +156,26 @@
   let trackDiscussionRefreshAgain = false;
   let trackDiscussionLog: HTMLDivElement;
   let searchAction: 'search' | 'surprise' | 'source' | null = null;
+  let browseCursor: CatalogueBrowseCursor | null = null;
+  let browseLoading = false;
+  let browseGeneration = 0;
+  let loadedNetworkMatches: NetworkResult[] = [];
+  let loadedNetworkAudiobooks: Audiobook[] = [];
+  let browseTotalAvailable = 0;
   let rescanPending = false;
+  let indexing = false;
+  let downloadLibraryPage = 0;
+  let sharedLibraryPage = 0;
   let selectedSource = 0;
   let selectedShared: NativeFile | null = null;
   let selectedTagFile: NativeFile | null = null;
   let tagDraft = '';
   let tagSaving = false;
   let libraryFolderView = '*';
+  let libraryFolderMenuOpen = false;
   let playerMode: PlayerMode = 'single';
   let playerOrigin: PlayerOrigin = 'direct';
+  let activePlayerAudiobook: Audiobook | null = null;
   let playerQueue: PlayerTrack[] = [];
   let playerQueueIndex = -1;
   let currentTrack: PlayerTrack | null = null;
@@ -161,8 +189,17 @@
   let transferPaneHeight = 119;
   let stopTransferResize = () => {};
   let transfers: Transfer[] = [];
+  let localAudiobooks: Audiobook[] = [];
+  let audiobookEditorOpen = false;
+  let audiobookSaving = false;
+  let audiobookTitle = '';
+  let audiobookAuthor = '';
+  let audiobookNarrator = '';
+  type AudiobookDownload = { audiobookId: string; title: string; author: string; narrator: string; destinationFolder: string; chapters: AudiobookChapter[]; sources: SourceDetail[]; nextIndex: number; activeFileId: string; failed: number };
+  let audiobookDownloads: AudiobookDownload[] = [];
 
   let sharedFiles: Array<NativeFile & { name: string; readableSize: string; peers: number; delivered: number; otherSeeders: number }> = [];
+  let localFileIds = new Set<string>();
 
   const readableSize = (bytes: number) => {
     if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
@@ -173,13 +210,12 @@
 
   function mapFiles(files: NativeFile[]): Result[] {
     return files.map((file, index) => ({
-      id: index + 1, name: file.filename, format: file.format, size: readableSize(file.size), bytes: file.size, sources: 1,
+      id: index + 1, name: file.title || file.filename, format: file.format, size: readableSize(file.size), bytes: file.size, sources: 1,
       speed: 'Local', length: '—', fileId: file.fileId, artist: file.artist, album: file.album, license: file.license, description: file.description, tags: file.tags
     }));
   }
 
   function mapNetworkFiles(files: NetworkResult[]): Result[] {
-    const localFileIds = new Set(sharedFiles.map((file) => file.fileId));
     return files.map((file, index) => {
       const local = localFileIds.has(file.fileId);
       return {
@@ -189,6 +225,69 @@
         license: file.license, description: file.description, tags: file.tags
       };
     });
+  }
+
+  function audiobookMatches(book: Audiobook, value: string) {
+    if (/^audiobooks?$/i.test(value.trim())) return true;
+    const fields = [book.title, book.author, book.narrator, ...book.chapters.flatMap((chapter) => [chapter.title, chapter.filename])]
+      .join(' ')
+      .toLowerCase();
+    return value.trim().toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean).every((token) => fields.includes(token));
+  }
+
+  function mergeAudiobooks(trackResults: Result[], remoteBooks: Audiobook[], searchValue: string) {
+    const audiobookKeyword = /^audiobooks?$/i.test(searchValue.trim());
+    if (format !== 'Audiobooks' && !audiobookKeyword) return trackResults;
+    const books = new Map<string, Audiobook>();
+    for (const incoming of [...localAudiobooks.filter((book) => audiobookMatches(book, searchValue)), ...remoteBooks]) {
+      const existing = books.get(incoming.audiobookId);
+      if (!existing) {
+        books.set(incoming.audiobookId, { ...incoming, sources: [...incoming.sources] });
+        continue;
+      }
+      const sources = new Map(existing.sources.map((source) => [source.pubkey, source]));
+      incoming.sources.forEach((source) => sources.set(source.pubkey, source));
+      books.set(incoming.audiobookId, {
+        ...(existing.local ? existing : incoming),
+        local: existing.local || incoming.local,
+        localFolder: existing.localFolder || incoming.localFolder,
+        sources: [...sources.values()]
+      });
+    }
+    const grouped = [...books.values()].map((book, index): Result => ({
+      id: -(index + 1),
+      name: book.title,
+      format: 'AUDIOBOOK',
+      size: readableSize(book.totalSize),
+      bytes: book.totalSize,
+      sources: Math.max(book.local ? 1 : 0, book.sources.length),
+      speed: book.local ? 'Local' : 'Tor',
+      length: `${book.chapters.length} chapters`,
+      fileId: `audiobook:${book.audiobookId}`,
+      artist: book.author,
+      album: book.narrator ? `Narrated by ${book.narrator}` : '',
+      remote: !book.local,
+      sourceDetails: book.sources,
+      audiobook: book
+    }));
+    if (format === 'Audiobooks') {
+      return grouped
+        .sort((left, right) => right.sources - left.sources || left.name.localeCompare(right.name))
+        .map((result, index) => ({ ...result, id: index + 1 }));
+    }
+    // The dedicated media browse presents each collection once. This is only
+    // a display filter: normal title/artist searches retain every underlying
+    // audio hash, so one publisher cannot hide ordinary tracks by grouping
+    // them into a bogus collection.
+    const chapterIds = audiobookKeyword
+      ? new Set([...books.values()].flatMap((book) => book.chapters.map((chapter) => chapter.fileId)))
+      : null;
+    const displayedTracks = chapterIds
+      ? trackResults.filter((track) => !chapterIds.has(track.fileId))
+      : trackResults;
+    return [...grouped, ...displayedTracks]
+      .sort((left, right) => right.sources - left.sources || left.name.localeCompare(right.name))
+      .map((result, index) => ({ ...result, id: index + 1 }));
   }
 
   function matchesType(mime: string, fileFormat: string) {
@@ -213,6 +312,41 @@
       && matchesType(item.mime, item.format)
       && matchesSelectedFormat(item.format)
     );
+  }
+
+  function mergeSearchResults(networkMatches: NetworkResult[], localMatches: NativeFile[]) {
+    const merged = new Map<string, Result>();
+    for (const result of mapNetworkFiles(eligibleNetworkMatches(networkMatches))) {
+      merged.set(result.fileId, result);
+    }
+    if (minimumSources <= 1) {
+      for (const local of mapFiles(localMatches.filter((item) =>
+        item.size <= maximumBytes() && matchesType(item.mime, item.format)
+      ))) {
+        const existing = merged.get(local.fileId);
+        merged.set(local.fileId, existing
+          ? { ...existing, remote: false, speed: 'Local', sources: Math.max(1, existing.sources) }
+          : local);
+      }
+    }
+    return [...merged.values()]
+      .sort((left, right) => right.sources - left.sources || left.name.localeCompare(right.name))
+      .map((result, index) => ({ ...result, id: index + 1 }));
+  }
+
+  function mergeNetworkPages(existing: NetworkResult[], incoming: NetworkResult[]) {
+    const merged = new Map(existing.map((item) => [item.fileId, item]));
+    for (const item of incoming) {
+      const previous = merged.get(item.fileId);
+      if (!previous) {
+        merged.set(item.fileId, item);
+        continue;
+      }
+      const sources = new Map(previous.sources.map((source) => [source.pubkey, source]));
+      for (const source of item.sources) sources.set(source.pubkey, source);
+      merged.set(item.fileId, { ...previous, ...item, sources: [...sources.values()] });
+    }
+    return [...merged.values()];
   }
 
   function shuffled<T>(items: T[]) {
@@ -252,7 +386,7 @@
   }
 
   function isLocalFile(fileId: string) {
-    return sharedFiles.some((file) => file.fileId === fileId);
+    return localFileIds.has(fileId);
   }
 
   function folderName(folder: string) {
@@ -268,6 +402,84 @@
     return libraryFolderView === '*'
       ? sharedFiles
       : sharedFiles.filter((file) => file.folder === libraryFolderView);
+  }
+
+  function audiobookFolderFiles() {
+    if (libraryFolderView === '*') return [];
+    const prefix = `${libraryFolderView}/`;
+    return sharedFiles
+      .filter((file) => file.folder === libraryFolderView || file.folder.startsWith(prefix))
+      .sort((left, right) => `${left.folder}/${left.filename}`.localeCompare(`${right.folder}/${right.filename}`, undefined, { numeric: true, sensitivity: 'base' }));
+  }
+
+  function localPageCount(files: NativeFile[]) {
+    return Math.max(1, Math.ceil(files.length / LOCAL_PAGE_SIZE));
+  }
+
+  function paginatedTagFiles() {
+    const start = downloadLibraryPage * LOCAL_PAGE_SIZE;
+    return sharedFiles.slice(start, start + LOCAL_PAGE_SIZE);
+  }
+
+  function paginatedSharedFiles() {
+    const files = visibleSharedFiles();
+    const start = sharedLibraryPage * LOCAL_PAGE_SIZE;
+    return files.slice(start, start + LOCAL_PAGE_SIZE);
+  }
+
+  function localPageRange(page: number, total: number) {
+    if (!total) return '0';
+    const start = page * LOCAL_PAGE_SIZE + 1;
+    return `${start}–${Math.min(start + LOCAL_PAGE_SIZE - 1, total)}`;
+  }
+
+  function changeDownloadLibraryPage(nextPage: number) {
+    downloadLibraryPage = Math.max(0, Math.min(nextPage, localPageCount(sharedFiles) - 1));
+  }
+
+  function changeSharedLibraryPage(nextPage: number) {
+    const files = visibleSharedFiles();
+    sharedLibraryPage = Math.max(0, Math.min(nextPage, localPageCount(files) - 1));
+    selectedShared = paginatedSharedFiles()[0] ?? null;
+  }
+
+  function changeLibraryFolder() {
+    sharedLibraryPage = 0;
+    selectedShared = visibleSharedFiles()[0] ?? null;
+  }
+
+  function selectLibraryFolder(folder: string) {
+    libraryFolderView = folder;
+    libraryFolderMenuOpen = false;
+    changeLibraryFolder();
+  }
+
+  function containLibraryFolderMenu(node: HTMLElement) {
+    const outside = (event: PointerEvent) => {
+      if (libraryFolderMenuOpen && event.target instanceof Node && !node.contains(event.target)) {
+        libraryFolderMenuOpen = false;
+      }
+    };
+    const focusLeft = (event: FocusEvent) => {
+      if (!(event.relatedTarget instanceof Node) || !node.contains(event.relatedTarget)) {
+        libraryFolderMenuOpen = false;
+      }
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      libraryFolderMenuOpen = false;
+      node.querySelector<HTMLButtonElement>('.folder-picker-toggle')?.focus();
+    };
+    document.addEventListener('pointerdown', outside);
+    node.addEventListener('focusout', focusLeft);
+    node.addEventListener('keydown', escape);
+    return {
+      destroy() {
+        document.removeEventListener('pointerdown', outside);
+        node.removeEventListener('focusout', focusLeft);
+        node.removeEventListener('keydown', escape);
+      }
+    };
   }
 
   function resultPageCount() {
@@ -313,7 +525,14 @@
     return `${start}–${Math.min(start + SEARCH_PAGE_SIZE - 1, results.length)}`;
   }
 
-  function changeResultPage(nextPage: number) {
+  function availableResultTotal() {
+    return Math.max(results.length, browseTotalAvailable);
+  }
+
+  async function changeResultPage(nextPage: number) {
+    if (nextPage >= resultPageCount() && browseCursor && !browseLoading) {
+      await loadNextBrowsePage();
+    }
     resultPage = Math.max(0, Math.min(nextPage, resultPageCount() - 1));
     selectResult(paginatedResults()[0] ?? null);
   }
@@ -345,7 +564,7 @@
       if (networkConnected) {
         try {
           await invoke('publish_catalogue');
-          activityMessage = 'Tags saved and published to Nostr';
+          activityMessage = 'Tags saved and queued for Nostr publication';
         } catch (error) {
           activityMessage = `Tags saved locally · Nostr publication will retry later: ${String(error)}`;
         }
@@ -376,6 +595,11 @@
         });
     } else if (origin === 'shared') {
       queue = visibleSharedFiles().map(toPlayerTrack);
+    } else if (origin === 'audiobook' && activePlayerAudiobook) {
+      queue = activePlayerAudiobook.chapters.flatMap((chapter) => {
+        const file = sharedFiles.find((candidate) => candidate.fileId === chapter.fileId);
+        return file ? [toPlayerTrack(file)] : [];
+      });
     }
     return queue.some((item) => item.fileId === track.fileId) ? queue : [track];
   }
@@ -388,6 +612,7 @@
     const library = sortedLibraryTracks();
     if (!library.some((item) => item.fileId === track.fileId)) return [track];
     const contextualQueue = contextualPlayerQueue(track, origin);
+    if (origin === 'audiobook') return mode === 'single' ? [track] : contextualQueue;
     if (origin !== 'direct') {
       if (mode === 'folder') return contextualQueue.filter((item) => item.folder === track.folder);
       if (mode === 'shuffle') return shuffledQueueFrom(contextualQueue, track);
@@ -407,11 +632,18 @@
         selectResult(results[index]);
       }
     } else if (playerOrigin === 'downloads') {
-      const file = sharedFiles.find((item) => item.fileId === track.fileId);
-      if (file) selectTagFile(file);
+      const index = sharedFiles.findIndex((item) => item.fileId === track.fileId);
+      if (index >= 0) {
+        downloadLibraryPage = Math.floor(index / LOCAL_PAGE_SIZE);
+        selectTagFile(sharedFiles[index]);
+      }
     } else if (playerOrigin === 'shared') {
       const file = sharedFiles.find((item) => item.fileId === track.fileId);
-      if (file) selectedShared = { ...file };
+      if (file) {
+        const index = visibleSharedFiles().findIndex((item) => item.fileId === track.fileId);
+        if (index >= 0) sharedLibraryPage = Math.floor(index / LOCAL_PAGE_SIZE);
+        selectedShared = { ...file };
+      }
     }
   }
 
@@ -450,6 +682,7 @@
     const track = indexed
       ? toPlayerTrack(indexed)
       : { fileId, name, folder: '', artist: '', mime: '' };
+    activePlayerAudiobook = null;
     playerOrigin = origin;
     playerMode = indexed ? mode : 'single';
     playerQueue = queueForTrack(track, playerMode, playerOrigin);
@@ -476,7 +709,9 @@
   async function stopPlayer() {
     try { applyPlaybackStatus(await invoke<PlaybackStatus>('stop_audio')); }
     catch (error) { activityMessage = `Could not stop playback: ${String(error)}`; return; }
-    playerEnded = false;
+    // The native output stream is deliberately released on Stop. Treat the
+    // track as reloadable so pressing Play opens it again from the beginning.
+    playerEnded = true;
     if (currentTrack) activityMessage = `Stopped ${currentTrack.name}`;
   }
 
@@ -541,11 +776,16 @@
     const selectedFileId = selected?.fileId;
     if (resultsAreNetwork) {
       results = results.map((result) => {
+        if (result.audiobook) {
+          const localBook = localAudiobooks.find((book) => book.audiobookId === result.audiobook?.audiobookId);
+          const audiobook = localBook ? { ...result.audiobook, local: true, localFolder: localBook.localFolder } : result.audiobook;
+          return { ...result, audiobook, remote: !audiobook.local, speed: audiobook.local ? 'Local' : 'Tor' };
+        }
         const local = isLocalFile(result.fileId);
         return { ...result, remote: !local, speed: local ? 'Local' : 'Tor' };
       });
     } else if (!query.trim() || searchedQuery === 'local catalogue' || searchedQuery === 'All audio') {
-      results = mapFiles(sharedFiles);
+      results = mergeAudiobooks(mapFiles(sharedFiles), [], query.trim());
     } else {
       results = results.filter((result) => isLocalFile(result.fileId));
     }
@@ -562,9 +802,13 @@
     displayName = snapshot.settings.displayName;
     profileAbout = snapshot.settings.profileAbout;
     profilePicture = snapshot.settings.profilePicture;
+    localAudiobooks = snapshot.audiobooks;
     sharedFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: seedingStats[file.fileId]?.activeGrants ?? 0, delivered: seedingStats[file.fileId]?.delivered ?? 0, otherSeeders: seedingStats[file.fileId]?.otherSeeders ?? 0 }));
+    localFileIds = new Set(snapshot.files.map((file) => file.fileId));
+    downloadLibraryPage = Math.min(downloadLibraryPage, localPageCount(snapshot.files) - 1);
+    sharedLibraryPage = Math.min(sharedLibraryPage, localPageCount(visibleSharedFiles()) - 1);
     if (selectedShared) selectedShared = snapshot.files.find((file) => file.fileId === selectedShared?.fileId) ?? null;
-    results = mapFiles(snapshot.files);
+    results = mergeAudiobooks(mapFiles(snapshot.files), [], '');
     resultPage = 0;
     resultsAreNetwork = false;
     selected = results[0] ?? null;
@@ -652,6 +896,15 @@
     }
   }
 
+  async function openNapstrfyWebsite(event: MouseEvent) {
+    event.preventDefault();
+    try {
+      await invoke('open_napstrfy_website');
+    } catch (error) {
+      activityMessage = `Could not open the Napstrfy website: ${String(error)}`;
+    }
+  }
+
   function chatNameColor(npub: string) {
     const colours = ['#0000b8', '#006400', '#8b008b', '#a00020', '#005f73', '#7a3e00', '#4b0082', '#006b3c', '#9b1c00', '#0047ab', '#7030a0', '#007070'];
     let hash = 2166136261;
@@ -695,6 +948,59 @@
   function activateView(view: View) {
     activeView = view;
     if (view === 'Trollbox') void refreshTrollbox();
+    if (view === 'Mobile') void openMobileConnect();
+  }
+
+  async function openMobileConnect() {
+    await refreshMobileStatus();
+    if (!mobilePairing) await createMobilePairing();
+  }
+
+  async function refreshMobileStatus() {
+    if (!nativeReady || mobileStatusPending) return;
+    mobileStatusPending = true;
+    try {
+      mobileStatusValue = await invoke<MobileStatus>('mobile_status');
+      mobileError = mobileStatusValue.error;
+    } catch (error) {
+      mobileError = String(error);
+    } finally {
+      mobileStatusPending = false;
+    }
+  }
+
+  async function createMobilePairing() {
+    if (!nativeReady || mobileLoading) return;
+    mobileLoading = true;
+    mobileError = '';
+    try {
+      mobilePairing = await invoke<MobilePairingOffer>('create_mobile_pairing');
+      await refreshMobileStatus();
+    } catch (error) {
+      mobileError = String(error);
+    } finally {
+      mobileLoading = false;
+    }
+  }
+
+  async function revokeMobileDevice(device: MobileDevice) {
+    if (!window.confirm(`Remove ${device.name}? It will need a new QR code before it can connect again.`)) return;
+    try {
+      await invoke('revoke_mobile_device', { endpointId: device.endpointId });
+      await refreshMobileStatus();
+    } catch (error) {
+      mobileError = String(error);
+    }
+  }
+
+  function mobileLastSeen(value: string) {
+    const time = Date.parse(value);
+    if (!Number.isFinite(time)) return 'Never';
+    const elapsed = Math.max(0, Date.now() - time);
+    if (elapsed < 90_000) return 'Just now';
+    if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)} min ago`;
+    if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)} hr ago`;
+    return new Date(time).toLocaleDateString();
   }
 
   async function sendTrollboxMessage() {
@@ -722,7 +1028,7 @@
     const changed = selected?.fileId !== item?.fileId;
     selected = item;
     selectedSource = 0;
-    if (!item) {
+    if (!item || item.audiobook) {
       trackDiscussionFileId = '';
       trackDiscussionMessages = [];
       trackDiscussionDraft = '';
@@ -794,9 +1100,13 @@
     try {
       const snapshot = await invoke<Snapshot>('get_snapshot');
       indexedBytes = snapshot.indexedBytes;
+      localAudiobooks = snapshot.audiobooks;
       const nextFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: seedingStats[file.fileId]?.activeGrants ?? 0, delivered: seedingStats[file.fileId]?.delivered ?? 0, otherSeeders: seedingStats[file.fileId]?.otherSeeders ?? 0 }));
       const removedCurrentTrack = currentTrack && !nextFiles.some((file) => file.fileId === currentTrack?.fileId);
       sharedFiles = nextFiles;
+      localFileIds = new Set(nextFiles.map((file) => file.fileId));
+      downloadLibraryPage = Math.min(downloadLibraryPage, localPageCount(nextFiles) - 1);
+      sharedLibraryPage = Math.min(sharedLibraryPage, localPageCount(visibleSharedFiles()) - 1);
       if (selectedShared) selectedShared = nextFiles.find((file) => file.fileId === selectedShared?.fileId) ?? null;
       if (selectedTagFile && !nextFiles.some((file) => file.fileId === selectedTagFile?.fileId)) {
         selectedTagFile = null;
@@ -818,6 +1128,30 @@
       }
       syncResultLocality();
     } catch { /* the next folder-watch or transfer poll will retry */ }
+  }
+
+  function mergeIndexBatch(batch: IndexBatch) {
+    const merged = new Map(sharedFiles.map((file) => [file.fileId, file]));
+    for (const file of batch.files) {
+      merged.set(file.fileId, {
+        ...file,
+        name: file.filename,
+        readableSize: readableSize(file.size),
+        peers: merged.get(file.fileId)?.peers ?? 0,
+        delivered: merged.get(file.fileId)?.delivered ?? 0,
+        otherSeeders: merged.get(file.fileId)?.otherSeeders ?? 0
+      });
+    }
+    sharedFiles = [...merged.values()].sort((left, right) => left.filename.localeCompare(right.filename));
+    localFileIds = new Set(sharedFiles.map((file) => file.fileId));
+    indexedBytes = sharedFiles.reduce((total, file) => total + file.size, 0);
+    if (selectedShared) selectedShared = merged.get(selectedShared.fileId) ?? selectedShared;
+    if (selectedTagFile) selectedTagFile = merged.get(selectedTagFile.fileId) ?? selectedTagFile;
+    if (currentTrack) {
+      playerQueue = queueForTrack(currentTrack, playerMode);
+      playerQueueIndex = playerQueue.findIndex((item) => item.fileId === currentTrack?.fileId);
+    }
+    syncResultLocality();
   }
 
   async function connectNetwork() {
@@ -879,30 +1213,128 @@
 
   async function search() {
     if (searchAction) return;
+    const generation = ++browseGeneration;
+    browseCursor = null;
+    browseLoading = false;
+    loadedNetworkMatches = [];
+    loadedNetworkAudiobooks = [];
+    browseTotalAvailable = 0;
     searchAction = 'search';
     try {
-      searchedQuery = query.trim() || 'All audio';
+      const trimmedQuery = query.trim();
+      searchedQuery = trimmedQuery || (format === 'Audiobooks' ? 'All audiobooks' : 'All audio');
       if (networkConnected) {
-        try {
-          const matches = await invoke<NetworkResult[]>('network_search', { query: query.trim() });
-          const ranked = eligibleNetworkMatches(matches)
-            .sort((left, right) => right.sources.length - left.sources.length || left.filename.localeCompare(right.filename));
-          results = mapNetworkFiles(ranked);
-          resultsAreNetwork = true;
-          activityMessage = `${results.length} track(s) found across the network, most available first`;
-        } catch (error) { activityMessage = `Global search failed: ${String(error)}`; }
+        if (format === 'Audiobooks') {
+          try {
+            loadedNetworkAudiobooks = await invoke<Audiobook[]>('network_search_audiobooks', { query: trimmedQuery });
+            if (generation !== browseGeneration) return;
+            results = mergeAudiobooks([], loadedNetworkAudiobooks, trimmedQuery);
+            resultsAreNetwork = true;
+            activityMessage = `${results.length} audiobook collection(s) found`;
+          } catch (error) {
+            if (generation !== browseGeneration) return;
+            loadedNetworkAudiobooks = [];
+            results = mergeAudiobooks([], [], trimmedQuery);
+            resultsAreNetwork = false;
+            activityMessage = `Global audiobook search failed: ${String(error)} · showing ${results.length} local collection(s)`;
+          }
+        } else {
+        const includeAudiobooks = /^audiobooks?$/i.test(trimmedQuery);
+        const audiobookRequest = includeAudiobooks
+          ? invoke<Audiobook[]>('network_search_audiobooks', { query: trimmedQuery })
+              .then((books) => books, () => [] as Audiobook[])
+          : Promise.resolve([] as Audiobook[]);
+        const [networkOutcome, localOutcome] = await Promise.allSettled([
+          trimmedQuery
+            ? invoke<NetworkResult[]>('network_search', { query: trimmedQuery })
+            : invoke<CatalogueBrowsePage>('network_browse', { cursor: null, limit: 500, cacheLimit: 10000 }),
+          invoke<NativeFile[]>('search_catalog', { query: trimmedQuery })
+        ]);
+        if (generation !== browseGeneration) return;
+        const networkMatches = networkOutcome.status === 'fulfilled'
+          ? trimmedQuery
+            ? networkOutcome.value as NetworkResult[]
+            : (networkOutcome.value as CatalogueBrowsePage).results
+          : [];
+        const localMatches = localOutcome.status === 'fulfilled' ? localOutcome.value : [];
+        loadedNetworkMatches = networkMatches;
+        loadedNetworkAudiobooks = [];
+        browseCursor = format !== 'Audiobooks' && networkOutcome.status === 'fulfilled' && !trimmedQuery
+          ? (networkOutcome.value as CatalogueBrowsePage).cursor
+          : null;
+        browseTotalAvailable = format !== 'Audiobooks' && networkOutcome.status === 'fulfilled' && !trimmedQuery
+          ? (networkOutcome.value as CatalogueBrowsePage).totalAvailable
+          : 0;
+        results = mergeAudiobooks(mergeSearchResults(networkMatches, localMatches), loadedNetworkAudiobooks, trimmedQuery);
+        resultsAreNetwork = networkOutcome.status === 'fulfilled';
+        if (networkOutcome.status === 'rejected') {
+          activityMessage = localOutcome.status === 'fulfilled'
+            ? `Global search failed: ${String(networkOutcome.reason)} · showing ${results.length} local match(es)`
+            : `Search failed: ${String(networkOutcome.reason)}`;
+        } else {
+          activityMessage = format === 'Audiobooks'
+            ? `${results.length} audiobook collection(s) found`
+            : !trimmedQuery
+            ? `${results.length} loaded of ${availableResultTotal()} currently available file ID(s), ranked by active seeders`
+            : `${results.length} available file ID(s), ranked by active seeders`;
+        }
+        // Audiobook manifests are additive. Let ordinary track results render
+        // as soon as they are ready instead of making every search wait for a
+        // second relay query and manifest validation pass.
+        if (includeAudiobooks) void audiobookRequest.then((books) => {
+          if (generation !== browseGeneration) return;
+          loadedNetworkAudiobooks = books;
+          results = mergeAudiobooks(
+            mergeSearchResults(loadedNetworkMatches, localMatches),
+            loadedNetworkAudiobooks,
+            trimmedQuery
+          );
+          resultPage = 0;
+          selectResult((selected && results.find((result) => result.fileId === selected?.fileId)) || results[0] || null, true);
+          activityMessage = format === 'Audiobooks'
+            ? `${results.length} audiobook collection(s) found`
+            : !trimmedQuery
+            ? `${results.length} loaded of ${availableResultTotal()} currently available file ID(s), ranked by active seeders`
+            : `${results.length} available file ID(s), ranked by active seeders`;
+        });
+        }
       } else if (nativeReady) {
         try {
           const matches = await invoke<NativeFile[]>('search_catalog', { query: query.trim() });
-          results = mapFiles(matches.filter((item) => minimumSources <= 1 && item.size <= maximumBytes() && matchesType(item.mime, item.format) && matchesSelectedFormat(item.format)));
+          results = mergeAudiobooks(mapFiles(matches.filter((item) => minimumSources <= 1 && item.size <= maximumBytes() && matchesType(item.mime, item.format) && matchesSelectedFormat(item.format))), [], query.trim());
           resultsAreNetwork = false;
           activityMessage = `${results.length} local match(es) found`;
         } catch (error) { activityMessage = `Search failed: ${String(error)}`; }
       }
       resultPage = 0;
       selectResult(results[0] ?? null, true);
+      if (generation === browseGeneration && !query.trim() && browseCursor) {
+        void loadNextBrowsePage();
+      }
     } finally {
-      searchAction = null;
+      if (generation === browseGeneration) searchAction = null;
+    }
+  }
+
+  async function loadNextBrowsePage() {
+    const cursor = browseCursor;
+    if (!cursor || browseLoading || query.trim()) return;
+    const generation = browseGeneration;
+    browseLoading = true;
+    activityMessage = `${results.length} available file ID(s) loaded · fetching the next relay page…`;
+    try {
+      const page = await invoke<CatalogueBrowsePage>('network_browse', { cursor, limit: 500, cacheLimit: 10000 });
+      if (generation !== browseGeneration || query.trim()) return;
+      loadedNetworkMatches = mergeNetworkPages(loadedNetworkMatches, page.results);
+      browseCursor = page.cursor;
+      browseTotalAvailable = page.totalAvailable;
+      results = mergeAudiobooks(mergeSearchResults(loadedNetworkMatches, sharedFiles), loadedNetworkAudiobooks, '');
+      resultsAreNetwork = true;
+      activityMessage = `${results.length} loaded of ${availableResultTotal()} currently available file ID(s), ranked by active seeders`;
+    } catch (error) {
+      if (generation === browseGeneration) activityMessage = `Could not load the next catalogue page: ${String(error)}`;
+    } finally {
+      if (generation === browseGeneration) browseLoading = false;
     }
   }
 
@@ -912,11 +1344,22 @@
       activityMessage = 'Connect first, then ask for a surprise';
       return;
     }
+    browseGeneration += 1;
+    browseCursor = null;
+    browseLoading = false;
+    loadedNetworkMatches = [];
+    loadedNetworkAudiobooks = [];
+    browseTotalAvailable = 0;
     searchAction = 'surprise';
     searchedQuery = 'Surprise me';
     activityMessage = 'Finding 50 random downloadable tracks…';
     try {
-      const matches = await invoke<NetworkResult[]>('network_search', { query: '' });
+      const page = await invoke<CatalogueBrowsePage>('network_browse', { cursor: null, limit: 50, cacheLimit: 50 });
+      let matches = page.results;
+      if (matches.length < 50 && page.cursor) {
+        const missing = await invoke<CatalogueBrowsePage>('network_browse', { cursor: page.cursor, limit: 50, cacheLimit: 50 });
+        matches = mergeNetworkPages(matches, missing.results);
+      }
       const downloadable = eligibleNetworkMatches(matches)
         .filter((item) => !isLocalFile(item.fileId) && item.sources.length > 0);
       results = mapNetworkFiles(shuffled(downloadable).slice(0, 50));
@@ -963,6 +1406,10 @@
   async function startDownload() {
     const target = selected;
     if (!target) return;
+    if (target.audiobook) {
+      await startAudiobookDownload(target.audiobook);
+      return;
+    }
     if (nativeReady && isLocalFile(target.fileId)) {
       await playAudio(target.fileId, target.name, playerMode, 'search');
       return;
@@ -1000,8 +1447,214 @@
   }
 
   async function playSelectedAudio() {
-    if (!selected || !isLocalFile(selected.fileId)) return;
+    if (!selected) return;
+    if (selected.audiobook) {
+      await playAudiobook(selected.audiobook);
+      return;
+    }
+    if (!isLocalFile(selected.fileId)) return;
     await playAudio(selected.fileId, selected.name, playerMode, 'search');
+  }
+
+  function currentFolderAudiobook() {
+    if (libraryFolderView === '*') return null;
+    return localAudiobooks.find((book) => book.localFolder === libraryFolderView) ?? null;
+  }
+
+  function openAudiobookEditor() {
+    if (libraryFolderView === '*' || audiobookFolderFiles().length < 1) return;
+    const existing = currentFolderAudiobook();
+    const files = audiobookFolderFiles();
+    const folderTitle = folderName(libraryFolderView).split('/').at(-1) ?? 'Audiobook';
+    audiobookTitle = existing?.title || files.find((file) => file.album)?.album || folderTitle.replace(/[_-]+/g, ' ');
+    audiobookAuthor = existing?.author || files.find((file) => file.artist)?.artist || '';
+    audiobookNarrator = existing?.narrator || '';
+    audiobookEditorOpen = true;
+  }
+
+  async function saveAudiobookGroup() {
+    if (audiobookSaving || libraryFolderView === '*') return;
+    audiobookSaving = true;
+    try {
+      localAudiobooks = await invoke<Audiobook[]>('save_audiobook', {
+        folder: libraryFolderView,
+        title: audiobookTitle,
+        author: audiobookAuthor,
+        narrator: audiobookNarrator
+      });
+      audiobookEditorOpen = false;
+      activityMessage = `${audiobookTitle.trim()} grouped and queued for Nostr publication`;
+      syncResultLocality();
+    } catch (error) {
+      activityMessage = `Could not group audiobook: ${String(error)}`;
+    } finally {
+      audiobookSaving = false;
+    }
+  }
+
+  async function ungroupAudiobook() {
+    const existing = currentFolderAudiobook();
+    if (!existing || audiobookSaving) return;
+    audiobookSaving = true;
+    try {
+      localAudiobooks = await invoke<Audiobook[]>('remove_audiobook', { folder: existing.localFolder });
+      audiobookEditorOpen = false;
+      activityMessage = `${existing.title} is now published as individual tracks only`;
+      syncResultLocality();
+    } catch (error) {
+      activityMessage = `Could not remove audiobook grouping: ${String(error)}`;
+    } finally {
+      audiobookSaving = false;
+    }
+  }
+
+  async function playAudiobook(book: Audiobook) {
+    const firstReadyChapter = book.chapters.find((chapter) => isLocalFile(chapter.fileId));
+    if (!firstReadyChapter) {
+      activityMessage = 'Download at least the first chapter before playing this audiobook';
+      return;
+    }
+    await playAudiobookChapter(book, firstReadyChapter.fileId);
+  }
+
+  async function playAudiobookChapter(book: Audiobook, fileId: string) {
+    const queue = book.chapters.flatMap((chapter) => {
+      const file = sharedFiles.find((candidate) => candidate.fileId === chapter.fileId);
+      return file ? [toPlayerTrack(file)] : [];
+    });
+    const index = queue.findIndex((chapter) => chapter.fileId === fileId);
+    if (index < 0) {
+      activityMessage = 'That chapter has not finished downloading yet';
+      return;
+    }
+    activePlayerAudiobook = book;
+    playerOrigin = 'audiobook';
+    playerMode = 'all';
+    playerQueue = queue;
+    await loadPlayerTrack(index);
+  }
+
+  function audiobookChapterStatus(book: Audiobook, chapter: AudiobookChapter) {
+    if (isLocalFile(chapter.fileId)) return 'Ready';
+    const download = audiobookDownloads.find((item) => item.audiobookId === book.audiobookId);
+    return download?.activeFileId === chapter.fileId ? 'Downloading' : 'Waiting';
+  }
+
+  async function requestNextAudiobookChapter(audiobookId: string) {
+    const queue = audiobookDownloads.find((item) => item.audiobookId === audiobookId);
+    if (!queue || queue.activeFileId) return;
+    while (queue.nextIndex < queue.chapters.length && isLocalFile(queue.chapters[queue.nextIndex].fileId)) queue.nextIndex += 1;
+    if (queue.nextIndex >= queue.chapters.length) {
+      const missing = queue.chapters.filter((chapter) => !isLocalFile(chapter.fileId)).length;
+      if (missing) {
+        audiobookDownloads = audiobookDownloads.filter((item) => item.audiobookId !== audiobookId);
+        activityMessage = `${queue.title} finished with ${missing} missing chapter${missing === 1 ? '' : 's'} · select the book to retry`;
+        return;
+      }
+      if (queue.destinationFolder) {
+        try {
+          localAudiobooks = await invoke<Audiobook[]>('save_audiobook', {
+            folder: `Audiobooks/${queue.destinationFolder}`,
+            title: queue.title,
+            author: queue.author,
+            narrator: queue.narrator
+          });
+          syncResultLocality();
+        } catch { /* downloaded chapters remain valid and can be grouped manually */ }
+      }
+      audiobookDownloads = audiobookDownloads.filter((item) => item.audiobookId !== audiobookId);
+      activityMessage = `${queue.title} downloaded and ready to play`;
+      return;
+    }
+    const chapter = queue.chapters[queue.nextIndex];
+    queue.activeFileId = chapter.fileId;
+    audiobookDownloads = [...audiobookDownloads];
+    startingDownloads = new Set(startingDownloads).add(chapter.fileId);
+    try {
+      await invoke('request_network_download', {
+        fileId: chapter.fileId,
+        sourcePubkeys: queue.sources.map((source) => source.pubkey),
+        destinationFolder: queue.destinationFolder
+      });
+      transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers'));
+      activityMessage = `Downloading ${queue.title} · chapter ${queue.nextIndex + 1} of ${queue.chapters.length}`;
+    } catch (error) {
+      queue.failed += 1;
+      queue.nextIndex += 1;
+      queue.activeFileId = '';
+      audiobookDownloads = [...audiobookDownloads];
+      activityMessage = `Chapter ${queue.nextIndex} could not start: ${String(error)} · continuing with the book`;
+      void requestNextAudiobookChapter(audiobookId);
+    } finally {
+      const nextStarting = new Set(startingDownloads);
+      nextStarting.delete(chapter.fileId);
+      startingDownloads = nextStarting;
+    }
+  }
+
+  async function advanceAudiobookDownloads() {
+    for (const queue of [...audiobookDownloads]) {
+      if (queue.activeFileId && isLocalFile(queue.activeFileId)) {
+        queue.nextIndex += 1;
+        queue.activeFileId = '';
+      } else if (queue.activeFileId) {
+        const transfer = transfers.find((item) => item.fileId === queue.activeFileId);
+        if (transfer && isFinishedTransfer(transfer) && !isCompleteTransfer(transfer)) {
+          queue.failed += 1;
+          queue.nextIndex += 1;
+          queue.activeFileId = '';
+        }
+      }
+      audiobookDownloads = [...audiobookDownloads];
+      if (!queue.activeFileId) await requestNextAudiobookChapter(queue.audiobookId);
+    }
+  }
+
+  async function startAudiobookDownload(book: Audiobook) {
+    if (book.chapters.every((chapter) => isLocalFile(chapter.fileId))) {
+      await playAudiobook(book);
+      return;
+    }
+    if (!book.sources.length) {
+      activityMessage = 'No complete audiobook seeder is currently available';
+      return;
+    }
+    if (audiobookDownloads.some((item) => item.audiobookId === book.audiobookId)) {
+      activityMessage = `${book.title} is already in the download queue`;
+      return;
+    }
+    audiobookDownloads = [...audiobookDownloads, {
+      audiobookId: book.audiobookId,
+      title: book.title,
+      author: book.author,
+      narrator: book.narrator,
+      destinationFolder: `${book.title.replace(/[\x00-\x1f/\\:*?"<>|]/g, '_').replace(/^[.\s]+|[.\s]+$/g, '').slice(0, 86) || 'Audiobook'} [${book.audiobookId.slice(0, 8)}]`,
+      chapters: book.chapters,
+      sources: book.sources,
+      nextIndex: 0,
+      activeFileId: '',
+      failed: 0
+    }];
+    await requestNextAudiobookChapter(book.audiobookId);
+  }
+
+  function selectedAudiobookComplete() {
+    return selected?.audiobook?.chapters.every((chapter) => isLocalFile(chapter.fileId)) ?? false;
+  }
+
+  function selectedAudiobookDownloading() {
+    const audiobookId = selected?.audiobook?.audiobookId;
+    return Boolean(audiobookId && audiobookDownloads.some((item) => item.audiobookId === audiobookId));
+  }
+
+  async function playSelectedAudiobook() {
+    const book = selected?.audiobook;
+    if (book) await playAudiobook(book);
+  }
+
+  async function downloadSelectedAudiobook() {
+    const book = selected?.audiobook;
+    if (book) await startAudiobookDownload(book);
   }
 
   async function playSelectedSharedAudio() {
@@ -1021,7 +1674,8 @@
   }
 
   async function activateSelected() {
-    if (nativeReady && selected && isLocalFile(selected.fileId)) await playSelectedAudio();
+    if (nativeReady && selected?.audiobook?.local) await playSelectedAudio();
+    else if (nativeReady && selected && isLocalFile(selected.fileId)) await playSelectedAudio();
     else await startDownload();
   }
 
@@ -1102,10 +1756,8 @@
       const selectedPath = await open({ directory: true, multiple: false, title: 'Choose the folder Napstr uses for downloads and sharing', defaultPath: napstrFolder || undefined });
       if (!selectedPath || Array.isArray(selectedPath)) return;
       activityMessage = 'Indexing files and calculating SHA-256 hashes…';
-      const report = await invoke<{ fileCount: number; totalBytes: number; errors: string[] }>('set_napstr_folder', { path: selectedPath });
-      await refreshSnapshot();
-      if (networkConnected) await invoke('publish_catalogue');
-      activityMessage = `Indexed ${report.fileCount} file(s), ${readableSize(report.totalBytes)}${report.errors.length ? ` · ${report.errors.length} skipped` : ''}`;
+      const report = await invoke<{ fileCount: number; totalBytes: number; errors: string[]; errorCount: number; changedFiles: number }>('set_napstr_folder', { path: selectedPath });
+      activityMessage = `Indexed ${report.fileCount} file(s), ${readableSize(report.totalBytes)}${report.errorCount ? ` · ${report.errorCount} skipped` : ''}`;
     } catch (error) { activityMessage = `Folder selection failed: ${String(error)}`; }
   }
 
@@ -1120,14 +1772,22 @@
     rescanPending = true;
     activityMessage = 'Rescanning Napstr folder…';
     try {
-      const report = await invoke<{ fileCount: number; totalBytes: number }>('rescan_napstr_folder');
-      await refreshSnapshot();
-      if (networkConnected) await invoke('publish_catalogue');
+      const report = await invoke<{ fileCount: number; totalBytes: number; changedFiles: number }>('rescan_napstr_folder');
       activityMessage = `Indexed ${report.fileCount} file(s), ${readableSize(report.totalBytes)}`;
     } catch (error) {
       activityMessage = `Rescan failed: ${String(error)}`;
     } finally {
       rescanPending = false;
+    }
+  }
+
+  async function cancelLibraryScan() {
+    if (!nativeReady || !indexing) return;
+    try {
+      await invoke('cancel_library_scan');
+      activityMessage = 'Cancelling the library scan…';
+    } catch (error) {
+      activityMessage = `Could not cancel indexing: ${String(error)}`;
     }
   }
 
@@ -1307,14 +1967,42 @@
         appVersion = 'unknown';
       });
     let destroyed = false;
-    const chatUnlisteners: UnlistenFn[] = [];
+    const eventUnlisteners: UnlistenFn[] = [];
     void listen<string>('napstr-public-chat', ({ payload: topic }) => {
       if (topic === 'napstr-trollbox') void refreshTrollbox();
       const fileId = selected?.fileId?.toLowerCase();
       if (fileId && topic === `napstr-${fileId}`) void refreshTrackDiscussion(fileId);
     }).then((unlisten) => {
       if (destroyed) unlisten();
-      else chatUnlisteners.push(unlisten);
+      else eventUnlisteners.push(unlisten);
+    });
+    void listen('napstr-library-changed', () => {
+      void refreshLocalLibrary();
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
+    });
+    void listen('napstr-transfers-changed', () => {
+      void invoke<NativeTransfer[]>('get_transfers')
+        .then((items) => { transfers = mapTransfers(items); })
+        .catch(() => {});
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
+    });
+    void listen<IndexBatch>('napstr-index-batch', ({ payload }) => {
+      mergeIndexBatch(payload);
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
+    });
+    void listen<IndexProgress>('napstr-index-progress', ({ payload }) => {
+      indexing = payload.scanning;
+      if (payload.message) activityMessage = payload.message;
+      if (!payload.scanning) rescanPending = false;
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
     });
     const updateClock = () => {
       clock = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit' }).format(new Date());
@@ -1361,7 +2049,11 @@
     }, 5000);
     let transferPollPending = false;
     const transferTimer = window.setInterval(async () => {
-      if (!nativeReady || transferPollPending) return;
+      const transferWorkPending =
+        startingDownloads.size > 0 ||
+        audiobookDownloads.length > 0 ||
+        transfers.some(isActiveTransfer);
+      if (!nativeReady || transferPollPending || !transferWorkPending) return;
       transferPollPending = true;
       try {
         const items = await invoke<NativeTransfer[]>('get_transfers');
@@ -1381,16 +2073,10 @@
           const latest = newlyComplete[0] ?? vanishedActive[0];
           activityMessage = `${latest.name} downloaded, verified, and ready to play`;
         }
+        if (audiobookDownloads.length) await advanceAudiobookDownloads();
       } catch { /* the next transfer poll retries */ }
       finally { transferPollPending = false; }
     }, 1000);
-    let libraryPollPending = false;
-    const libraryTimer = window.setInterval(async () => {
-      if (!nativeReady || libraryPollPending) return;
-      libraryPollPending = true;
-      try { await refreshLocalLibrary(); }
-      finally { libraryPollPending = false; }
-    }, 2000);
     const playerTimer = window.setInterval(() => {
       if (!nativeReady || !currentTrack || playerLoading) return;
       invoke<PlaybackStatus>('audio_status').then((status) => {
@@ -1399,15 +2085,19 @@
         if (naturallyEnded) void playerTrackEnded();
       }).catch(() => {});
     }, 250);
+    const mobileTimer = window.setInterval(() => {
+      if (mobilePairing && mobilePairing.expiresAt <= Math.floor(Date.now() / 1000)) mobilePairing = null;
+      if (activeView === 'Mobile') void refreshMobileStatus();
+    }, 3000);
     return () => {
       destroyed = true;
-      chatUnlisteners.forEach((unlisten) => unlisten());
+      eventUnlisteners.forEach((unlisten) => unlisten());
       clearInterval(clockTimer);
       clearInterval(wakeTimer);
       clearInterval(networkTimer);
       clearInterval(transferTimer);
-      clearInterval(libraryTimer);
       clearInterval(playerTimer);
+      clearInterval(mobileTimer);
       window.removeEventListener('resize', clampTransferPane);
       window.removeEventListener('focus', foregrounded);
       document.removeEventListener('visibilitychange', foregrounded);
@@ -1503,7 +2193,7 @@
             <label for="search-query">Search:</label>
             <input id="search-query" bind:value={query} placeholder="punk, rock, jazz, audiobook" />
             <label for="format">File type:</label>
-            <select id="format" bind:value={format}><option>Audio only</option><option>FLAC</option><option>MP3</option><option>WAV</option><option>OGG</option><option>OPUS</option></select>
+            <select id="format" bind:value={format} disabled={searchAction !== null} onchange={() => void search()}><option>Audio only</option><option>Audiobooks</option><option>FLAC</option><option>MP3</option><option>WAV</option><option>OGG</option><option>OPUS</option></select>
             <button class="classic-button primary search-button" type="submit" disabled={searchAction !== null} aria-busy={searchAction === 'search'}>
               {#if searchAction === 'search'}<span class="search-spinner" aria-hidden="true"></span>{/if}
               {searchAction === 'search' ? 'Searching' : 'Search'}
@@ -1521,14 +2211,14 @@
 
         <div class="split-content">
           <section class="results-pane" aria-label="Search results">
-            <div class="section-caption"><span>Search results for “{searchedQuery}”</span><small>{results.length} track{results.length === 1 ? '' : 's'} found</small></div>
+            <div class="section-caption"><span>Search results for “{searchedQuery}”</span><small>{format === 'Audiobooks' ? `${results.length} audiobook${results.length === 1 ? '' : 's'} found` : browseTotalAvailable ? `${results.length} loaded of ${availableResultTotal()} available` : `${results.length} file IDs found`}</small></div>
             <div class="table-wrap">
               <table class="file-table">
                 <thead><tr><th class="name-col"><button class="sort-header" onclick={() => toggleSort('name')}>Name{sortIndicator('name')}</button></th><th><button class="sort-header" onclick={() => toggleSort('format')}>Type{sortIndicator('format')}</button></th><th class="number"><button class="sort-header" onclick={() => toggleSort('bytes')}>Size{sortIndicator('bytes')}</button></th><th class="number"><button class="sort-header" onclick={() => toggleSort('sources')}>Seeders{sortIndicator('sources')}</button></th><th>Line speed</th><th>Length</th></tr></thead>
                 <tbody>
                   {#each paginatedResults() as item}
                     <tr class:selected={selected?.id === item.id} onclick={() => selectResult(item)} ondblclick={activateSelected}>
-                      <td><span class="file-icon">▶</span>{item.name}</td><td>{item.format}</td><td class="number">{item.size}</td><td class="number"><span class="source-dot"></span>{item.sources}</td><td>{item.speed}</td><td>{item.length}</td>
+                      <td><span class:audiobook-icon={Boolean(item.audiobook)} class="file-icon">{item.audiobook ? '▥' : '▶'}</span>{item.name}</td><td>{item.format}</td><td class="number">{item.size}</td><td class="number"><span class="source-dot"></span>{item.sources}</td><td>{item.speed}</td><td>{item.length}</td>
                     </tr>
                   {/each}
                 </tbody>
@@ -1538,19 +2228,41 @@
               {/if}
             </div>
             <div class="results-pager">
-              <button onclick={() => changeResultPage(resultPage - 1)} disabled={resultPage === 0}>◀ Previous</button>
-              <span>{resultRange()} of {results.length} · Page {resultPage + 1} of {resultPageCount()}</span>
-              <button onclick={() => changeResultPage(resultPage + 1)} disabled={resultPage + 1 >= resultPageCount()}>Next ▶</button>
+              <button onclick={() => void changeResultPage(resultPage - 1)} disabled={resultPage === 0}>◀ Previous</button>
+              <span>{resultRange()} of {results.length} loaded{browseTotalAvailable ? ` · ${availableResultTotal()} available` : ''} · Page {resultPage + 1} of {resultPageCount()}{browseCursor ? '+' : ''}</span>
+              <button onclick={() => void changeResultPage(resultPage + 1)} disabled={browseLoading || (resultPage + 1 >= resultPageCount() && !browseCursor)}>{browseLoading ? 'Loading…' : 'Next ▶'}</button>
             </div>
           </section>
 
           <aside class="details-pane">
             <div class="section-caption"><span>File details</span></div>
             {#if selected}
+              {#if selected.audiobook}
+                <div class="selected-file audiobook-selected">
+                  <div class="large-file-icon">▥</div>
+                  <div><strong>{selected.audiobook.title}</strong><span>Audiobook · {selected.audiobook.chapters.length} chapters · {selected.size}</span><small>Edition ID: {selected.audiobook.audiobookId}</small></div>
+                </div>
+                <div class="file-metadata"><p><b>{selected.audiobook.author || 'Unknown author'}</b>{selected.audiobook.narrator ? ` · Narrated by ${selected.audiobook.narrator}` : ''}</p><small>Chapters are ordered and each file is independently SHA-256 verified.</small></div>
+                <div class="audiobook-chapters" aria-label="Audiobook chapters">
+                  {#each selected.audiobook.chapters as chapter}
+                    <button
+                      type="button"
+                      class:chapter-local={isLocalFile(chapter.fileId)}
+                      class:chapter-playing={currentTrack?.fileId === chapter.fileId}
+                      disabled={!isLocalFile(chapter.fileId)}
+                      title={isLocalFile(chapter.fileId) ? `Play ${chapter.title}` : `${chapter.title} has not downloaded yet`}
+                      onclick={() => playAudiobookChapter(selected!.audiobook!, chapter.fileId)}
+                    ><span>{String(chapter.position).padStart(2, '0')}</span><b>{chapter.title}</b><small>{readableSize(chapter.size)}</small><i>{audiobookChapterStatus(selected.audiobook!, chapter)}</i></button>
+                  {/each}
+                </div>
+                <div class="detail-actions">{#if selectedAudiobookComplete()}<button class="classic-button primary" onclick={playSelectedAudiobook}>▶ Play book</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button>{:else}<button class="classic-button primary" disabled={selectedAudiobookDownloading()} onclick={downloadSelectedAudiobook}>⇩ {selectedAudiobookDownloading() ? 'Downloading…' : 'Download book'}</button>{/if}</div>
+                {#if !selected.audiobook.local}<p class="privacy-note"><span>♜</span> Chapters download first-to-last through private Tor onion services. Play each chapter as soon as it shows Ready.</p>{:else}<p class="privacy-note"><span>♬</span> This complete audiobook is ready to play.</p>{/if}
+              {:else}
               <div class="selected-file">
                 <div class="large-file-icon">▶</div>
                 <div><strong>{selected.name}</strong><span>{selected.format} · {selected.size} · {selected.length}</span><small>File ID: {selected.fileId}</small></div>
               </div>
+              {#if selected.artist || selected.album}<div class="file-metadata"><small>{selected.artist ? `Artist: ${selected.artist}` : ''}{selected.artist && selected.album ? ' · ' : ''}{selected.album ? `Album: ${selected.album}` : ''}</small></div>{/if}
               {#if selected.tags}<div class="file-metadata"><small>Tags: {selected.tags}</small></div>{/if}
               <fieldset><legend>Seeders</legend>
                 <div class="sources-list">
@@ -1581,6 +2293,7 @@
                   <button class="classic-button primary" type="button" disabled={!networkConnected || trackDiscussionSending || !trackDiscussionDraft.trim()} onclick={() => void sendTrackDiscussionMessage()}>{trackDiscussionSending ? '…' : 'Send'}</button>
                 </div>
               </section>
+              {/if}
             {:else}<p class="empty-state">{networkConnected ? 'Select a result to see who is sharing it right now.' : 'Not connected yet — press “Connect” at the top right to see who is sharing music.'}</p>{/if}
           </aside>
         </div>
@@ -1589,6 +2302,9 @@
           <div class="panel-title"><span></span><b>Download Manager</b><span></span></div>
           <div class="actionbar"><button class="classic-button" onclick={togglePause}>{paused ? '▶ Resume all' : 'Ⅱ Pause all'}</button><button class="classic-button" onclick={openNapstrFolder}>Open Napstr folder</button><button class="classic-button" onclick={clearFinishedTransfers} disabled={!transfers.some(isFinishedTransfer)}>Clear finished</button><div class="spacer"></div><span>{transfers.filter(isActiveTransfer).length} active · {transfers.filter(isCompleteTransfer).length} ready to play</span></div>
           <div class="download-queue">
+            {#each audiobookDownloads as book}
+              <div class="audiobook-download-row"><span class="audiobook-glyph">▥</span><b>{book.title}</b><div class="progress"><span style={`width:${book.chapters.length ? (book.nextIndex / book.chapters.length) * 100 : 0}%`}></span><b>{book.nextIndex}/{book.chapters.length}</b></div><span>{book.activeFileId ? `Downloading chapter ${book.nextIndex + 1}` : 'Preparing next chapter'}</span></div>
+            {/each}
             <table class="file-table download-table"><thead><tr><th>Download order</th><th>Progress</th><th>Size</th><th>Speed</th><th>Status</th><th></th></tr></thead><tbody>
               {#each transfers as transfer}
                 <tr class:transfer-complete={isCompleteTransfer(transfer)} ondblclick={() => { if (isCompleteTransfer(transfer)) playAudio(transfer.fileId, transfer.name, playerMode, 'downloads'); }}><td><span class="download-arrow">{isCompleteTransfer(transfer) ? '▶' : '⇩'}</span>{transfer.name}</td><td><div class="progress"><span style={`width:${transfer.progress}%`}></span><b>{Math.round(transfer.progress)}%</b></div></td><td>{transfer.size}</td><td>{isCompleteTransfer(transfer) ? 'Local' : transfer.speed}</td><td>{isCompleteTransfer(transfer) ? 'Ready to play' : transfer.status}</td><td class="transfer-actions">{#if isCompleteTransfer(transfer)}<button class="classic-button transfer-play" onclick={(event) => { event.stopPropagation(); playAudio(transfer.fileId, transfer.name, playerMode, 'downloads'); }} title="Play verified audio">▶ Play</button>{/if}<button class="tiny-button" onclick={(event) => { event.stopPropagation(); removeTransfer(transfer.id); }} title="Remove from this list">×</button></td></tr>
@@ -1605,21 +2321,41 @@
           </div>
           <div class="tag-library">
             <table class="file-table tags-table"><thead><tr><th>Name</th><th>Folder</th><th>Tags</th></tr></thead><tbody>
-              {#each sharedFiles as file}
+              {#each paginatedTagFiles() as file}
                 <tr class:selected={selectedTagFile?.fileId === file.fileId} onclick={() => selectTagFile(file)} ondblclick={() => playAudio(file.fileId, file.filename, playerMode, 'downloads')}><td><button type="button" class="file-icon file-play-button" title={`Play ${file.filename}`} aria-label={`Play ${file.filename}`} onclick={(event) => { event.stopPropagation(); selectTagFile(file); playAudio(file.fileId, file.filename, playerMode, 'downloads'); }}>▶</button>{file.filename}</td><td>{folderName(file.folder)}</td><td>{file.tags || '—'}</td></tr>
               {/each}
             </tbody></table>
             {#if sharedFiles.length === 0}<p class="empty-state compact">Downloaded and shared tracks will appear here.</p>{/if}
           </div>
+          {#if sharedFiles.length > LOCAL_PAGE_SIZE}<div class="results-pager"><button disabled={downloadLibraryPage === 0} onclick={() => changeDownloadLibraryPage(downloadLibraryPage - 1)}>◀ Previous</button><span>{localPageRange(downloadLibraryPage, sharedFiles.length)} of {sharedFiles.length} · Page {downloadLibraryPage + 1} of {localPageCount(sharedFiles)}</span><button disabled={downloadLibraryPage + 1 >= localPageCount(sharedFiles)} onclick={() => changeDownloadLibraryPage(downloadLibraryPage + 1)}>Next ▶</button></div>{/if}
         </section>
       {:else if activeView === 'Shared'}
         <section class="full-panel">
           <div class="panel-title"><span></span><b>My Shared Files</b><span></span></div>
-          <div class="actionbar"><button class="classic-button" onclick={rescanSharedFolder} disabled={rescanPending}>{rescanPending ? '… Rescanning' : '↻ Rescan'}</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button><button class="classic-button" onclick={playSelectedSharedAudio} disabled={!selectedShared}>▶ Play</button><button class="classic-button" onclick={playSelectedFolder} disabled={!selectedShared}>▶ Play folder</button><button class="classic-button primary" onclick={playAllSongs} disabled={!sharedFiles.length}>▶ Play all</button><div class="spacer"></div><span>Sharing {sharedFiles.length} files · {readableSize(indexedBytes)}</span></div>
+          <div class="actionbar"><button class="classic-button" onclick={indexing ? cancelLibraryScan : rescanSharedFolder}>{indexing ? '× Cancel scan' : rescanPending ? '… Rescanning' : '↻ Rescan'}</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button><button class="classic-button" onclick={playSelectedSharedAudio} disabled={!selectedShared}>▶ Play</button><button class="classic-button" onclick={playSelectedFolder} disabled={!selectedShared}>▶ Play folder</button><button class="classic-button primary" onclick={playAllSongs} disabled={!sharedFiles.length}>▶ Play all</button><button class="classic-button audiobook-button" onclick={openAudiobookEditor} disabled={libraryFolderView === '*' || audiobookFolderFiles().length < 1}>▥ {currentFolderAudiobook() ? 'Edit audiobook' : 'Group as audiobook…'}</button><div class="spacer"></div><span>Sharing {sharedFiles.length} files · {readableSize(indexedBytes)}</span></div>
           <div class="folder-path"><b>Napstr folder:</b><input value={napstrFolder || 'No folder selected'} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>Browse…</button></div>
-          <div class="library-filter"><label>View folder: <select bind:value={libraryFolderView}><option value="*">All folders</option>{#each libraryFolders() as folder}<option value={folder}>{folderName(folder)}</option>{/each}</select></label><span>{visibleSharedFiles().length} song{visibleSharedFiles().length === 1 ? '' : 's'} shown</span></div>
-          <table class="file-table shared-table"><thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Catalogue</th><th>Uploads</th></tr></thead><tbody>{#each visibleSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? `Published${file.otherSeeders ? ` · +${file.otherSeeders} others` : ''}` : 'Indexed'}</td><td>{file.delivered || file.peers ? `${file.delivered} delivered${file.peers ? ` · ${file.peers} active` : ''}` : '—'}</td></tr>{/each}</tbody></table>
-          <p class="privacy-note wide"><span>♜</span> Only validated MP3, FLAC, WAV, Ogg Vorbis, and Opus audio is indexed recursively. Subfolders become player folders; folder names remain local and are not published. Embedded cover artwork is allowed.</p>
+          <div class="library-filter">
+            <span class="library-filter-label">View folder:</span>
+            <div class="folder-picker" use:containLibraryFolderMenu>
+              <button type="button" class="folder-picker-toggle" aria-haspopup="listbox" aria-expanded={libraryFolderMenuOpen} onclick={() => (libraryFolderMenuOpen = !libraryFolderMenuOpen)} title={libraryFolderView === '*' ? 'All folders' : folderName(libraryFolderView)}>
+                <span>{libraryFolderView === '*' ? 'All folders' : folderName(libraryFolderView)}</span><i aria-hidden="true">▼</i>
+              </button>
+              {#if libraryFolderMenuOpen}
+                <div class="folder-picker-menu" role="listbox" aria-label="View folder">
+                  <button type="button" role="option" aria-selected={libraryFolderView === '*'} class:selected={libraryFolderView === '*'} onclick={() => selectLibraryFolder('*')}>All folders</button>
+                  {#each libraryFolders() as folder}
+                    <button type="button" role="option" aria-selected={libraryFolderView === folder} class:selected={libraryFolderView === folder} onclick={() => selectLibraryFolder(folder)} title={folderName(folder)}>{folderName(folder)}</button>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+            <span class="library-song-count">{visibleSharedFiles().length} song{visibleSharedFiles().length === 1 ? '' : 's'} shown</span>
+          </div>
+          {#if !currentFolderAudiobook() && libraryFolderView.toLowerCase().includes('audiobook') && audiobookFolderFiles().length >= 1}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>Possible audiobook detected</b><small>Review the natural chapter order before making the collection public.</small></div><button class="classic-button primary" onclick={openAudiobookEditor}>Group as audiobook…</button></div>{/if}
+          {#if currentFolderAudiobook()}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>{currentFolderAudiobook()?.title}</b><small>{currentFolderAudiobook()?.author || 'Unknown author'} · {currentFolderAudiobook()?.chapters.length} ordered chapters · published as one audiobook</small></div><button class="classic-button primary" onclick={() => playAudiobook(currentFolderAudiobook()!)}>▶ Play book</button></div>{/if}
+          <table class="file-table shared-table"><thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Catalogue</th><th>Uploads</th></tr></thead><tbody>{#each paginatedSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? `Published${file.otherSeeders ? ` · +${file.otherSeeders} others` : ''}` : 'Indexed'}</td><td>{file.delivered || file.peers ? `${file.delivered} delivered${file.peers ? ` · ${file.peers} active` : ''}` : '—'}</td></tr>{/each}</tbody></table>
+          {#if visibleSharedFiles().length > LOCAL_PAGE_SIZE}<div class="results-pager"><button disabled={sharedLibraryPage === 0} onclick={() => changeSharedLibraryPage(sharedLibraryPage - 1)}>◀ Previous</button><span>{localPageRange(sharedLibraryPage, visibleSharedFiles().length)} of {visibleSharedFiles().length} · Page {sharedLibraryPage + 1} of {localPageCount(visibleSharedFiles())}</span><button disabled={sharedLibraryPage + 1 >= localPageCount(visibleSharedFiles())} onclick={() => changeSharedLibraryPage(sharedLibraryPage + 1)}>Next ▶</button></div>{/if}
+          <p class="privacy-note wide"><span>♜</span> Only validated MP3, FLAC, WAV, Ogg Vorbis, and Opus audio is indexed recursively. Put book folders or complete one-file books inside Audiobooks for automatic grouping. Existing contents are never replaced. Folder names remain local and embedded cover artwork is allowed.</p>
           <p class="privacy-note wide"><span>i</span> Removing a file from your folder removes only your own listing. Copies that other people already share stay available — “+N others” shows who else is offering the same file right now.</p>
         </section>
       {:else if activeView === 'Trollbox'}
@@ -1637,6 +2373,46 @@
           <div class="trollbox-compose">
             <input bind:value={trollboxDraft} maxlength="500" autocomplete="off" placeholder={networkConnected ? 'Type a public message…' : 'Connect to Nostr to chat'} disabled={!networkConnected || trollboxSending} aria-label="Trollbox message" onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void sendTrollboxMessage(); } }} />
             <button class="classic-button primary" type="button" disabled={!networkConnected || trollboxSending || !trollboxDraft.trim()} onclick={() => void sendTrollboxMessage()}>{trollboxSending ? 'Sending…' : 'Send'}</button>
+          </div>
+        </section>
+      {:else if activeView === 'Mobile'}
+        <section class="full-panel mobile-connect-view">
+          <div class="panel-title"><span></span><b>Mobile connect</b><span></span></div>
+          <div class="mobile-connect-status">
+            <span><i class:amber={!mobileStatusValue?.online} class:error={Boolean(mobileStatusValue?.error)} class="led"></i><b>{mobileStatusValue?.online ? 'Iroh ready' : mobileStatusValue?.running ? 'Iroh connecting…' : 'Iroh unavailable'}</b></span>
+            <small>Napstr stays in control of discovery and Tor downloads.</small>
+          </div>
+          {#if mobileError}<div class="trollbox-error">{mobileError}</div>{/if}
+          <div class="mobile-connect-grid">
+            <section class="pair-phone-card">
+              <h2>Pair Napstrfy</h2>
+              <p>Open <a href="https://napstr.net/napstrfy.html" onclick={openNapstrfyWebsite}>Napstrfy</a> on your phone and scan this code. Napstr must remain open while you listen away from this computer.</p>
+              {#if mobilePairing}
+                <div class="pairing-qr" aria-label="Napstrfy pairing QR code">{@html mobilePairing.qrSvg}</div>
+                <p class="pairing-expiry">One use · expires {new Date(mobilePairing.expiresAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+                <details><summary>Pair without a camera</summary><textarea readonly value={mobilePairing.ticket} aria-label="Manual Napstrfy pairing code"></textarea></details>
+                <button class="classic-button" onclick={createMobilePairing} disabled={mobileLoading}>{mobileLoading ? 'Preparing…' : 'Create a new code'}</button>
+              {:else}
+                <button class="classic-button primary" onclick={createMobilePairing} disabled={mobileLoading}>{mobileLoading ? 'Preparing Iroh…' : 'Create pairing code'}</button>
+                <div class="pairing-placeholder"><span>▦</span><b>Your one-use QR code will appear here</b></div>
+              {/if}
+            </section>
+            <section class="paired-devices-card">
+              <p>Napstrfy creates a private, encrypted tunnel from your phone to Napstr, letting you listen to your catalogue by connecting directly to your Napstr instance. Only for your own use and for people you trust.</p>
+              <h2>Paired phones</h2>
+              <p>A paired phone can browse your indexed music, ask this Napstr to download a track.</p>
+              <div class="paired-device-list">
+                {#each mobileStatusValue?.devices ?? [] as device (device.endpointId)}
+                  <div class="paired-device">
+                    <span class="phone-glyph">▯</span>
+                    <div><b>{device.name}</b><small>Last connected {mobileLastSeen(device.lastSeen)}</small><code title={device.endpointId}>{device.endpointId}</code></div>
+                    <button class="classic-button" onclick={() => revokeMobileDevice(device)}>Remove</button>
+                  </div>
+                {/each}
+                {#if (mobileStatusValue?.devices.length ?? 0) === 0}<p class="empty-state compact">No phones are paired yet.</p>{/if}
+              </div>
+              <p class="privacy-note wide"><span>i</span> The QR secret is random, expires after five minutes, and is invalidated by the first successful pairing. Removing a phone immediately revokes future connections.</p>
+            </section>
           </div>
         </section>
       {:else if activeView === 'Profile'}
@@ -1696,6 +2472,9 @@
       ></button>
       <div class="dock-title"><span></span><b>Transfer Manager</b><span></span><button class="dock-clear" onclick={clearFinishedTransfers} disabled={!transfers.some(isFinishedTransfer)}>Clear finished</button><button onclick={() => (activeView = 'Downloads')} title="Open Download Manager">□</button></div>
       <div class="mini-transfers">
+        {#each audiobookDownloads as book}
+          <div class="mini-row audiobook-mini-row"><span class="audiobook-glyph">▥</span><span class="mini-name">{book.title} · chapter {Math.min(book.nextIndex + 1, book.chapters.length)} of {book.chapters.length}</span><div class="progress"><span style={`width:${book.chapters.length ? (book.nextIndex / book.chapters.length) * 100 : 0}%`}></span></div><span>{readableSize(book.chapters.reduce((sum, chapter) => sum + chapter.size, 0))}</span><span>Book</span></div>
+        {/each}
         {#each transfers as transfer}
           <div class:transfer-complete={isCompleteTransfer(transfer)} class="mini-row">{#if isCompleteTransfer(transfer)}<button class="mini-play" onclick={() => playAudio(transfer.fileId, transfer.name, playerMode, 'downloads')} title="Play verified audio">▶</button>{:else}<span class="download-arrow">⇩</span>{/if}<span class="mini-name">{transfer.name}</span><div class="progress"><span style={`width:${transfer.progress}%`}></span></div><span>{transfer.size}</span><span>{isCompleteTransfer(transfer) ? 'Ready' : transfer.speed}</span></div>
         {/each}
@@ -1709,7 +2488,10 @@
     <div class="modal-backdrop" role="presentation" onclick={() => (aboutOpen = false)}>
       <dialog class="dialog" open aria-label="About Napstr" onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') aboutOpen = false; }}>
         <header class="titlebar"><div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>About Napstr</span></div><div class="window-controls"><button onclick={() => (aboutOpen = false)}>×</button></div></header>
-        <div class="dialog-body"><div class="about-logo"><img src="/napstr-logo.png" alt="" /></div><div><h2>Napstr</h2><p>Version {appVersion}</p><p>Public discovery over Nostr.<br />Private verified transfers over Tor.</p></div></div>
+        <div class="dialog-body about-dialog-body">
+          <div class="about-summary"><div class="about-logo"><img src="/napstr-logo.png" alt="" /></div><div><h2>Napstr</h2><p>Version {appVersion}</p><p>Public discovery over Nostr.<br />Private verified transfers over Tor.</p></div></div>
+          <p class="about-donation">donations welcome!<br /><code>bc1qwgms685z3j69qtgalyjtrfuqg5f6pt302z0k60</code></p>
+        </div>
         <div class="dialog-actions"><button class="classic-button primary" onclick={() => (aboutOpen = false)}>OK</button></div>
       </dialog>
     </div>
@@ -1760,6 +2542,23 @@
           {#if backupError}<p class="backup-error">{backupError}</p>{/if}
         </div></div>
         <div class="dialog-actions">{#if backupDialog === 'import-confirm'}<button class="classic-button primary" disabled={backupBusy || (!!backupCurrentNpub && backupCurrentNpub !== backupRestoreNpub && !backupAcknowledged)} onclick={() => void confirmRestore()}>{backupBusy ? 'Replacing…' : 'Replace my account'}</button><button class="classic-button" disabled={backupBusy} onclick={closeBackupDialog}>Cancel</button>{:else}<button class="classic-button primary" disabled={backupBusy} onclick={() => void submitBackup()}>{backupBusy ? 'Working…' : backupDialog === 'export' ? 'Encrypt and save' : 'Continue'}</button><button class="classic-button" disabled={backupBusy} onclick={closeBackupDialog}>Cancel</button>{/if}</div>
+      </dialog>
+    </div>
+  {/if}
+
+  {#if audiobookEditorOpen}
+    <div class="modal-backdrop" role="presentation" onclick={() => { if (!audiobookSaving) audiobookEditorOpen = false; }}>
+      <dialog class="dialog audiobook-dialog" open aria-label="Group folder as audiobook" onclick={(event) => event.stopPropagation()} onkeydown={(event) => { if (event.key === 'Escape' && !audiobookSaving) audiobookEditorOpen = false; }}>
+        <header class="titlebar"><div class="title-left"><span class="app-icon">▥</span><span>Publish Audiobook</span></div><div class="window-controls"><button disabled={audiobookSaving} onclick={() => (audiobookEditorOpen = false)}>×</button></div></header>
+        <div class="audiobook-dialog-body">
+          <p>Napstr will publish this folder as one ordered audiobook while retaining its normal chapter file events.</p>
+          <label>Title <input bind:value={audiobookTitle} maxlength="256" /></label>
+          <label>Author <input bind:value={audiobookAuthor} maxlength="256" /></label>
+          <label>Narrator <input bind:value={audiobookNarrator} maxlength="256" /></label>
+          <fieldset><legend>Chapter order</legend><div class="audiobook-preview">{#each audiobookFolderFiles() as file, index}<div><span>{String(index + 1).padStart(2, '0')}</span><b>{file.title || file.filename}</b><small>{file.readableSize}</small></div>{/each}</div></fieldset>
+          <p class="privacy-note"><span>i</span> The title, author, narrator, chapter names, and ordered file hashes will be public. Your folder name and filesystem path remain private.</p>
+        </div>
+        <div class="dialog-actions audiobook-dialog-actions">{#if currentFolderAudiobook()}<button class="classic-button" disabled={audiobookSaving} onclick={ungroupAudiobook}>Publish separately</button>{/if}<span></span><button class="classic-button primary" disabled={audiobookSaving || !audiobookTitle.trim()} onclick={saveAudiobookGroup}>{audiobookSaving ? 'Publishing…' : 'Save & publish'}</button><button class="classic-button" disabled={audiobookSaving} onclick={() => (audiobookEditorOpen = false)}>Cancel</button></div>
       </dialog>
     </div>
   {/if}

@@ -17,8 +17,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    fs::{self, File},
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
+    fs::{self, File, OpenOptions},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufWriter, SeekFrom},
     net::TcpListener,
     sync::{watch, Mutex, RwLock, Semaphore},
     task::JoinHandle,
@@ -33,6 +33,159 @@ pub struct SeedingStat {
     pub delivered: u32,
     pub active_grants: u32,
     pub other_seeders: u32,
+}
+
+struct TemporaryPath {
+    path: PathBuf,
+}
+
+impl Drop for TemporaryPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn create_temporary_file(
+    directory: &Path,
+    prefix: &str,
+    source_name: &Path,
+) -> Result<(File, TemporaryPath), String> {
+    for _ in 0..16 {
+        let extension = source_name
+            .extension()
+            .and_then(|value| value.to_str())
+            .filter(|value| value.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+            .map(|value| format!(".{value}"))
+            .unwrap_or_default();
+        let path = directory.join(format!(
+            ".{prefix}-{}{extension}.part",
+            uuid::Uuid::new_v4()
+        ));
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => {
+                #[cfg(unix)]
+                fs::set_permissions(&path, {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::Permissions::from_mode(0o600)
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+                return Ok((file, TemporaryPath { path }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("could not create a private transfer file".into())
+}
+
+fn ensure_secure_child_directory(parent: &Path, name: &std::ffi::OsStr) -> Result<PathBuf, String> {
+    let candidate = parent.join(name);
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("download destination is not a real directory".into());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&candidate).map_err(|error| error.to_string())?;
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    let canonical = std::fs::canonicalize(&candidate).map_err(|error| error.to_string())?;
+    if canonical.parent() != Some(parent) {
+        return Err("download destination escapes the Napstr folder".into());
+    }
+    Ok(canonical)
+}
+
+fn secure_destination_root(
+    napstr_folder: &Path,
+    destination_folder: &str,
+) -> Result<PathBuf, String> {
+    let root = std::fs::canonicalize(napstr_folder).map_err(|error| error.to_string())?;
+    if !root.is_dir() {
+        return Err("Napstr folder is not a directory".into());
+    }
+    let component = Path::new(destination_folder);
+    if destination_folder.is_empty()
+        || component.is_absolute()
+        || component.components().count() != 1
+        || !component
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Ok(root);
+    }
+    let audiobooks = ensure_secure_child_directory(&root, std::ffi::OsStr::new("Audiobooks"))?;
+    let name = component
+        .file_name()
+        .ok_or("invalid audiobook destination")?;
+    ensure_secure_child_directory(&audiobooks, name)
+}
+
+async fn verified_shared_snapshot(
+    db_path: &Path,
+    path: &Path,
+    expected_size: u64,
+    expected_hash: &str,
+) -> Result<(File, TemporaryPath), String> {
+    let temp_root = db_path
+        .parent()
+        .ok_or("database has no private application directory")?;
+    let temp_root = std::fs::canonicalize(temp_root).map_err(|error| error.to_string())?;
+    let temp_root =
+        ensure_secure_child_directory(&temp_root, std::ffi::OsStr::new("transfer-temp"))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&temp_root, {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(0o700)
+    })
+    .map_err(|error| error.to_string())?;
+    let mut source = File::open(path).await.map_err(|error| error.to_string())?;
+    let (mut snapshot, guard) = create_temporary_file(&temp_root, "napstr-serve", path).await?;
+    let mut remaining = expected_size;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    while remaining > 0 {
+        let wanted = remaining.min(buffer.len() as u64) as usize;
+        let count = source
+            .read(&mut buffer[..wanted])
+            .await
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            return Err("local shared file changed after indexing".into());
+        }
+        hasher.update(&buffer[..count]);
+        snapshot
+            .write_all(&buffer[..count])
+            .await
+            .map_err(|error| error.to_string())?;
+        remaining -= count as u64;
+    }
+    if source
+        .read(&mut buffer[..1])
+        .await
+        .map_err(|error| error.to_string())?
+        != 0
+        || hex::encode(hasher.finalize()) != expected_hash
+    {
+        return Err("local shared file changed after indexing".into());
+    }
+    snapshot.flush().await.map_err(|error| error.to_string())?;
+    crate::audio::validate_audio(&guard.path)
+        .map_err(|error| format!("shared file failed the audio-only policy: {error}"))?;
+    snapshot
+        .seek(SeekFrom::Start(0))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((snapshot, guard))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,20 +597,33 @@ where
         .optional()
         .map_err(|error| error.to_string())?;
     let (path, filename, size) = record.ok_or("shared file disappeared")?;
-    crate::audio::validate_audio(Path::new(&path))
-        .map_err(|error| format!("shared file failed the audio-only policy: {error}"))?;
+    let size = u64::try_from(size).map_err(|_| "shared file has an invalid size")?;
+    let (mut file, _snapshot) =
+        match verified_shared_snapshot(db_path, Path::new(&path), size, &file_id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                write_frame(
+                    &mut stream,
+                    &ServerFrame::Error {
+                        code: "LOCAL_FILE_UNAVAILABLE".into(),
+                        message: error.clone(),
+                    },
+                )
+                .await?;
+                return Err(error);
+            }
+        };
     write_frame(
         &mut stream,
         &ServerFrame::Welcome {
             version: PROTOCOL_VERSION,
             file_id: file_id.clone(),
             filename,
-            size: size as u64,
+            size,
         },
     )
     .await?;
 
-    let mut file = File::open(path).await.map_err(|error| error.to_string())?;
     let mut sent_file = false;
     loop {
         match timeout(
@@ -471,13 +637,12 @@ where
                 write_frame(
                     &mut stream,
                     &ServerFrame::FileData {
-                        size: size as u64,
+                        size,
                         sha256: file_id.clone(),
                     },
                 )
                 .await?;
-                let mut remaining = size as u64;
-                let mut hasher = Sha256::new();
+                let mut remaining = size;
                 let mut buffer = vec![0u8; 256 * 1024];
                 while remaining > 0 {
                     let wanted = remaining.min(buffer.len() as u64) as usize;
@@ -488,7 +653,6 @@ where
                     if count == 0 {
                         return Err("shared file became shorter while streaming".into());
                     }
-                    hasher.update(&buffer[..count]);
                     stream
                         .write_all(&buffer[..count])
                         .await
@@ -496,9 +660,6 @@ where
                     remaining -= count as u64;
                 }
                 stream.flush().await.map_err(|error| error.to_string())?;
-                if hex::encode(hasher.finalize()) != file_id {
-                    return Err("local shared file changed after indexing".into());
-                }
                 sent_file = true;
             }
             ClientFrame::RequestFile => return Err("duplicate file request".into()),
@@ -569,11 +730,11 @@ async fn download_offer(
         ServerFrame::Error { message, .. } => return Err(message),
         _ => return Err("peer returned an invalid manifest".into()),
     };
-    let (filename, expected_size): (String, i64) = crate::open_connection(db_path)?
+    let (filename, expected_size, destination_folder): (String, i64, String) = crate::open_connection(db_path)?
         .query_row(
-            "SELECT filename,size FROM network_downloads WHERE request_id=?1 AND file_id=?2",
+            "SELECT filename,size,destination_folder FROM network_downloads WHERE request_id=?1 AND file_id=?2",
             params![offer.request_id, offer.file_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|error| error.to_string())?;
     if size != expected_size as u64 {
@@ -612,24 +773,17 @@ async fn download_offer(
 
     let connection = crate::open_connection(db_path)?;
     let napstr_folder = PathBuf::from(super::get_setting(&connection, "shared_folder")?);
-    fs::create_dir_all(&napstr_folder)
-        .await
-        .map_err(|error| error.to_string())?;
+    let destination_root = secure_destination_root(&napstr_folder, &destination_folder)?;
     let destination = {
         let mut selected = coordinator.destination.lock().await;
         selected
-            .get_or_insert_with(|| super::unique_destination(&napstr_folder, &filename))
+            .get_or_insert_with(|| super::unique_destination(&destination_root, &filename))
             .clone()
     };
     drop(connection);
-    let partial = destination.with_extension(format!(
-        "{}part",
-        destination
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| format!("{value}."))
-            .unwrap_or_default()
-    ));
+    let (partial_file, partial_guard) =
+        create_temporary_file(&destination_root, "napstr-download", Path::new(&filename)).await?;
+    let partial = partial_guard.path.clone();
     let final_result: Result<(), String> = async {
         while *pause.borrow() {
             update_download(
@@ -658,11 +812,7 @@ async fn download_offer(
             _ => return Err("peer returned an invalid file stream header".into()),
         }
 
-        let mut writer = BufWriter::new(
-            File::create(&partial)
-                .await
-                .map_err(|error| error.to_string())?,
-        );
+        let mut writer = BufWriter::new(partial_file);
         let mut full_hasher = Sha256::new();
         let mut received = 0u64;
         let mut buffer = vec![0u8; 256 * 1024];
@@ -742,11 +892,16 @@ async fn download_offer(
             }
         };
         let mut final_destination = destination.clone();
+        let current_destination_root =
+            secure_destination_root(&napstr_folder, &destination_folder)?;
+        if current_destination_root != destination_root {
+            return Err("download destination changed during transfer".into());
+        }
         loop {
             match fs::hard_link(&partial, &final_destination).await {
                 Ok(()) => break,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    final_destination = super::unique_destination(&napstr_folder, &filename);
+                    final_destination = super::unique_destination(&destination_root, &filename);
                 }
                 Err(error) => return Err(error.to_string()),
             }
@@ -803,6 +958,7 @@ async fn download_offer(
         let _ = write_frame(&mut stream, &ClientFrame::Cancel).await;
         let _ = fs::remove_file(&partial).await;
     }
+    drop(partial_guard);
     final_result
 }
 
@@ -1017,6 +1173,57 @@ mod tests {
             read_frame::<_, ServerFrame>(&mut stream).await.unwrap(),
             ServerFrame::TransferComplete
         ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_shared_file_is_rejected_before_any_bytes_are_offered() {
+        let (directory, db_path, file_id, mut bytes) = shared_fixture();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(directory.join("payload.wav"), bytes).unwrap();
+        let capability = "changed-file-capability".to_string();
+        let grants = Arc::new(RwLock::new(HashMap::from([(
+            capability_key(&capability),
+            SessionGrant {
+                file_id: file_id.clone(),
+                requester: "requester".into(),
+                expires_at: Utc::now().timestamp() + 60,
+                _onion_lease: None,
+            },
+        )])));
+        let mut stream = test_peer(db_path, grants);
+        write_frame(
+            &mut stream,
+            &ClientFrame::Hello {
+                version: PROTOCOL_VERSION,
+                capability,
+                file_id,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, ServerFrame>(&mut stream).await.unwrap(),
+            ServerFrame::Error { code, .. } if code == "LOCAL_FILE_UNAVAILABLE"
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audiobook_download_rejects_a_symlinked_destination() {
+        use std::os::unix::fs::symlink;
+
+        let directory =
+            std::env::temp_dir().join(format!("napstr-destination-test-{}", uuid::Uuid::new_v4()));
+        let shared = directory.join("shared");
+        let outside = directory.join("outside");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, shared.join("Audiobooks")).unwrap();
+
+        assert!(secure_destination_root(&shared, "A Book").is_err());
+        assert!(!outside.join("A Book").exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

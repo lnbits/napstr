@@ -1,0 +1,33 @@
+{
+  "name": "napstrfy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "tauri": "tauri",
+    "desktop": "tauri dev",
+    "android:init": "tauri icon ../src-tauri/icons/icon.png && tauri android init && node scripts/configure-android.mjs",
+    "android:dev": "node scripts/configure-android.mjs && tauri android dev",
+    "android:dev:usb": "node scripts/configure-android.mjs && adb reverse tcp:1421 tcp:1421 && tauri android dev --host 127.0.0.1",
+    "android:build": "node scripts/configure-android.mjs && tauri android build",
+    "ios:init": "tauri icon ../src-tauri/icons/icon.png && tauri ios init",
+    "ios:dev": "tauri ios dev",
+    "ios:build": "tauri ios build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.3.0",
+    "@tauri-apps/plugin-barcode-scanner": "^2.4.5"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@tauri-apps/cli": "^2.3.1",
+    "@types/node": "^22.0.0",
+    "svelte": "^5.20.0",
+    "svelte-check": "^4.1.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.1.0"
+  }
+}

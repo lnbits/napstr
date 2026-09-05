@@ -6,6 +6,19 @@ export APPDIR="$appdir"
 export PATH="$appdir/usr/bin:${PATH:-/usr/bin:/bin}"
 export XDG_DATA_DIRS="$appdir/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 
+# Rodio uses ALSA on Linux. Keep its configuration and Pulse bridge inside the
+# AppImage so the packaged build reaches PulseAudio or PipeWire's Pulse server
+# instead of probing a physical sound device. On systems without that shared
+# server, retain ALSA's normal configured default.
+export ALSA_CONFIG_DIR="$appdir/usr/share/alsa"
+export ALSA_PLUGIN_DIR="$appdir/usr/lib/alsa-lib"
+pulse_socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse/native"
+if [[ -n "${PULSE_SERVER:-}" || -S "$pulse_socket" ]]; then
+  export ALSA_CONFIG_PATH="$appdir/usr/share/alsa/napstr-pulse.conf"
+else
+  export ALSA_CONFIG_PATH="$appdir/usr/share/alsa/alsa.conf"
+fi
+
 # Keep the GTK and GStreamer integration prepared by linuxdeploy. The hooks
 # are generated inside the AppImage.
 # shellcheck disable=SC1091

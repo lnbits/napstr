@@ -1,10 +1,10 @@
-name: Build desktop installers
+name: Build desktop and Android installers
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Release tag to create (for example, v0.1.0)
+        description: Release tag to create (for example, v0.1.0 or v0.1.5-rc1)
         required: true
         type: string
   push:
@@ -32,18 +32,18 @@ jobs:
             tor_platform: windows
             tor_url: https://archive.torproject.org/tor-package-archive/torbrowser/15.0.20/tor-expert-bundle-windows-x86_64-15.0.20.tar.gz
             tor_sha256: d59bff934e3ad876e1623e24ae60c19aeea56f50178093b9f86fba230639f949
-          # macOS release builds are paused until Napstr and its nested Tor
-          # executable/library can be Developer ID signed and notarized.
-          # - platform: macos-15-intel
-          #   args: --bundles dmg
-          #   tor_platform: macos
-          #   tor_url: https://archive.torproject.org/tor-package-archive/torbrowser/15.0.20/tor-expert-bundle-macos-x86_64-15.0.20.tar.gz
-          #   tor_sha256: 6ec3048b3a5d55e297f35d84830d0e338884d702aac3db49056633c1223841df
-          # - platform: macos-15
-          #   args: --target aarch64-apple-darwin --bundles dmg
-          #   tor_platform: macos
-          #   tor_url: https://archive.torproject.org/tor-package-archive/torbrowser/15.0.20/tor-expert-bundle-macos-aarch64-15.0.20.tar.gz
-          #   tor_sha256: 73fdccde8136678e41a625160993e6a9dc4f4ff8cd376318b5e41e5627d55682
+          - platform: macos-15-intel
+            args: --config src-tauri/tauri.macos-community.conf.json --bundles dmg
+            tor_platform: macos
+            mac_arch: x86_64
+            tor_url: https://archive.torproject.org/tor-package-archive/torbrowser/15.0.20/tor-expert-bundle-macos-x86_64-15.0.20.tar.gz
+            tor_sha256: 6ec3048b3a5d55e297f35d84830d0e338884d702aac3db49056633c1223841df
+          - platform: macos-15
+            args: --config src-tauri/tauri.macos-community.conf.json --target aarch64-apple-darwin --bundles dmg
+            tor_platform: macos
+            mac_arch: arm64
+            tor_url: https://archive.torproject.org/tor-package-archive/torbrowser/15.0.20/tor-expert-bundle-macos-aarch64-15.0.20.tar.gz
+            tor_sha256: 73fdccde8136678e41a625160993e6a9dc4f4ff8cd376318b5e41e5627d55682
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v7
@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
-            echo "Release tag must look like v0.1.0 or v0.1.0-beta.1" >&2
+            echo "Release tag must look like v0.1.0 or v0.1.5-rc1" >&2
             exit 1
           fi
       - uses: actions/setup-node@v7
@@ -78,6 +78,7 @@ jobs:
             gstreamer1.0-pulseaudio \
             gstreamer1.0-tools \
             libasound2-dev \
+            libasound2-plugins \
             libayatana-appindicator3-dev \
             libgirepository1.0-dev \
             librsvg2-dev \
@@ -99,6 +100,10 @@ jobs:
       - name: Add pinned Tor Expert Bundle
         shell: bash
         run: bash scripts/prepare-tor.sh '${{ matrix.tor_platform }}' '${{ matrix.tor_url }}' '${{ matrix.tor_sha256 }}'
+      - name: Ad-hoc sign bundled macOS Tor runtime
+        if: matrix.tor_platform == 'macos'
+        shell: bash
+        run: bash scripts/adhoc-sign-macos.sh src-tauri/resources/tor/macos '${{ matrix.mac_arch }}'
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -110,9 +115,12 @@ jobs:
         with:
           tagName: ${{ env.RELEASE_TAG }}
           releaseName: Napstr ${{ env.RELEASE_TAG }}
-          releaseBody: Cross-platform Napstr desktop installers.
-          releaseDraft: false
-          prerelease: false
+          releaseBody: |
+            Cross-platform Napstr desktop installers.
+
+            The macOS DMGs are ad-hoc-signed, unnotarized community builds. After the first blocked launch, open System Settings → Privacy & Security and choose Open Anyway.
+          releaseDraft: true
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           args: ${{ matrix.args }}
       - name: Repair and smoke-test Linux AppImage
         if: matrix.platform == 'ubuntu-22.04'
@@ -147,3 +155,174 @@ jobs:
           # tauri-action has already uploaded the initial bundle. Replace that
           # asset with the repaired, verified AppImage under the same filename.
           gh release upload "$RELEASE_TAG" "$appimage" --clobber
+      - name: Verify and checksum macOS community DMG
+        if: matrix.tor_platform == 'macos'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dmg="$(find src-tauri/target -type f -path '*/release/bundle/dmg/*.dmg' -print -quit)"
+          if [[ -z "$dmg" ]]; then
+            echo "Tauri did not produce the expected macOS DMG" >&2
+            exit 1
+          fi
+
+          mount_point="$(mktemp -d "$RUNNER_TEMP/napstr-dmg.XXXXXX")"
+          cleanup_dmg() {
+            hdiutil detach -quiet "$mount_point" >/dev/null 2>&1 || true
+            rmdir "$mount_point" >/dev/null 2>&1 || true
+          }
+          trap cleanup_dmg EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "$dmg" >/dev/null
+
+          app="$(find "$mount_point" -maxdepth 2 -type d -name 'Napstr.app' -print -quit)"
+          if [[ -z "$app" ]]; then
+            echo "The finished DMG does not contain Napstr.app" >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app"
+          app_binary="$app/Contents/MacOS/napstr"
+          tor_binary="$(find "$app/Contents/Resources" -type f -path '*/tor/macos/tor/tor' -print -quit)"
+          if [[ ! -f "$app_binary" || -z "$tor_binary" ]]; then
+            echo "The app bundle is missing Napstr or its bundled Tor executable" >&2
+            exit 1
+          fi
+
+          bash scripts/verify-macos-bundle.sh "$app_binary" "$tor_binary" '${{ matrix.mac_arch }}'
+
+          cleanup_dmg
+          trap - EXIT
+          checksum="$dmg.sha256"
+          (
+            cd "$(dirname "$dmg")"
+            shasum -a 256 "$(basename "$dmg")" > "$(basename "$checksum")"
+          )
+          gh release upload "$RELEASE_TAG" "$checksum" --clobber
+
+  android:
+    name: Build Napstrfy Android APK
+    runs-on: ubuntu-22.04
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      NAPSTRFY_ANDROID_RELEASE_SIGNING: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "Release tag must look like v0.1.0 or v0.1.5-rc1" >&2
+            exit 1
+          fi
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: android/package-lock.json
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools platforms;android-36 build-tools;35.0.0 ndk;29.0.13846066
+      - name: Configure Android NDK
+        shell: bash
+        run: |
+          ndk="$ANDROID_HOME/ndk/29.0.13846066"
+          if [[ ! -d "$ndk" ]]; then
+            echo "Pinned Android NDK was not installed at $ndk" >&2
+            exit 1
+          fi
+          echo "NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - name: Set and verify version from release tag
+        run: node scripts/set-release-version.mjs
+      - name: Install Napstrfy dependencies
+        working-directory: android
+        run: npm ci
+      - name: Verify Napstrfy interface
+        working-directory: android
+        run: npm run check
+      - name: Generate Android project
+        working-directory: android
+        run: npm run android:init
+      - name: Configure stable Android release signing
+        shell: bash
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+        run: |
+          if [[ -z "$ANDROID_KEY_ALIAS" || -z "$ANDROID_KEY_PASSWORD" || -z "$ANDROID_KEY_BASE64" ]]; then
+            echo "Napstrfy release signing secrets are missing." >&2
+            echo "Add ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD, and ANDROID_KEY_BASE64 in repository Actions secrets." >&2
+            exit 1
+          fi
+
+          keystore="$RUNNER_TEMP/napstrfy-release.jks"
+          printf '%s' "$ANDROID_KEY_BASE64" | base64 --decode > "$keystore"
+          keytool -list \
+            -keystore "$keystore" \
+            -storepass "$ANDROID_KEY_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS" >/dev/null
+
+          properties="android/src-tauri/gen/android/keystore.properties"
+          printf 'keyAlias=%s\n' "$ANDROID_KEY_ALIAS" > "$properties"
+          printf 'password=%s\n' "$ANDROID_KEY_PASSWORD" >> "$properties"
+          printf 'storeFile=%s\n' "$keystore" >> "$properties"
+      - name: Build signed universal APK
+        working-directory: android
+        run: npm run android:build -- --apk
+      - name: Verify and upload Napstrfy APK
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          apk="$(find android/src-tauri/gen/android/app/build/outputs/apk/universal/release \
+            -maxdepth 1 -type f -name '*.apk' ! -name '*unsigned*' -print -quit)"
+          if [[ -z "$apk" ]]; then
+            echo "Tauri did not produce a signed universal release APK" >&2
+            exit 1
+          fi
+
+          build_tools="$ANDROID_HOME/build-tools/35.0.0"
+          "$build_tools/apksigner" verify --verbose --print-certs "$apk"
+          "$build_tools/zipalign" -c -P 16 4 "$apk"
+
+          apk_files="$RUNNER_TEMP/napstrfy-apk-files.txt"
+          jar tf "$apk" > "$apk_files"
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            if ! grep -Fxq "lib/$abi/libnostrfy_lib.so" "$apk_files"; then
+              echo "APK is missing the Napstrfy native library for $abi" >&2
+              exit 1
+            fi
+          done
+
+          release_version="${RELEASE_TAG#v}"
+          badging="$("$build_tools/aapt" dump badging "$apk")"
+          if [[ "$badging" != *"versionName='$release_version'"* ]]; then
+            echo "APK version does not match $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          asset="$RUNNER_TEMP/Napstrfy_${release_version}_android.apk"
+          cp "$apk" "$asset"
+          checksum="$asset.sha256"
+          (
+            cd "$(dirname "$asset")"
+            sha256sum "$(basename "$asset")" > "$(basename "$checksum")"
+          )
+
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            create_args=(release create "$RELEASE_TAG" --draft --title "Napstr $RELEASE_TAG" --notes "Cross-platform Napstr desktop installers and the Napstrfy Android companion.")
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              create_args+=(--prerelease)
+            fi
+            gh "${create_args[@]}" || gh release view "$RELEASE_TAG" >/dev/null
+          fi
+
+          gh release upload "$RELEASE_TAG" "$asset" "$checksum" --clobber

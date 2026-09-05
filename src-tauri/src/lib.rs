@@ -1,6 +1,6 @@
 use chrono::Utc;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,10 +14,11 @@ use std::{
     },
     time::UNIX_EPOCH,
 };
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
 mod audio;
+mod mobile;
 mod network;
 mod player;
 mod protocol;
@@ -25,7 +26,15 @@ mod tor;
 mod transfer;
 
 const HASH_BUFFER_SIZE: usize = 256 * 1024;
-const DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom";
+const MAX_INDEX_ERRORS: usize = 100;
+const INDEX_PROGRESS_INTERVAL: usize = 25;
+const INDEX_COMMIT_BATCH_SIZE: usize = 50;
+const AUDIO_METADATA_VERSION: i64 = 2;
+const LIBRARY_CHANGED_EVENT: &str = "napstr-library-changed";
+const INDEX_BATCH_EVENT: &str = "napstr-index-batch";
+const INDEX_PROGRESS_EVENT: &str = "napstr-index-progress";
+const DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom,wss://relay.nostr.band";
+const PREVIOUS_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom";
 const LEGACY_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol";
 
 struct AppState {
@@ -33,13 +42,18 @@ struct AppState {
     network: Arc<network::NetworkService>,
     tor: Arc<tor::TorManager>,
     watcher: Mutex<Option<FolderWatcher>>,
+    scan_lock: Arc<Mutex<()>>,
+    scan_cancel: Arc<AtomicBool>,
+    app_handle: tauri::AppHandle,
     player: Arc<player::NativePlayer>,
+    mobile: Arc<mobile::MobileService>,
     recovering_after_sleep: Arc<AtomicBool>,
 }
 
 struct ShutdownServices {
     network: Arc<network::NetworkService>,
     tor: Arc<tor::TorManager>,
+    mobile: Arc<mobile::MobileService>,
 }
 
 struct FolderWatcher {
@@ -59,6 +73,8 @@ struct SharedFile {
     title: String,
     artist: String,
     album: String,
+    track_number: u32,
+    disc_number: u32,
     mime: String,
     license: String,
     description: String,
@@ -93,19 +109,41 @@ struct Settings {
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot {
     files: Vec<SharedFile>,
+    audiobooks: Vec<network::AudiobookResult>,
     transfers: Vec<Transfer>,
     settings: Settings,
     indexed_bytes: u64,
     native: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IndexReport {
     file_count: usize,
     total_bytes: u64,
     errors: Vec<String>,
+    error_count: usize,
+    changed_files: usize,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexProgress {
+    scanning: bool,
+    processed_files: usize,
+    indexed_files: usize,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexBatch {
+    files: Vec<SharedFile>,
+    file_count: usize,
+    total_bytes: u64,
+}
+
+type VerifiedIndexFile = (PathBuf, Option<audio::AudioInfo>, String, u64);
 
 fn open_db(state: &State<'_, AppState>) -> Result<Connection, String> {
     let path = state
@@ -140,7 +178,8 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
            title TEXT NOT NULL DEFAULT '', artist TEXT NOT NULL DEFAULT '', album TEXT NOT NULL DEFAULT '',
            mime TEXT NOT NULL DEFAULT 'application/octet-stream', license TEXT NOT NULL DEFAULT 'unspecified',
            description TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', folder TEXT NOT NULL DEFAULT '',
-           modified_ns INTEGER NOT NULL DEFAULT 0
+           modified_ns INTEGER NOT NULL DEFAULT 0,
+           track_number INTEGER NOT NULL DEFAULT 0, disc_number INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS transfers (
            id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +197,13 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
          );
          CREATE TABLE IF NOT EXISTS blocked_pubkeys (
            pubkey TEXT PRIMARY KEY, reason TEXT NOT NULL, created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS local_audiobooks (
+           folder TEXT PRIMARY KEY,
+           title TEXT NOT NULL,
+           author TEXT NOT NULL DEFAULT '',
+           narrator TEXT NOT NULL DEFAULT '',
+           updated_at TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS archived_identities (
            npub TEXT PRIMARY KEY,
@@ -185,9 +231,46 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         ("tags", "TEXT NOT NULL DEFAULT ''"),
         ("folder", "TEXT NOT NULL DEFAULT ''"),
         ("modified_ns", "INTEGER NOT NULL DEFAULT 0"),
+        ("metadata_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("track_number", "INTEGER NOT NULL DEFAULT 0"),
+        ("disc_number", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         ensure_column(&connection, "files", column, declaration)?;
     }
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder);
+             CREATE INDEX IF NOT EXISTS idx_files_modified_ns ON files(modified_ns);
+             CREATE TABLE IF NOT EXISTS library_state (
+               id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO library_state(id,revision) VALUES(1,1);
+             CREATE TRIGGER IF NOT EXISTS files_library_revision_insert
+               AFTER INSERT ON files BEGIN
+                 UPDATE library_state SET revision=revision+1 WHERE id=1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS files_library_revision_update
+               AFTER UPDATE ON files BEGIN
+                 UPDATE library_state SET revision=revision+1 WHERE id=1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS files_library_revision_delete
+               AFTER DELETE ON files BEGIN
+                 UPDATE library_state SET revision=revision+1 WHERE id=1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS audiobooks_library_revision_insert
+               AFTER INSERT ON local_audiobooks BEGIN
+                 UPDATE library_state SET revision=revision+1 WHERE id=1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS audiobooks_library_revision_update
+               AFTER UPDATE ON local_audiobooks BEGIN
+                 UPDATE library_state SET revision=revision+1 WHERE id=1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS audiobooks_library_revision_delete
+               AFTER DELETE ON local_audiobooks BEGIN
+                 UPDATE library_state SET revision=revision+1 WHERE id=1;
+               END;",
+        )
+        .map_err(|error| error.to_string())?;
     network::initialise_network_schema(&connection)?;
     connection
         .execute_batch(
@@ -230,12 +313,24 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
             [&downloads],
         )
         .map_err(|error| error.to_string())?;
-    connection
+    let shared_folder = get_setting(&connection, "shared_folder")?;
+    fs::create_dir_all(Path::new(&shared_folder).join("Audiobooks"))
+        .map_err(|error| format!("could not create the Audiobooks folder: {error}"))?;
+    let migrated_relays = connection
         .execute(
-            "UPDATE settings SET value=?1 WHERE key='nostr_relays' AND replace(value,' ','')=?2",
-            params![DEFAULT_NOSTR_RELAYS, LEGACY_DEFAULT_NOSTR_RELAYS],
+            "UPDATE settings SET value=?1 WHERE key='nostr_relays' AND replace(value,' ','') IN (?2,?3)",
+            params![
+                DEFAULT_NOSTR_RELAYS,
+                LEGACY_DEFAULT_NOSTR_RELAYS,
+                PREVIOUS_DEFAULT_NOSTR_RELAYS
+            ],
         )
         .map_err(|error| error.to_string())?;
+    if migrated_relays > 0 {
+        connection
+            .execute("DELETE FROM published_catalogue", [])
+            .map_err(|error| error.to_string())?;
+    }
     let migrated_profile = connection
         .execute(
             "UPDATE settings SET value=?1 WHERE key='profile_about' AND value=?2",
@@ -303,36 +398,40 @@ fn library_folder(root: &Path, file: &Path) -> String {
         .unwrap_or_default()
 }
 
+fn shared_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SharedFile> {
+    let path: String = row.get(2)?;
+    let filename: String = row.get(1)?;
+    Ok(SharedFile {
+        file_id: row.get(0)?,
+        filename: filename.clone(),
+        folder: row.get(6)?,
+        path,
+        size: row.get::<_, i64>(3)? as u64,
+        format: row.get(4)?,
+        status: "Published".into(),
+        title: row.get(8)?,
+        artist: row.get(9)?,
+        album: row.get(10)?,
+        track_number: row.get::<_, i64>(11)?.max(0) as u32,
+        disc_number: row.get::<_, i64>(12)?.max(0) as u32,
+        mime: row.get(5)?,
+        license: "unspecified".into(),
+        description: String::new(),
+        tags: row.get(7)?,
+    })
+}
+
 fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<SharedFile>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT file_id, filename, path, size, format, mime, folder, tags FROM files
+            "SELECT file_id, filename, path, size, format, mime, folder, tags, title, artist, album, track_number, disc_number FROM files
          WHERE format IN ('MP3','FLAC','WAV','OGG','OPUS')
            AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)
          ORDER BY filename",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([], |row| {
-            let path: String = row.get(2)?;
-            let filename: String = row.get(1)?;
-            Ok(SharedFile {
-                file_id: row.get(0)?,
-                filename: filename.clone(),
-                folder: row.get(6)?,
-                path,
-                size: row.get::<_, i64>(3)? as u64,
-                format: row.get(4)?,
-                status: "Published".into(),
-                title: filename,
-                artist: String::new(),
-                album: String::new(),
-                mime: row.get(5)?,
-                license: "unspecified".into(),
-                description: String::new(),
-                tags: row.get(7)?,
-            })
-        })
+        .query_map([], shared_file_from_row)
         .map_err(|error| error.to_string())?;
     let files = rows
         .collect::<Result<Vec<_>, _>>()
@@ -340,8 +439,44 @@ fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<Shared
     let query = query.unwrap_or_default();
     Ok(files
         .into_iter()
-        .filter(|file| search_matches(query, &[&file.filename, &file.tags]))
+        .filter(|file| {
+            search_matches(
+                query,
+                &[
+                    &file.filename,
+                    &file.title,
+                    &file.artist,
+                    &file.album,
+                    &file.tags,
+                ],
+            )
+        })
         .collect())
+}
+
+fn load_files_by_id(
+    connection: &Connection,
+    file_ids: &[String],
+) -> Result<Vec<SharedFile>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT file_id, filename, path, size, format, mime, folder, tags, title, artist, album, track_number, disc_number FROM files
+             WHERE file_id=?1
+               AND format IN ('MP3','FLAC','WAV','OGG','OPUS')
+               AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut files = Vec::with_capacity(file_ids.len());
+    for file_id in file_ids {
+        if let Some(file) = statement
+            .query_row([file_id], shared_file_from_row)
+            .optional()
+            .map_err(|error| error.to_string())?
+        {
+            files.push(file);
+        }
+    }
+    Ok(files)
 }
 
 fn search_matches(query: &str, fields: &[&str]) -> bool {
@@ -421,12 +556,272 @@ fn snapshot(connection: &Connection) -> Result<AppSnapshot, String> {
     let files = load_files(connection, None)?;
     let indexed_bytes = files.iter().map(|file| file.size).sum();
     Ok(AppSnapshot {
+        audiobooks: build_local_audiobooks(connection)?,
         files,
         transfers: load_transfers(connection)?,
         settings: load_settings(connection)?,
         indexed_bytes,
         native: true,
     })
+}
+
+fn natural_sort_key(value: &str) -> String {
+    let mut key = String::with_capacity(value.len() + 24);
+    let mut digits = String::new();
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_digit() {
+            digits.push(character);
+        } else {
+            if !digits.is_empty() {
+                key.push_str(&format!("#{:0>20}", digits.trim_start_matches('0')));
+                digits.clear();
+            }
+            key.push(character);
+        }
+    }
+    if !digits.is_empty() {
+        key.push_str(&format!("#{:0>20}", digits.trim_start_matches('0')));
+    }
+    key
+}
+
+pub(crate) fn build_local_audiobooks(
+    connection: &Connection,
+) -> Result<Vec<network::AudiobookResult>, String> {
+    let files = load_files(connection, None)?;
+    build_local_audiobooks_from_files(connection, &files)
+}
+
+pub(crate) fn build_local_audiobooks_from_files(
+    connection: &Connection,
+    files: &[SharedFile],
+) -> Result<Vec<network::AudiobookResult>, String> {
+    let mut statement = connection
+        .prepare("SELECT folder,title,author,narrator FROM local_audiobooks ORDER BY title")
+        .map_err(|error| error.to_string())?;
+    let configurations = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut audiobooks = Vec::new();
+    let mut grouped_file_ids = HashSet::new();
+    let build_book = |local_folder: String,
+                      title: String,
+                      author: String,
+                      narrator: String,
+                      mut chapters: Vec<&SharedFile>| {
+        chapters.sort_by_cached_key(|file| {
+            let has_track_number = file.track_number > 0;
+            (
+                if has_track_number { 0 } else { 1 },
+                if has_track_number {
+                    file.disc_number.max(1)
+                } else {
+                    0
+                },
+                if has_track_number {
+                    file.track_number
+                } else {
+                    0
+                },
+                natural_sort_key(&format!("{}/{}", file.folder, file.filename)),
+                file.file_id.clone(),
+            )
+        });
+        if chapters.is_empty() || chapters.len() > 500 {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"napstr-audiobook-v1\0");
+        for file in &chapters {
+            digest.update(file.file_id.as_bytes());
+        }
+        let audiobook_id = hex::encode(digest.finalize());
+        let chapter_records = chapters
+            .iter()
+            .enumerate()
+            .map(|(index, file)| network::AudiobookChapter {
+                position: index + 1,
+                file_id: file.file_id.clone(),
+                filename: file.filename.clone(),
+                title: if file.title.is_empty() {
+                    file.filename.clone()
+                } else {
+                    file.title.clone()
+                },
+                format: file.format.clone(),
+                mime: file.mime.clone(),
+                size: file.size,
+            })
+            .collect::<Vec<_>>();
+        Some(network::AudiobookResult {
+            audiobook_id,
+            title,
+            author,
+            narrator,
+            total_size: chapters.iter().map(|file| file.size).sum(),
+            chapters: chapter_records,
+            sources: Vec::new(),
+            local: true,
+            local_folder,
+        })
+    };
+    // Assign files to configured books in one library pass. Previously every
+    // book re-scanned every file, which became expensive for large libraries.
+    let configuration_index = configurations
+        .iter()
+        .enumerate()
+        .map(|(index, (folder, _, _, _))| (folder.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut configured_chapters = vec![Vec::new(); configurations.len()];
+    for file in files {
+        let mut ancestor = String::new();
+        for component in file
+            .folder
+            .split('/')
+            .filter(|component| !component.is_empty())
+        {
+            if !ancestor.is_empty() {
+                ancestor.push('/');
+            }
+            ancestor.push_str(component);
+            if let Some(index) = configuration_index.get(ancestor.as_str()) {
+                configured_chapters[*index].push(file);
+            }
+        }
+    }
+    for ((folder, title, author, narrator), mut chapters) in
+        configurations.into_iter().zip(configured_chapters)
+    {
+        if let Some(book) = build_book(
+            folder,
+            title,
+            author,
+            narrator,
+            std::mem::take(&mut chapters),
+        ) {
+            grouped_file_ids.extend(book.chapters.iter().map(|chapter| chapter.file_id.clone()));
+            audiobooks.push(book);
+        }
+    }
+    // `Audiobooks` is a convention-based drop zone. Each immediate child
+    // directory is one recursive book; loose files are complete one-file
+    // books. Explicitly configured collections above take precedence.
+    let mut automatic_folders: HashMap<String, Vec<&SharedFile>> = HashMap::new();
+    let mut automatic_loose_files = Vec::new();
+    for file in files
+        .iter()
+        .filter(|file| !grouped_file_ids.contains(&file.file_id))
+    {
+        if file.folder == "Audiobooks" {
+            automatic_loose_files.push(file);
+        } else if let Some(relative) = file.folder.strip_prefix("Audiobooks/") {
+            if let Some(folder) = relative
+                .split('/')
+                .next()
+                .filter(|folder| !folder.is_empty())
+            {
+                automatic_folders
+                    .entry(format!("Audiobooks/{folder}"))
+                    .or_default()
+                    .push(file);
+            }
+        }
+    }
+    for (folder, chapters) in automatic_folders {
+        let folder_title = folder
+            .strip_prefix("Audiobooks/")
+            .unwrap_or("Audiobook")
+            .replace('_', " ");
+        let title = audio::sanitise_public_text(&folder_title);
+        let title = if title.is_empty() {
+            "Audiobook".to_string()
+        } else {
+            title
+        };
+        let author = chapters
+            .iter()
+            .find_map(|file| (!file.artist.is_empty()).then(|| file.artist.clone()))
+            .unwrap_or_default();
+        if let Some(book) = build_book(folder, title, author, String::new(), chapters) {
+            grouped_file_ids.extend(book.chapters.iter().map(|chapter| chapter.file_id.clone()));
+            audiobooks.push(book);
+        }
+    }
+    for file in automatic_loose_files {
+        let title = if file.title.is_empty() {
+            Path::new(&file.filename)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or(&file.filename)
+                .to_string()
+        } else {
+            file.title.clone()
+        };
+        if let Some(book) = build_book(
+            format!("@automatic:{}", file.file_id),
+            title,
+            file.artist.clone(),
+            String::new(),
+            vec![file],
+        ) {
+            grouped_file_ids.insert(file.file_id.clone());
+            audiobooks.push(book);
+        }
+    }
+    // A complete audiobook is often distributed as one MP3. The exact
+    // `audiobook` tag opts that file into the collection catalogue without
+    // changing its ordinary track event. Files already covered by an explicit
+    // multi-file folder manifest are not duplicated as one-file books.
+    for file in files.iter().filter(|file| {
+        !grouped_file_ids.contains(&file.file_id)
+            && file
+                .tags
+                .split(',')
+                .any(|tag| tag.trim().eq_ignore_ascii_case("audiobook"))
+    }) {
+        let chapter = network::AudiobookChapter {
+            position: 1,
+            file_id: file.file_id.clone(),
+            filename: file.filename.clone(),
+            title: if file.title.is_empty() {
+                file.filename.clone()
+            } else {
+                file.title.clone()
+            },
+            format: file.format.clone(),
+            mime: file.mime.clone(),
+            size: file.size,
+        };
+        let mut digest = Sha256::new();
+        digest.update(b"napstr-audiobook-v1\0");
+        digest.update(file.file_id.as_bytes());
+        audiobooks.push(network::AudiobookResult {
+            audiobook_id: hex::encode(digest.finalize()),
+            title: if file.title.is_empty() {
+                file.filename.clone()
+            } else {
+                file.title.clone()
+            },
+            author: file.artist.clone(),
+            narrator: String::new(),
+            total_size: file.size,
+            chapters: vec![chapter],
+            sources: Vec::new(),
+            local: true,
+            local_folder: format!("@tagged:{}", file.file_id),
+        });
+    }
+    audiobooks.sort_by(|left, right| left.title.cmp(&right.title));
+    Ok(audiobooks)
 }
 
 fn ensure_column(
@@ -506,17 +901,22 @@ pub(crate) fn upsert_verified_file(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("Unnamed file");
+    let filename = audio::sanitise_public_text(filename);
+    if filename.is_empty() {
+        return Err("audio filename has no safe public text".into());
+    }
     let relative_folder = library_folder(folder_root, path);
     let modified = fs::metadata(path)
         .map(|metadata| modified_ns(&metadata))
         .unwrap_or(0);
     connection
         .execute(
-            "INSERT INTO files (file_id, filename, path, size, format, indexed_at, mime, folder, modified_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO files (file_id, filename, path, size, format, indexed_at, mime, folder, modified_ns, title, artist, album, metadata_version, track_number, disc_number)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(file_id) DO UPDATE SET filename=excluded.filename,path=excluded.path,size=excluded.size,
              format=excluded.format,mime=excluded.mime,folder=excluded.folder,indexed_at=excluded.indexed_at,
-             modified_ns=excluded.modified_ns",
+             modified_ns=excluded.modified_ns,title=excluded.title,artist=excluded.artist,album=excluded.album,
+             metadata_version=excluded.metadata_version,track_number=excluded.track_number,disc_number=excluded.disc_number",
             params![
                 file_id,
                 filename,
@@ -526,14 +926,108 @@ pub(crate) fn upsert_verified_file(
                 Utc::now().to_rfc3339(),
                 audio.mime,
                 relative_folder,
-                modified
+                modified,
+                audio.metadata.title,
+                audio.metadata.artist,
+                audio.metadata.album,
+                AUDIO_METADATA_VERSION,
+                audio.metadata.track_number,
+                audio.metadata.disc_number
             ],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
 }
 
-fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport, String> {
+fn supported_audio_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "mp3" | "flac" | "wav" | "ogg" | "opus"
+            )
+        })
+}
+
+fn record_index_error(report: &mut IndexReport, message: String) {
+    report.error_count += 1;
+    if report.errors.len() < MAX_INDEX_ERRORS {
+        report.errors.push(message);
+    }
+}
+
+fn validate_and_hash_index_file(
+    path: &Path,
+    expected_modified_ns: i64,
+) -> Result<VerifiedIndexFile, String> {
+    let audio = audio::validate_audio(path)?;
+    let (file_id, size) = hash_file(path)?;
+    let unchanged_during_hash = fs::metadata(path)
+        .map(|after| after.len() == size && modified_ns(&after) == expected_modified_ns)
+        .unwrap_or(false);
+    if !unchanged_during_hash {
+        return Err("file changed while it was being indexed".into());
+    }
+    Ok((path.to_path_buf(), Some(audio), file_id, size))
+}
+
+fn commit_index_batch(
+    connection: &mut Connection,
+    folder: &Path,
+    batch: &mut Vec<VerifiedIndexFile>,
+    report: &mut IndexReport,
+) -> Result<Vec<SharedFile>, String> {
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(|error| error.to_string())?;
+    let mut changed_ids = Vec::new();
+    let mut changed_ids_seen = HashSet::new();
+    for (path, audio, file_id, size) in batch.drain(..) {
+        let blocked: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
+                [&file_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if blocked {
+            record_index_error(
+                report,
+                format!("{}: this file hash is blocked", path.display()),
+            );
+            continue;
+        }
+        if let Some(audio) = audio {
+            upsert_verified_file(&transaction, folder, &path, &file_id, size, audio)?;
+            report.changed_files += 1;
+            if changed_ids_seen.insert(file_id.clone()) {
+                changed_ids.push(file_id.clone());
+            }
+        }
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO napstr_seen(file_id) VALUES (?1)",
+                [&file_id],
+            )
+            .map_err(|error| error.to_string())?;
+        report.file_count += 1;
+        report.total_bytes += size;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    load_files_by_id(connection, &changed_ids)
+}
+
+fn index_path_with_progress(
+    connection: &mut Connection,
+    folder: &Path,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(usize, usize),
+    mut batch_committed: impl FnMut(IndexBatch),
+) -> Result<IndexReport, String> {
     if !folder.is_dir() {
         return Err("The selected Napstr folder does not exist or is not a directory".into());
     }
@@ -541,11 +1035,14 @@ fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport,
         file_count: 0,
         total_bytes: 0,
         errors: Vec::new(),
+        error_count: 0,
+        changed_files: 0,
     };
-    let mut verified = Vec::new();
+    let mut verified = Vec::with_capacity(INDEX_COMMIT_BATCH_SIZE);
+    let mut processed_files = 0usize;
     let existing = {
         let mut statement = connection
-            .prepare("SELECT path,file_id,size,modified_ns FROM files")
+            .prepare("SELECT path,file_id,size,modified_ns,metadata_version FROM files")
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map([], |row| {
@@ -555,6 +1052,7 @@ fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)? as u64,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
                     ),
                 ))
             })
@@ -563,91 +1061,120 @@ fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport,
             .map_err(|error| error.to_string())?
     };
 
-    // Audio validation and SHA-256 hashing can take a while. Do all filesystem
-    // work before opening a write transaction so downloads and progress
-    // updates are not blocked for the duration of a rescan.
+    connection
+        .execute_batch(
+            "DROP TABLE IF EXISTS temp.napstr_seen;
+             CREATE TEMP TABLE napstr_seen(file_id TEXT PRIMARY KEY);",
+        )
+        .map_err(|error| error.to_string())?;
+
+    // Audio validation and SHA-256 hashing stay outside write transactions.
+    // Small commits make verified tracks visible without holding the database
+    // while the rest of a large collection is scanned.
     for entry in WalkDir::new(folder)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .is_none_or(|extension| !extension.eq_ignore_ascii_case("part"))
-        })
+        .filter(|entry| entry.file_type().is_file() && supported_audio_path(entry.path()))
     {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = connection.execute("DROP TABLE IF EXISTS temp.napstr_seen", []);
+            return Err("Indexing cancelled".into());
+        }
+        processed_files += 1;
         let path = entry.path();
         let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) => {
-                report.errors.push(format!("{}: {error}", path.display()));
+                record_index_error(&mut report, format!("{}: {error}", path.display()));
                 continue;
             }
         };
         let path_key = path.to_string_lossy();
         let current_modified_ns = modified_ns(&metadata);
-        if current_modified_ns != 0 {
-            if let Some((file_id, size, stored_modified_ns)) = existing.get(path_key.as_ref()) {
-                if *size == metadata.len() && *stored_modified_ns == current_modified_ns {
-                    verified.push((path.to_path_buf(), None, file_id.clone(), *size));
-                    continue;
+        let unchanged = current_modified_ns != 0
+            && existing
+                .get(path_key.as_ref())
+                .is_some_and(|(_, size, stored_modified_ns, _)| {
+                    *size == metadata.len() && *stored_modified_ns == current_modified_ns
+                });
+        if unchanged {
+            let (file_id, size, _, metadata_version) = existing
+                .get(path_key.as_ref())
+                .expect("unchanged index entry disappeared");
+            if *metadata_version >= AUDIO_METADATA_VERSION {
+                verified.push((path.to_path_buf(), None, file_id.clone(), *size));
+            } else {
+                match audio::validate_audio(path) {
+                    Ok(audio) => {
+                        let still_unchanged = fs::metadata(path)
+                            .map(|after| {
+                                after.len() == *size && modified_ns(&after) == current_modified_ns
+                            })
+                            .unwrap_or(false);
+                        if still_unchanged {
+                            verified.push((
+                                path.to_path_buf(),
+                                Some(audio),
+                                file_id.clone(),
+                                *size,
+                            ));
+                        } else {
+                            record_index_error(
+                                &mut report,
+                                format!(
+                                    "{}: file changed while its metadata was being indexed",
+                                    path.display()
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        record_index_error(&mut report, format!("{}: {}", path.display(), error))
+                    }
+                }
+            }
+        } else {
+            match validate_and_hash_index_file(path, current_modified_ns) {
+                Ok(file) => verified.push(file),
+                Err(error) => {
+                    record_index_error(&mut report, format!("{}: {}", path.display(), error))
                 }
             }
         }
-        match audio::validate_audio(path)
-            .and_then(|audio| hash_file(path).map(|hash| (audio, hash)))
-        {
-            Ok((audio, (file_id, size))) => {
-                let unchanged_during_hash = fs::metadata(path)
-                    .map(|after| after.len() == size && modified_ns(&after) == current_modified_ns)
-                    .unwrap_or(false);
-                if unchanged_during_hash {
-                    verified.push((path.to_path_buf(), Some(audio), file_id, size));
-                } else {
-                    report.errors.push(format!(
-                        "{}: file changed while it was being indexed",
-                        path.display()
-                    ));
-                }
+        if verified.len() >= INDEX_COMMIT_BATCH_SIZE {
+            let files = commit_index_batch(connection, folder, &mut verified, &mut report)?;
+            if !files.is_empty() {
+                batch_committed(IndexBatch {
+                    files,
+                    file_count: report.file_count,
+                    total_bytes: report.total_bytes,
+                });
             }
-            Err(error) => report.errors.push(format!("{}: {}", path.display(), error)),
+        }
+        if processed_files % INDEX_PROGRESS_INTERVAL == 0 {
+            progress(processed_files, report.file_count + verified.len());
         }
     }
+
+    if cancelled.load(Ordering::Relaxed) {
+        let _ = connection.execute("DROP TABLE IF EXISTS temp.napstr_seen", []);
+        return Err("Indexing cancelled".into());
+    }
+    let files = commit_index_batch(connection, folder, &mut verified, &mut report)?;
+    if !files.is_empty() {
+        batch_committed(IndexBatch {
+            files,
+            file_count: report.file_count,
+            total_bytes: report.total_bytes,
+        });
+    }
+    progress(processed_files, report.file_count);
 
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
-    transaction.execute_batch("DROP TABLE IF EXISTS temp.napstr_seen; CREATE TEMP TABLE napstr_seen(file_id TEXT PRIMARY KEY);").map_err(|error| error.to_string())?;
-    for (path, audio, file_id, size) in verified {
-        let blocked: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
-                [&file_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        if blocked {
-            report
-                .errors
-                .push(format!("{}: this file hash is blocked", path.display()));
-            continue;
-        }
-        if let Some(audio) = audio {
-            upsert_verified_file(&transaction, folder, &path, &file_id, size, audio)?;
-        }
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO napstr_seen(file_id) VALUES (?1)",
-                [file_id],
-            )
-            .map_err(|error| error.to_string())?;
-        report.file_count += 1;
-        report.total_bytes += size;
-    }
-    transaction
+    report.changed_files += transaction
         .execute(
             "DELETE FROM files WHERE file_id NOT IN (SELECT file_id FROM napstr_seen)",
             [],
@@ -660,10 +1187,100 @@ fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport,
     Ok(report)
 }
 
+#[cfg(test)]
+fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport, String> {
+    index_path_with_progress(
+        connection,
+        folder,
+        &AtomicBool::new(false),
+        |_, _| {},
+        |_| {},
+    )
+}
+
+fn run_index_job(
+    db_path: &Path,
+    folder: &Path,
+    scan_lock: &Mutex<()>,
+    scan_cancel: &AtomicBool,
+    app_handle: &tauri::AppHandle,
+    network: &Arc<network::NetworkService>,
+) -> Result<IndexReport, String> {
+    let _scan_guard = scan_lock.lock().map_err(|_| "library scan lock poisoned")?;
+    scan_cancel.store(false, Ordering::SeqCst);
+    let _ = app_handle.emit(
+        INDEX_PROGRESS_EVENT,
+        IndexProgress {
+            scanning: true,
+            processed_files: 0,
+            indexed_files: 0,
+            message: "Scanning the Napstr folder…".into(),
+        },
+    );
+    let mut connection = open_connection(db_path)?;
+    let result = index_path_with_progress(
+        &mut connection,
+        folder,
+        scan_cancel,
+        |processed_files, indexed_files| {
+            let _ = app_handle.emit(
+                INDEX_PROGRESS_EVENT,
+                IndexProgress {
+                    scanning: true,
+                    processed_files,
+                    indexed_files,
+                    message: format!("Checking audio files… {processed_files}"),
+                },
+            );
+        },
+        |batch| {
+            let file_ids = batch
+                .files
+                .iter()
+                .map(|file| file.file_id.clone())
+                .collect::<Vec<_>>();
+            let _ = app_handle.emit(INDEX_BATCH_EVENT, batch);
+            network.queue_catalogue_files(file_ids);
+        },
+    );
+    match &result {
+        Ok(report) => {
+            if report.changed_files > 0 {
+                let _ = app_handle.emit(LIBRARY_CHANGED_EVENT, report.clone());
+                network.queue_catalogue_publish(false);
+            }
+            let _ = app_handle.emit(
+                INDEX_PROGRESS_EVENT,
+                IndexProgress {
+                    scanning: false,
+                    processed_files: report.file_count + report.error_count,
+                    indexed_files: report.file_count,
+                    message: format!("Indexed {} audio file(s)", report.file_count),
+                },
+            );
+        }
+        Err(error) => {
+            let _ = app_handle.emit(
+                INDEX_PROGRESS_EVENT,
+                IndexProgress {
+                    scanning: false,
+                    processed_files: 0,
+                    indexed_files: 0,
+                    message: error.clone(),
+                },
+            );
+        }
+    }
+    result
+}
+
 fn start_folder_watcher(
     folder: PathBuf,
     db_path: PathBuf,
     network: Arc<network::NetworkService>,
+    scan_lock: Arc<Mutex<()>>,
+    scan_cancel: Arc<AtomicBool>,
+    app_handle: tauri::AppHandle,
 ) -> Result<FolderWatcher, String> {
     let (event_tx, event_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher = notify::recommended_watcher(move |event| {
@@ -683,15 +1300,14 @@ fn start_folder_watcher(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(750));
                 while event_rx.try_recv().is_ok() {}
-                let Ok(mut connection) = open_connection(&db_path) else {
-                    continue;
-                };
-                if index_path(&mut connection, &folder).is_ok() {
-                    let network = network.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _ = network.publish_catalogue().await;
-                    });
-                }
+                let _ = run_index_job(
+                    &db_path,
+                    &folder,
+                    &scan_lock,
+                    &scan_cancel,
+                    &app_handle,
+                    &network,
+                );
             }
         })
         .map_err(|error| error.to_string())?;
@@ -709,16 +1325,117 @@ fn search_catalog(query: String, state: State<'_, AppState>) -> Result<Vec<Share
 }
 
 #[tauri::command]
-fn set_napstr_folder(path: String, state: State<'_, AppState>) -> Result<IndexReport, String> {
-    let folder = PathBuf::from(&path);
+fn save_audiobook(
+    folder: String,
+    title: String,
+    author: String,
+    narrator: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::AudiobookResult>, String> {
+    let folder = folder.trim();
+    if folder.is_empty()
+        || Path::new(folder).is_absolute()
+        || Path::new(folder)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("choose a subfolder inside the Napstr folder".into());
+    }
+    let title = audio::sanitise_public_text(title.trim());
+    let author = audio::sanitise_public_text(author.trim());
+    let narrator = audio::sanitise_public_text(narrator.trim());
+    if title.is_empty() {
+        return Err("an audiobook title is required".into());
+    }
     let mut connection = open_db(&state)?;
-    let report = index_path(&mut connection, &folder)?;
+    let nested_prefix = format!("{folder}/");
+    let chapter_count = {
+        let mut statement = connection
+            .prepare("SELECT folder FROM files")
+            .map_err(|error| error.to_string())?;
+        let count = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .filter(|candidate| candidate == folder || candidate.starts_with(&nested_prefix))
+            .count();
+        count
+    };
+    if !(1..=500).contains(&chapter_count) {
+        return Err("an audiobook must contain between 1 and 500 indexed audio chapters".into());
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO local_audiobooks(folder,title,author,narrator,updated_at)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(folder) DO UPDATE SET title=excluded.title,author=excluded.author,
+             narrator=excluded.narrator,updated_at=excluded.updated_at",
+            params![folder, title, author, narrator, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+    let audiobooks = build_local_audiobooks(&transaction)?;
+    let saved = audiobooks
+        .iter()
+        .find(|book| book.local_folder == folder)
+        .ok_or("the selected folder no longer contains enough indexed chapters")?;
+    if serde_json::to_vec(saved)
+        .map_err(|error| error.to_string())?
+        .len()
+        > 128 * 1024
+    {
+        return Err("this audiobook manifest is too large; split it into volumes".into());
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    drop(connection);
+    state.network.queue_catalogue_publish(false);
+    Ok(audiobooks)
+}
+
+#[tauri::command]
+fn remove_audiobook(
+    folder: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::AudiobookResult>, String> {
+    let connection = open_db(&state)?;
+    connection
+        .execute("DELETE FROM local_audiobooks WHERE folder=?1", [&folder])
+        .map_err(|error| error.to_string())?;
+    let audiobooks = build_local_audiobooks(&connection)?;
+    drop(connection);
+    state.network.queue_catalogue_publish(false);
+    Ok(audiobooks)
+}
+
+#[tauri::command]
+async fn set_napstr_folder(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<IndexReport, String> {
+    let folder = PathBuf::from(&path);
+    if !folder.is_dir() {
+        return Err("The selected Napstr folder does not exist or is not a directory".into());
+    }
+    fs::create_dir_all(folder.join("Audiobooks"))
+        .map_err(|error| format!("could not create the Audiobooks folder: {error}"))?;
+    let connection = open_db(&state)?;
     connection
         .execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('shared_folder', ?1)",
             [&path],
         )
         .map_err(|error| error.to_string())?;
+    connection
+        .execute("DELETE FROM files", [])
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute("DELETE FROM local_audiobooks", [])
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+    let _ = state.app_handle.emit(LIBRARY_CHANGED_EVENT, ());
+    state.network.queue_catalogue_publish(false);
     let db_path = state
         .db_path
         .lock()
@@ -729,56 +1446,115 @@ fn set_napstr_folder(path: String, state: State<'_, AppState>) -> Result<IndexRe
         .lock()
         .map_err(|_| "folder watcher lock poisoned")? = Some(start_folder_watcher(
         folder,
-        db_path,
+        db_path.clone(),
         state.network.clone(),
+        state.scan_lock.clone(),
+        state.scan_cancel.clone(),
+        state.app_handle.clone(),
     )?);
-    Ok(report)
+    let scan_lock = state.scan_lock.clone();
+    let scan_cancel = state.scan_cancel.clone();
+    let app_handle = state.app_handle.clone();
+    let network = state.network.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_index_job(
+            &db_path,
+            Path::new(&path),
+            &scan_lock,
+            &scan_cancel,
+            &app_handle,
+            &network,
+        )
+    })
+    .await
+    .map_err(|error| format!("library scan task failed: {error}"))?
 }
 
 #[tauri::command]
-fn rescan_napstr_folder(state: State<'_, AppState>) -> Result<IndexReport, String> {
-    let mut connection = open_db(&state)?;
+async fn rescan_napstr_folder(state: State<'_, AppState>) -> Result<IndexReport, String> {
+    let connection = open_db(&state)?;
     let folder = PathBuf::from(get_setting(&connection, "shared_folder")?);
-    index_path(&mut connection, &folder)
+    drop(connection);
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .clone();
+    let scan_lock = state.scan_lock.clone();
+    let scan_cancel = state.scan_cancel.clone();
+    let app_handle = state.app_handle.clone();
+    let network = state.network.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_index_job(
+            &db_path,
+            &folder,
+            &scan_lock,
+            &scan_cancel,
+            &app_handle,
+            &network,
+        )
+    })
+    .await
+    .map_err(|error| format!("library scan task failed: {error}"))?
 }
 
 #[tauri::command]
-fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result<AppSnapshot, String> {
+fn cancel_library_scan(state: State<'_, AppState>) {
+    state.scan_cancel.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+async fn save_settings(
+    settings: Settings,
+    state: State<'_, AppState>,
+) -> Result<AppSnapshot, String> {
     network::validate_profile_picture(&settings.profile_picture)?;
     validate_length("display name", &settings.display_name, 64)?;
     validate_length("profile about", &settings.profile_about, 500)?;
     validate_length("relay list", &settings.nostr_relays, 4096)?;
-    let connection = open_db(&state)?;
-    let profile_changed = get_setting(&connection, "display_name")? != settings.display_name
-        || get_setting(&connection, "profile_about")? != settings.profile_about
-        || get_setting(&connection, "profile_picture")? != settings.profile_picture;
-    for (key, value) in [
-        ("shared_folder", settings.napstr_folder),
-        ("nostr_relays", settings.nostr_relays),
-        ("display_name", settings.display_name),
-        ("profile_about", settings.profile_about),
-        ("profile_picture", settings.profile_picture),
-        (
-            "relays_over_tor",
-            if settings.relays_over_tor { "on" } else { "off" }.to_string(),
-        ),
-    ] {
-        connection
-            .execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
-                params![key, value],
-            )
-            .map_err(|error| error.to_string())?;
+    let (snapshot, relays_changed) = {
+        let connection = open_db(&state)?;
+        let relays_changed = get_setting(&connection, "nostr_relays")? != settings.nostr_relays;
+        let profile_changed = get_setting(&connection, "display_name")? != settings.display_name
+            || get_setting(&connection, "profile_about")? != settings.profile_about
+            || get_setting(&connection, "profile_picture")? != settings.profile_picture;
+        for (key, value) in [
+            ("shared_folder", settings.napstr_folder),
+            ("nostr_relays", settings.nostr_relays),
+            ("display_name", settings.display_name),
+            ("profile_about", settings.profile_about),
+            ("profile_picture", settings.profile_picture),
+            (
+                "relays_over_tor",
+                if settings.relays_over_tor { "on" } else { "off" }.to_string(),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                    params![key, value],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        if profile_changed {
+            connection
+                .execute(
+                    "UPDATE settings SET value='' WHERE key='profile_event_fingerprint'",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        if relays_changed {
+            connection
+                .execute("DELETE FROM published_catalogue", [])
+                .map_err(|error| error.to_string())?;
+        }
+        (snapshot(&connection)?, relays_changed)
+    };
+    if relays_changed && state.network.status().await?.connected {
+        state.network.restart().await?;
     }
-    if profile_changed {
-        connection
-            .execute(
-                "UPDATE settings SET value='' WHERE key='profile_event_fingerprint'",
-                [],
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    snapshot(&connection)
+    Ok(snapshot)
 }
 
 fn unique_destination(folder: &Path, filename: &str) -> PathBuf {
@@ -983,6 +1759,14 @@ fn open_release_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_napstrfy_website() -> Result<(), String> {
+    open_with_system(
+        Path::new("https://napstr.net/napstrfy.html"),
+        "Napstrfy website",
+    )
+}
+
+#[tauri::command]
 fn open_napstr_folder(state: State<'_, AppState>) -> Result<(), String> {
     let folder = PathBuf::from(get_setting(&open_db(&state)?, "shared_folder")?);
     fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
@@ -1033,8 +1817,20 @@ pub(crate) fn normalise_tags(value: &str) -> Result<String, String> {
         .filter(|value| !value.is_empty())
     {
         validate_length("each tag", value, 32)?;
-        if value.chars().any(char::is_control) {
-            return Err("tags cannot contain control characters".into());
+        if value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        }) {
+            return Err(
+                "tags cannot contain control or bidirectional formatting characters".into(),
+            );
         }
         let key = value.to_lowercase();
         if seen.insert(key) {
@@ -1331,7 +2127,8 @@ fn apply_tor_status(status: &mut network::NetworkStatus, tor: tor::TorStatus) {
 
 #[tauri::command]
 async fn publish_catalogue(state: State<'_, AppState>) -> Result<usize, String> {
-    state.network.publish_catalogue().await
+    state.network.queue_catalogue_publish(false);
+    Ok(0)
 }
 
 #[tauri::command]
@@ -1345,6 +2142,27 @@ async fn network_search(
     state: State<'_, AppState>,
 ) -> Result<Vec<network::CatalogueResult>, String> {
     state.network.search(&query).await
+}
+
+#[tauri::command]
+async fn network_search_audiobooks(
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::AudiobookResult>, String> {
+    state.network.search_audiobooks(&query).await
+}
+
+#[tauri::command]
+async fn network_browse(
+    cursor: Option<network::CatalogueBrowseCursor>,
+    limit: Option<usize>,
+    cache_limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<network::CatalogueBrowsePage, String> {
+    state
+        .network
+        .browse(cursor, limit.unwrap_or(500), cache_limit.unwrap_or(10_000))
+        .await
 }
 
 #[tauri::command]
@@ -1390,12 +2208,30 @@ async fn send_track_discussion_message(
 async fn request_network_download(
     file_id: String,
     source_pubkeys: Vec<String>,
+    destination_folder: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     state
         .network
-        .request_download(file_id, source_pubkeys)
+        .request_download(file_id, source_pubkeys, destination_folder)
         .await
+}
+
+#[tauri::command]
+async fn mobile_status(state: State<'_, AppState>) -> Result<mobile::MobileStatus, String> {
+    Ok(state.mobile.status().await)
+}
+
+#[tauri::command]
+async fn create_mobile_pairing(
+    state: State<'_, AppState>,
+) -> Result<mobile::MobilePairingOffer, String> {
+    state.mobile.create_pairing().await
+}
+
+#[tauri::command]
+fn revoke_mobile_device(endpoint_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.mobile.revoke(&endpoint_id)
 }
 
 #[tauri::command]
@@ -1416,9 +2252,7 @@ async fn block_file(file_id: String, state: State<'_, AppState>) -> Result<(), S
         .execute("DELETE FROM remote_catalogue WHERE file_id=?1", [&file_id])
         .map_err(|error| error.to_string())?;
     drop(connection);
-    if state.network.status().await?.connected {
-        state.network.publish_catalogue().await?;
-    }
+    state.network.queue_catalogue_publish(false);
     Ok(())
 }
 
@@ -1475,6 +2309,7 @@ fn toggle_maximise(window: tauri::Window) -> Result<(), String> {
 async fn close_window(window: tauri::Window, state: State<'_, AppState>) -> Result<(), String> {
     state.network.stop().await;
     state.tor.stop().await;
+    state.mobile.stop().await;
     window.close().map_err(|error| error.to_string())
 }
 
@@ -1495,7 +2330,7 @@ pub fn run() {
                 .map_err(|error| error.to_string())?;
             let db_path = app_data.join("napstr.sqlite3");
             initialise_database(&db_path, &app_data)?;
-            let tor = Arc::new(tor::TorManager::new(app_data, resource_dir));
+            let tor = Arc::new(tor::TorManager::new(app_data.clone(), resource_dir));
             let transfers = Arc::new(transfer::TransferService::new(db_path.clone(), tor.clone()));
             let network = network::NetworkService::new(
                 db_path.clone(),
@@ -1503,16 +2338,22 @@ pub fn run() {
                 tor.clone(),
                 app.handle().clone(),
             );
+            let mobile =
+                mobile::MobileService::new(db_path.clone(), app_data.clone(), network.clone())?;
+            let scan_lock = Arc::new(Mutex::new(()));
+            let scan_cancel = Arc::new(AtomicBool::new(false));
             *setup_shutdown_services
                 .lock()
                 .map_err(|_| "shutdown service lock was poisoned")? = Some(ShutdownServices {
                 network: network.clone(),
                 tor: tor.clone(),
+                mobile: mobile.clone(),
             });
             let existing_folder = open_connection(&db_path)
                 .ok()
                 .and_then(|connection| get_setting(&connection, "shared_folder").ok())
                 .map(PathBuf::from);
+            let startup_folder = existing_folder.clone();
             let watcher = existing_folder.and_then(|folder| {
                 if !folder.is_dir() {
                     if let Ok(connection) = open_connection(&db_path) {
@@ -1520,26 +2361,61 @@ pub fn run() {
                     }
                     return None;
                 }
-                if let Ok(mut connection) = open_connection(&db_path) {
-                    let _ = index_path(&mut connection, &folder);
-                }
-                start_folder_watcher(folder, db_path.clone(), network.clone()).ok()
+                start_folder_watcher(
+                    folder,
+                    db_path.clone(),
+                    network.clone(),
+                    scan_lock.clone(),
+                    scan_cancel.clone(),
+                    app.handle().clone(),
+                )
+                .ok()
             });
             app.manage(AppState {
                 db_path: Mutex::new(db_path),
-                network,
+                network: network.clone(),
                 tor,
                 watcher: Mutex::new(watcher),
+                scan_lock: scan_lock.clone(),
+                scan_cancel: scan_cancel.clone(),
+                app_handle: app.handle().clone(),
                 player: Arc::new(player::NativePlayer::default()),
+                mobile: mobile.clone(),
                 recovering_after_sleep: Arc::new(AtomicBool::new(false)),
             });
+            if mobile.has_devices() {
+                tauri::async_runtime::spawn(async move {
+                    let _ = mobile.start().await;
+                });
+            }
+            if let Some(folder) = startup_folder.filter(|folder| folder.is_dir()) {
+                let startup_db_path = app
+                    .path()
+                    .app_data_dir()
+                    .map_err(|error| error.to_string())?
+                    .join("napstr.sqlite3");
+                let startup_handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let _ = run_index_job(
+                        &startup_db_path,
+                        &folder,
+                        &scan_lock,
+                        &scan_cancel,
+                        &startup_handle,
+                        &network,
+                    );
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             search_catalog,
+            save_audiobook,
+            remove_audiobook,
             set_napstr_folder,
             rescan_napstr_folder,
+            cancel_library_scan,
             save_file_tags,
             save_settings,
             remove_transfer,
@@ -1552,6 +2428,7 @@ pub fn run() {
             adopt_archived_identity,
             open_napstr_folder,
             open_release_url,
+            open_napstrfy_website,
             player::play_audio,
             player::toggle_audio,
             player::stop_audio,
@@ -1566,11 +2443,16 @@ pub fn run() {
             publish_catalogue,
             publish_profile,
             network_search,
+            network_search_audiobooks,
+            network_browse,
             get_trollbox_messages,
             send_trollbox_message,
             get_track_discussion_messages,
             send_track_discussion_message,
             request_network_download,
+            mobile_status,
+            create_mobile_pairing,
+            revoke_mobile_device,
             block_file,
             block_user,
             report_catalogue,
@@ -1590,6 +2472,7 @@ pub fn run() {
         tauri::async_runtime::block_on(async move {
             services.network.stop().await;
             services.tor.stop().await;
+            services.mobile.stop().await;
         });
     }
     std::process::exit(exit_code);
@@ -1651,25 +2534,283 @@ mod tests {
         let mut connection = open_connection(&db_path).unwrap();
         let report = index_path(&mut connection, &directory).unwrap();
         assert_eq!(report.file_count, 1);
-        assert!(report.errors.len() >= 2);
+        assert_eq!(report.error_count, 1);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.changed_files, 1);
         let indexed = load_files(&connection, None).unwrap();
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed[0].folder, "artist/album");
         connection
             .execute(
-                "UPDATE files SET tags='punk, favourite' WHERE file_id=?1",
+                "UPDATE files SET tags='punk, favourite',metadata_version=0 WHERE file_id=?1",
                 [&indexed[0].file_id],
             )
             .unwrap();
         let report = index_path(&mut connection, &directory).unwrap();
         assert_eq!(report.file_count, 1);
+        assert_eq!(report.changed_files, 1);
         let tagged = load_files(&connection, Some("FAVOURITE")).unwrap();
         assert_eq!(tagged.len(), 1);
         assert_eq!(tagged[0].tags, "punk, favourite");
+        let report = index_path(&mut connection, &directory).unwrap();
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.changed_files, 0);
         fs::remove_file(&audio).unwrap();
         let report = index_path(&mut connection, &directory).unwrap();
         assert_eq!(report.file_count, 0);
+        assert_eq!(report.changed_files, 1);
         assert!(load_files(&connection, None).unwrap().is_empty());
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audiobook_manifest_prefers_metadata_then_naturally_orders_chapters() {
+        let directory = test_directory("audiobook-manifest-test");
+        fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        for (file_id, filename, size) in [
+            ("22".repeat(32), "Chapter 10.mp3", 10i64),
+            ("11".repeat(32), "Chapter 2.mp3", 20i64),
+        ] {
+            connection.execute(
+                "INSERT INTO files(file_id,filename,path,size,format,indexed_at,mime,folder,modified_ns,title,artist,album,metadata_version)
+                 VALUES(?1,?2,?3,?4,'MP3','now','audio/mpeg','My Audiobook',1,?2,'Author','Book',1)",
+                params![file_id, filename, directory.join(filename).to_string_lossy(), size],
+            ).unwrap();
+        }
+        connection.execute(
+            "INSERT INTO local_audiobooks(folder,title,author,narrator,updated_at) VALUES('My Audiobook','The Book','Author','Narrator','now')",
+            [],
+        ).unwrap();
+
+        let books = build_local_audiobooks(&connection).unwrap();
+
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].chapters[0].filename, "Chapter 2.mp3");
+        assert_eq!(books[0].chapters[1].filename, "Chapter 10.mp3");
+        assert_eq!(books[0].total_size, 30);
+        assert_eq!(books[0].audiobook_id.len(), 64);
+
+        connection
+            .execute(
+                "UPDATE files SET track_number=CASE filename WHEN 'Chapter 10.mp3' THEN 1 ELSE 2 END",
+                [],
+            )
+            .unwrap();
+        let metadata_ordered = build_local_audiobooks(&connection).unwrap();
+        assert_eq!(metadata_ordered[0].chapters[0].filename, "Chapter 10.mp3");
+        assert_eq!(metadata_ordered[0].chapters[1].filename, "Chapter 2.mp3");
+
+        connection
+            .execute(
+                "INSERT INTO files(file_id,filename,path,size,format,indexed_at,mime,folder,title,artist,tags)
+                 VALUES(?1,'Complete Book.mp3',?2,40,'MP3','now','audio/mpeg','Singles','Complete Book','Author','spoken, Audiobook')",
+                params!["33".repeat(32), directory.join("Complete Book.mp3").to_string_lossy()],
+            )
+            .unwrap();
+        let with_tagged_book = build_local_audiobooks(&connection).unwrap();
+        let tagged_book = with_tagged_book
+            .iter()
+            .find(|book| book.title == "Complete Book")
+            .unwrap();
+        assert_eq!(tagged_book.chapters.len(), 1);
+        assert_eq!(tagged_book.chapters[0].filename, "Complete Book.mp3");
+        connection.execute(
+            "INSERT INTO files(file_id,filename,path,size,format,indexed_at,mime,folder,title,artist)
+             VALUES(?1,'Only Chapter.mp3',?2,50,'MP3','now','audio/mpeg','One Chapter Folder','Only Chapter','Author')",
+            params!["44".repeat(32), directory.join("Only Chapter.mp3").to_string_lossy()],
+        ).unwrap();
+        connection
+            .execute(
+                "INSERT INTO local_audiobooks(folder,title,author,narrator,updated_at)
+             VALUES('One Chapter Folder','Folder Book','Author','','now')",
+                [],
+            )
+            .unwrap();
+        let with_one_chapter_folder = build_local_audiobooks(&connection).unwrap();
+        let folder_book = with_one_chapter_folder
+            .iter()
+            .find(|book| book.title == "Folder Book")
+            .unwrap();
+        assert_eq!(folder_book.chapters.len(), 1);
+        assert_eq!(folder_book.chapters[0].filename, "Only Chapter.mp3");
+
+        for (file_id, filename, folder, title, artist, size) in [
+            (
+                "55".repeat(32),
+                "Chapter 10.mp3",
+                "Audiobooks/Automatic Book/Disc 1",
+                "Chapter 10",
+                "Automatic Author",
+                60i64,
+            ),
+            (
+                "66".repeat(32),
+                "Chapter 2.mp3",
+                "Audiobooks/Automatic Book/Disc 1",
+                "Chapter 2",
+                "Automatic Author",
+                70i64,
+            ),
+            (
+                "77".repeat(32),
+                "Complete Story.mp3",
+                "Audiobooks",
+                "Complete Story",
+                "Solo Author",
+                80i64,
+            ),
+        ] {
+            connection.execute(
+                "INSERT INTO files(file_id,filename,path,size,format,indexed_at,mime,folder,title,artist)
+                 VALUES(?1,?2,?3,?4,'MP3','now','audio/mpeg',?5,?6,?7)",
+                params![
+                    file_id,
+                    filename,
+                    directory.join(filename).to_string_lossy(),
+                    size,
+                    folder,
+                    title,
+                    artist
+                ],
+            ).unwrap();
+        }
+        let with_automatic_books = build_local_audiobooks(&connection).unwrap();
+        let automatic_folder = with_automatic_books
+            .iter()
+            .find(|book| book.title == "Automatic Book")
+            .unwrap();
+        assert_eq!(automatic_folder.author, "Automatic Author");
+        assert_eq!(automatic_folder.chapters.len(), 2);
+        assert_eq!(automatic_folder.chapters[0].filename, "Chapter 2.mp3");
+        assert_eq!(automatic_folder.chapters[1].filename, "Chapter 10.mp3");
+        let automatic_file = with_automatic_books
+            .iter()
+            .find(|book| book.title == "Complete Story")
+            .unwrap();
+        assert_eq!(automatic_file.author, "Solo Author");
+        assert_eq!(automatic_file.chapters.len(), 1);
+        assert_eq!(automatic_file.chapters[0].filename, "Complete Story.mp3");
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn indexing_skips_unrelated_files_and_bounds_error_details() {
+        let directory = test_directory("bounded-index-errors-test");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("cover.jpg"), b"not audio").unwrap();
+        for index in 0..(MAX_INDEX_ERRORS + 5) {
+            fs::write(directory.join(format!("invalid-{index}.mp3")), b"not audio").unwrap();
+        }
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut connection = open_connection(&db_path).unwrap();
+
+        let report = index_path(&mut connection, &directory).unwrap();
+
+        assert_eq!(report.file_count, 0);
+        assert_eq!(report.error_count, MAX_INDEX_ERRORS + 5);
+        assert_eq!(report.errors.len(), MAX_INDEX_ERRORS);
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn indexing_can_be_cancelled_before_database_changes() {
+        let directory = test_directory("cancel-index-test");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("track.mp3"), b"not audio").unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut connection = open_connection(&db_path).unwrap();
+        let cancelled = AtomicBool::new(true);
+
+        let result =
+            index_path_with_progress(&mut connection, &directory, &cancelled, |_, _| {}, |_| {});
+
+        assert_eq!(result.unwrap_err(), "Indexing cancelled");
+        assert!(load_files(&connection, None).unwrap().is_empty());
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn indexing_commits_verified_files_in_bounded_batches() {
+        let directory = test_directory("progressive-index-test");
+        fs::create_dir_all(&directory).unwrap();
+        for index in 0..(INDEX_COMMIT_BATCH_SIZE + 1) {
+            let mut bytes = b"RIFF".to_vec();
+            bytes.extend_from_slice(&40u32.to_le_bytes());
+            bytes.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data\x04\0\0\0");
+            bytes.extend_from_slice(&(index as u32).to_le_bytes());
+            fs::write(directory.join(format!("track-{index:03}.wav")), bytes).unwrap();
+        }
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut connection = open_connection(&db_path).unwrap();
+        let mut committed_batches = Vec::new();
+        let mut independently_visible = Vec::new();
+
+        let report = index_path_with_progress(
+            &mut connection,
+            &directory,
+            &AtomicBool::new(false),
+            |_, _| {},
+            |batch| {
+                committed_batches.push(batch.files.len());
+                let observer = open_connection(&db_path).unwrap();
+                independently_visible.push(load_files(&observer, None).unwrap().len());
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.file_count, INDEX_COMMIT_BATCH_SIZE + 1);
+        assert_eq!(committed_batches, vec![INDEX_COMMIT_BATCH_SIZE, 1]);
+        assert_eq!(
+            independently_visible,
+            vec![INDEX_COMMIT_BATCH_SIZE, INDEX_COMMIT_BATCH_SIZE + 1]
+        );
+        assert_eq!(
+            load_files(&connection, None).unwrap().len(),
+            INDEX_COMMIT_BATCH_SIZE + 1
+        );
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cancelling_after_a_batch_keeps_only_verified_commits() {
+        let directory = test_directory("progressive-cancel-test");
+        fs::create_dir_all(&directory).unwrap();
+        for index in 0..(INDEX_COMMIT_BATCH_SIZE + 1) {
+            let mut bytes = b"RIFF".to_vec();
+            bytes.extend_from_slice(&40u32.to_le_bytes());
+            bytes.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data\x04\0\0\0");
+            bytes.extend_from_slice(&(index as u32).to_le_bytes());
+            fs::write(directory.join(format!("track-{index:03}.wav")), bytes).unwrap();
+        }
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut connection = open_connection(&db_path).unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let result = index_path_with_progress(
+            &mut connection,
+            &directory,
+            &cancelled,
+            |_, _| {},
+            |_| cancelled.store(true, Ordering::SeqCst),
+        );
+
+        assert_eq!(result.unwrap_err(), "Indexing cancelled");
+        assert_eq!(
+            load_files(&connection, None).unwrap().len(),
+            INDEX_COMMIT_BATCH_SIZE
+        );
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1691,6 +2832,7 @@ mod tests {
             "punk, Live, audiobook"
         );
         assert!(normalise_tags("bad\ntag").is_err());
+        assert!(normalise_tags("safe\u{202e}spoofed").is_err());
         let too_many = (0..13)
             .map(|index| format!("tag{index}"))
             .collect::<Vec<_>>()
@@ -1702,6 +2844,10 @@ mod tests {
     #[test]
     fn fresh_install_uses_one_napstr_folder() {
         let directory = test_directory("default-folder-test");
+        let existing_audiobooks = directory.join("Downloads/Audiobooks");
+        fs::create_dir_all(&existing_audiobooks).unwrap();
+        let existing_book = existing_audiobooks.join("Already Here.txt");
+        fs::write(&existing_book, b"must remain untouched").unwrap();
         let db_path = directory.join("napstr.sqlite3");
         initialise_database(&db_path, &directory).unwrap();
         let connection = open_connection(&db_path).unwrap();
@@ -1711,6 +2857,8 @@ mod tests {
             directory.join("Downloads")
         );
         assert!(Path::new(&settings.napstr_folder).is_dir());
+        assert!(existing_audiobooks.is_dir());
+        assert_eq!(fs::read(existing_book).unwrap(), b"must remain untouched");
         assert!(get_setting(&connection, "download_folder").is_err());
         assert_eq!(settings.nostr_relays, DEFAULT_NOSTR_RELAYS);
         assert_eq!(
@@ -1911,6 +3059,19 @@ mod tests {
             .execute(
                 "UPDATE settings SET value=?1 WHERE key='nostr_relays'",
                 [LEGACY_DEFAULT_NOSTR_RELAYS],
+            )
+            .unwrap();
+        drop(connection);
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        assert_eq!(
+            get_setting(&connection, "nostr_relays").unwrap(),
+            DEFAULT_NOSTR_RELAYS
+        );
+        connection
+            .execute(
+                "UPDATE settings SET value=?1 WHERE key='nostr_relays'",
+                [PREVIOUS_DEFAULT_NOSTR_RELAYS],
             )
             .unwrap();
         drop(connection);
