@@ -1820,8 +1820,8 @@
     backupError = '';
   }
 
-  function closeBackupDialog() {
-    if (backupBusy) return;
+  function closeBackupDialog(force = false) {
+    if (backupBusy && !force) return;
     backupDialog = null;
     backupPassphrase = '';
     backupPassphraseRepeat = '';
@@ -1840,8 +1840,7 @@
       backupBusy = true;
       try {
         await invoke('export_identity_backup', { path, passphrase: backupPassphrase });
-        backupBusy = false;
-        closeBackupDialog();
+        closeBackupDialog(true);
         activityMessage = 'Backup saved. Keep the file and the passphrase safe — there is no reset.';
       } catch (error) { backupError = String(error); }
       finally { backupBusy = false; }
@@ -1860,6 +1859,8 @@
   }
 
   async function loadArchivedIdentities() {
+    // Callers must wait for the first snapshot: before it lands there is no native
+    // bridge to ask, and a silent skip here would leave the list permanently empty.
     if (!nativeReady) return;
     try { archivedIdentities = await invoke<ArchivedIdentity[]>('archived_identities'); }
     catch { archivedIdentities = []; }
@@ -1884,7 +1885,7 @@
     try {
       const npub = await invoke<string>('import_identity_backup', { path: backupImportPath, passphrase: backupPassphrase });
       identityNpub = npub;
-      closeBackupDialog();
+      closeBackupDialog(true);
       activityMessage = 'Account restored. The replaced account was kept on this computer under Previous accounts.';
       await refreshSnapshot();
       await loadArchivedIdentities();
@@ -1956,7 +1957,7 @@
     window.addEventListener('resize', clampTransferPane);
     const snapshotReady = refreshSnapshot();
     void snapshotReady.then(connectNetwork);
-    void loadArchivedIdentities();
+    void snapshotReady.then(() => loadArchivedIdentities());
     void getVersion()
       .then(async (version) => {
         appVersion = version;
@@ -2421,11 +2422,11 @@
           <div class="profile-card"><div class="avatar"><img src="/napstr-logo.png" alt="Napstr mascot" /></div><div><h2>{displayName}</h2><p>Your dedicated Napstr Nostr identity.</p><code>{identityNpub || 'Connect to create identity'}</code><div class="profile-stats"><span><b>{sharedFiles.length}</b> shared files</span><span><b>{transfers.length}</b> transfers</span><span><b>{networkConnected ? 'Nostr online' : 'Offline'}</b></span></div></div></div>
           <fieldset class="edit-profile"><legend>Profile</legend><label>Display name <input bind:value={displayName} /></label><label>About <input bind:value={profileAbout} /></label><label>Picture URL <input bind:value={profilePicture} placeholder="https://…" /></label><button class="classic-button primary" onclick={persistSettings}>Save profile</button><div class="backup-actions"><button class="classic-button" onclick={startBackupExport}>Back up account…</button><button class="classic-button" onclick={() => void startBackupImport()}>Restore backup…</button></div></fieldset>
           {#if archivedIdentities.length}
-            <fieldset class="edit-profile"><legend>Previous accounts on this computer</legend>
+            <fieldset class="archived-accounts"><legend>Previous accounts on this computer ({archivedIdentities.length})</legend>
               <p>Accounts replaced by a restore are kept here so a mistaken restore can be undone. They live in this computer's keychain only.</p>
               <ul class="archived-identities">
                 {#each archivedIdentities as entry (entry.keyringAccount)}
-                  <li><code>{entry.npub}</code><span>replaced {new Date(entry.archivedAt).toLocaleDateString()}</span><button class="classic-button" disabled={backupBusy} onclick={() => void adoptArchived(entry)}>Switch back</button></li>
+                  <li><code>{entry.npub}</code><span>replaced {new Date(entry.archivedAt).toLocaleDateString()}</span><button class="classic-button archived-switch" disabled={backupBusy} onclick={() => void adoptArchived(entry)}>Switch back</button></li>
                 {/each}
               </ul>
             </fieldset>
@@ -2508,9 +2509,9 @@
   {/if}
 
   {#if backupDialog}
-    <div class="modal-backdrop" role="presentation" onclick={closeBackupDialog}>
+    <div class="modal-backdrop" role="presentation" onclick={() => closeBackupDialog()}>
       <dialog class="dialog confirm-dialog" open aria-label={backupDialog === 'export' ? 'Back up account' : backupDialog === 'import-confirm' ? 'Confirm account replacement' : 'Restore account'} onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') closeBackupDialog(); }}>
-        <header class="titlebar"><div class="title-left"><span class="app-icon">🔑</span><span>{backupDialog === 'export' ? 'Back up account' : backupDialog === 'import-confirm' ? 'Replace this account?' : 'Restore account'}</span></div><div class="window-controls"><button disabled={backupBusy} onclick={closeBackupDialog}>×</button></div></header>
+        <header class="titlebar"><div class="title-left"><span class="app-icon">🔑</span><span>{backupDialog === 'export' ? 'Back up account' : backupDialog === 'import-confirm' ? 'Replace this account?' : 'Restore account'}</span></div><div class="window-controls"><button disabled={backupBusy} onclick={() => closeBackupDialog()}>×</button></div></header>
         <div class="dialog-body"><div class="backup-body">
           {#if backupDialog === 'export'}
             <p>Choose a passphrase for the backup file. The file is useless without it.</p>
@@ -2541,7 +2542,7 @@
           {/if}
           {#if backupError}<p class="backup-error">{backupError}</p>{/if}
         </div></div>
-        <div class="dialog-actions">{#if backupDialog === 'import-confirm'}<button class="classic-button primary" disabled={backupBusy || (!!backupCurrentNpub && backupCurrentNpub !== backupRestoreNpub && !backupAcknowledged)} onclick={() => void confirmRestore()}>{backupBusy ? 'Replacing…' : 'Replace my account'}</button><button class="classic-button" disabled={backupBusy} onclick={closeBackupDialog}>Cancel</button>{:else}<button class="classic-button primary" disabled={backupBusy} onclick={() => void submitBackup()}>{backupBusy ? 'Working…' : backupDialog === 'export' ? 'Encrypt and save' : 'Continue'}</button><button class="classic-button" disabled={backupBusy} onclick={closeBackupDialog}>Cancel</button>{/if}</div>
+        <div class="dialog-actions">{#if backupDialog === 'import-confirm'}<button class="classic-button primary" disabled={backupBusy || (!!backupCurrentNpub && backupCurrentNpub !== backupRestoreNpub && !backupAcknowledged)} onclick={() => void confirmRestore()}>{backupBusy ? 'Replacing…' : 'Replace my account'}</button><button class="classic-button" disabled={backupBusy} onclick={() => closeBackupDialog()}>Cancel</button>{:else}<button class="classic-button primary" disabled={backupBusy} onclick={() => void submitBackup()}>{backupBusy ? 'Working…' : backupDialog === 'export' ? 'Encrypt and save' : 'Continue'}</button><button class="classic-button" disabled={backupBusy} onclick={() => closeBackupDialog()}>Cancel</button>{/if}</div>
       </dialog>
     </div>
   {/if}

@@ -325,3 +325,8 @@ body.resizing-transfer-pane, body.resizing-transfer-pane * { cursor: ns-resize !
 .archived-identities li { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .archived-identities code { flex: 1 1 260px; overflow-wrap: anywhere; font-size: 11px; }
 .archived-identities span { opacity: 0.75; font-size: 11px; }
+
+.archived-accounts { margin-top: 10px; }
+.archived-accounts .archived-switch { margin: 0; flex: 0 0 auto; }
+.archived-identities li { padding: 4px 0; border-bottom: 1px solid rgba(128,128,128,0.25); }
+.archived-identities li:last-child { border-bottom: 0; }

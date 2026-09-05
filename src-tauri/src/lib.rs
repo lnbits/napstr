@@ -1900,6 +1900,13 @@ struct RestorePreview {
     current_backed_up: bool,
 }
 
+fn reconnect_in_background(state: &State<'_, AppState>) {
+    let network = state.network.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = network.restart().await;
+    });
+}
+
 #[tauri::command]
 async fn inspect_identity_backup(
     path: String,
@@ -1984,7 +1991,10 @@ async fn adopt_archived_identity(
     .map_err(|error| error.to_string())??;
     state.network.stop().await;
     state.network.clear_cached_identity().await;
-    let _ = state.network.restart().await;
+    // Reconnecting talks to every relay and can take tens of seconds. The identity is
+    // already switched, so let it happen behind the returning call rather than making
+    // the dialog sit on "Replacing…" until the network answers.
+    reconnect_in_background(&state);
     Ok(npub)
 }
 
@@ -2006,8 +2016,9 @@ async fn import_identity_backup(
     .map_err(|error| error.to_string())??;
     state.network.stop().await;
     state.network.clear_cached_identity().await;
-    // The identity is already replaced; reconnecting may legitimately fail offline.
-    let _ = state.network.restart().await;
+    // The identity is already replaced; reconnecting may legitimately fail offline,
+    // and takes long enough that the caller must not wait for it.
+    reconnect_in_background(&state);
     Ok(npub)
 }
 
