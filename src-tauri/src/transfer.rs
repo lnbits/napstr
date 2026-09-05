@@ -26,6 +26,15 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeedingStat {
+    pub file_id: String,
+    pub delivered: u32,
+    pub active_grants: u32,
+    pub other_seeders: u32,
+}
+
 struct TemporaryPath {
     path: PathBuf,
 }
@@ -250,6 +259,48 @@ impl TransferService {
 
     pub async fn warm_tor(&self) -> Result<(), String> {
         self.tor.start().await.map(|_| ())
+    }
+
+    pub async fn seeding_stats(&self) -> Result<Vec<SeedingStat>, String> {
+        let now = Utc::now().timestamp();
+        let mut active: HashMap<String, u32> = HashMap::new();
+        for grant in self.grants.read().await.values() {
+            if grant.expires_at > now {
+                *active.entry(grant.file_id.clone()).or_default() += 1;
+            }
+        }
+        let connection = crate::open_connection(&self.db_path)?;
+        let mut statement = connection
+            .prepare("SELECT file_id, delivered FROM upload_stats")
+            .map_err(|error| error.to_string())?;
+        let mut stats: HashMap<String, SeedingStat> = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .map(|(file_id, delivered)| {
+                let stat = SeedingStat {
+                    file_id: file_id.clone(),
+                    delivered: delivered.max(0) as u32,
+                    active_grants: 0,
+                    other_seeders: 0,
+                };
+                (file_id, stat)
+            })
+            .collect();
+        for (file_id, count) in active {
+            stats
+                .entry(file_id.clone())
+                .or_insert_with(|| SeedingStat {
+                    file_id,
+                    delivered: 0,
+                    active_grants: 0,
+                    other_seeders: 0,
+                })
+                .active_grants = count;
+        }
+        let mut list: Vec<SeedingStat> = stats.into_values().collect();
+        list.sort_by(|left, right| left.file_id.cmp(&right.file_id));
+        Ok(list)
     }
 
     pub async fn warm_for_sharing(&self) -> Result<(), String> {
@@ -615,6 +666,9 @@ where
             ClientFrame::TransferComplete => {
                 write_frame(&mut stream, &ServerFrame::TransferComplete).await?;
                 grants.write().await.remove(&key);
+                if sent_file {
+                    let _ = record_delivery(db_path, &file_id);
+                }
                 return Ok(());
             }
             ClientFrame::Cancel => {
@@ -948,6 +1002,19 @@ fn update_download(
     Ok(())
 }
 
+fn record_delivery(db_path: &Path, file_id: &str) -> Result<(), String> {
+    let connection = crate::open_connection(db_path)?;
+    connection
+        .execute(
+            "INSERT INTO upload_stats(file_id, delivered, last_delivered_at) VALUES (?1, 1, ?2)
+             ON CONFLICT(file_id) DO UPDATE
+             SET delivered = delivered + 1, last_delivered_at = excluded.last_delivered_at",
+            params![file_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn format_speed(bytes_per_second: f64) -> String {
     if bytes_per_second >= 1024.0 * 1024.0 {
         format!("{:.1} MB/s", bytes_per_second / 1024.0 / 1024.0)
@@ -1016,6 +1083,33 @@ mod tests {
         .unwrap()
         .unwrap();
         drop(backup);
+    }
+
+    #[tokio::test]
+    async fn delivered_uploads_are_counted_and_reported_with_active_grants() {
+        let (directory, db_path, file_id, _bytes) = shared_fixture();
+        record_delivery(&db_path, &file_id).unwrap();
+        record_delivery(&db_path, &file_id).unwrap();
+        let service = TransferService::new(
+            db_path.clone(),
+            Arc::new(TorManager::new(directory.clone(), directory.clone())),
+        );
+        service.grants.write().await.insert(
+            "grant-key".into(),
+            SessionGrant {
+                file_id: file_id.clone(),
+                requester: "requester".into(),
+                expires_at: Utc::now().timestamp() + 60,
+                _onion_lease: None,
+            },
+        );
+
+        let stats = service.seeding_stats().await.unwrap();
+
+        let stat = stats.iter().find(|stat| stat.file_id == file_id).unwrap();
+        assert_eq!(stat.delivered, 2);
+        assert_eq!(stat.active_grants, 1);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

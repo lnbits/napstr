@@ -4,7 +4,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { open } from '@tauri-apps/plugin-dialog';
+  import { open, save } from '@tauri-apps/plugin-dialog';
 
   let appVersion = '…';
   const SEARCH_PAGE_SIZE = 100;
@@ -12,7 +12,7 @@
   const VISIBLE_SEEDER_LIMIT = 100;
 
   type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Mobile';
-  type PlayerMode = 'single' | 'folder' | 'all';
+  type PlayerMode = 'single' | 'folder' | 'all' | 'shuffle';
   type PlayerOrigin = 'search' | 'downloads' | 'shared' | 'audiobook' | 'direct';
   type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
   type Result = {
@@ -20,6 +20,7 @@
     name: string;
     format: string;
     size: string;
+    bytes: number;
     sources: number;
     speed: string;
     length: string;
@@ -57,11 +58,12 @@
 
   type NativeFile = { fileId: string; filename: string; path: string; folder: string; size: number; format: string; status: string; title: string; artist: string; album: string; mime: string; license: string; description: string; tags: string };
   type NativeTransfer = { id: number; fileId: string; filename: string; size: number; progress: number; status: string; speed: string; destination: string };
-  type NativeSettings = { napstrFolder: string; nostrRelays: string; displayName: string; profileAbout: string; profilePicture: string };
+  type SeedingStat = { fileId: string; delivered: number; activeGrants: number; otherSeeders: number };
+  type NativeSettings = { napstrFolder: string; nostrRelays: string; displayName: string; profileAbout: string; profilePicture: string; relaysOverTor: boolean };
   type AudiobookChapter = { position: number; fileId: string; filename: string; title: string; format: string; mime: string; size: number };
   type Audiobook = { audiobookId: string; title: string; author: string; narrator: string; totalSize: number; chapters: AudiobookChapter[]; sources: SourceDetail[]; local: boolean; localFolder: string };
   type Snapshot = { files: NativeFile[]; audiobooks: Audiobook[]; transfers: NativeTransfer[]; settings: NativeSettings; indexedBytes: number; native: boolean };
-  type NetworkStatus = { connected: boolean; npub: string; pubkey: string; relayCount: number; torRunning: boolean; torStarting: boolean; torProgress: number; torError: string; error: string };
+  type NetworkStatus = { connected: boolean; npub: string; pubkey: string; relayCount: number; relaysViaTor: boolean; torRunning: boolean; torStarting: boolean; torProgress: number; torError: string; error: string };
   type NetworkResult = { fileId: string; filename: string; title: string; artist: string; album: string; format: string; mime: string; size: number; license: string; description: string; tags: string; sources: SourceDetail[] };
   type CatalogueBrowseCursor = { sessionId: string };
   type CatalogueBrowsePage = { results: NetworkResult[]; cursor: CatalogueBrowseCursor | null; totalAvailable: number };
@@ -84,6 +86,9 @@
   let resultPage = 0;
   let query = '';
   let format = 'Audio only';
+  let sortKey: 'name' | 'format' | 'bytes' | 'sources' | null = null;
+  let sortDirection: 1 | -1 = 1;
+  let seedingStats: Record<string, SeedingStat> = {};
   let minimumSources = 1;
   let maximumSize = '';
   let searchedQuery = 'All audio';
@@ -102,9 +107,22 @@
   let activityMessage = 'Starting Napstr…';
   let napstrFolder = '';
   let nostrRelays = 'wss://relay.damus.io, wss://nos.lol, wss://relay.nostr.com, wss://relay.primal.net, wss://relay.snort.social, wss://nostr.mom, wss://relay.nostr.band';
+  let relaysOverTor = false;
   let displayName = 'napstr-user';
   let profileAbout = 'Sharing files privately with Napstr. napstr.net';
   let profilePicture = '';
+  let backupDialog: 'export' | 'import' | 'import-confirm' | null = null;
+  let backupRestoreNpub = '';
+  let backupCurrentNpub = '';
+  let backupCurrentBackedUp = false;
+  let backupAcknowledged = false;
+  type ArchivedIdentity = { npub: string; keyringAccount: string; archivedAt: string };
+  let archivedIdentities: ArchivedIdentity[] = [];
+  let backupPassphrase = '';
+  let backupPassphraseRepeat = '';
+  let backupImportPath = '';
+  let backupBusy = false;
+  let backupError = '';
   let indexedBytes = 0;
   let networkConnected = false;
   let torRunning = false;
@@ -137,7 +155,7 @@
   let trackDiscussionPollPending = false;
   let trackDiscussionRefreshAgain = false;
   let trackDiscussionLog: HTMLDivElement;
-  let searchAction: 'search' | 'surprise' | null = null;
+  let searchAction: 'search' | 'surprise' | 'source' | null = null;
   let browseCursor: CatalogueBrowseCursor | null = null;
   let browseLoading = false;
   let browseGeneration = 0;
@@ -180,7 +198,7 @@
   type AudiobookDownload = { audiobookId: string; title: string; author: string; narrator: string; destinationFolder: string; chapters: AudiobookChapter[]; sources: SourceDetail[]; nextIndex: number; activeFileId: string; failed: number };
   let audiobookDownloads: AudiobookDownload[] = [];
 
-  let sharedFiles: Array<NativeFile & { name: string; readableSize: string; peers: number }> = [];
+  let sharedFiles: Array<NativeFile & { name: string; readableSize: string; peers: number; delivered: number; otherSeeders: number }> = [];
   let localFileIds = new Set<string>();
 
   const readableSize = (bytes: number) => {
@@ -192,7 +210,7 @@
 
   function mapFiles(files: NativeFile[]): Result[] {
     return files.map((file, index) => ({
-      id: index + 1, name: file.title || file.filename, format: file.format, size: readableSize(file.size), sources: 1,
+      id: index + 1, name: file.title || file.filename, format: file.format, size: readableSize(file.size), bytes: file.size, sources: 1,
       speed: 'Local', length: '—', fileId: file.fileId, artist: file.artist, album: file.album, license: file.license, description: file.description, tags: file.tags
     }));
   }
@@ -202,7 +220,7 @@
       const local = localFileIds.has(file.fileId);
       return {
         id: index + 1, name: file.title || file.filename, format: file.format, size: readableSize(file.size),
-        sources: file.sources.length, speed: local ? 'Local' : 'Tor', length: '—', fileId: file.fileId,
+        bytes: file.size, sources: file.sources.length, speed: local ? 'Local' : 'Tor', length: '—', fileId: file.fileId,
         sourceDetails: file.sources, remote: !local, artist: file.artist, album: file.album,
         license: file.license, description: file.description, tags: file.tags
       };
@@ -241,6 +259,7 @@
       name: book.title,
       format: 'AUDIOBOOK',
       size: readableSize(book.totalSize),
+      bytes: book.totalSize,
       sources: Math.max(book.local ? 1 : 0, book.sources.length),
       speed: book.local ? 'Local' : 'Tor',
       length: `${book.chapters.length} chapters`,
@@ -275,6 +294,10 @@
     return mime.startsWith('audio/') && ['MP3', 'FLAC', 'WAV', 'OGG', 'OPUS'].includes(fileFormat.toUpperCase());
   }
 
+  function matchesSelectedFormat(fileFormat: string) {
+    return format === 'Audio only' || fileFormat.toUpperCase() === format;
+  }
+
   function maximumBytes() {
     const match = maximumSize.trim().match(/^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)?$/i);
     if (!match) return Number.POSITIVE_INFINITY;
@@ -287,6 +310,7 @@
       item.sources.length >= minimumSources
       && item.size <= maximumBytes()
       && matchesType(item.mime, item.format)
+      && matchesSelectedFormat(item.format)
     );
   }
 
@@ -462,9 +486,37 @@
     return Math.max(1, Math.ceil(results.length / SEARCH_PAGE_SIZE));
   }
 
+  function toggleSort(key: 'name' | 'format' | 'bytes' | 'sources') {
+    if (sortKey !== key) {
+      sortKey = key;
+      sortDirection = 1;
+    } else if (sortDirection === 1) {
+      sortDirection = -1;
+    } else {
+      sortKey = null;
+      sortDirection = 1;
+    }
+    resultPage = 0;
+  }
+
+  function sortIndicator(key: 'name' | 'format' | 'bytes' | 'sources') {
+    if (sortKey !== key) return '';
+    return sortDirection === 1 ? ' ▲' : ' ▼';
+  }
+
+  function sortedResults(): Result[] {
+    const key = sortKey;
+    if (!key) return results;
+    const direction = sortDirection;
+    return [...results].sort((left, right) => {
+      if (key === 'bytes' || key === 'sources') return (left[key] - right[key]) * direction;
+      return left[key].localeCompare(right[key]) * direction;
+    });
+  }
+
   function paginatedResults() {
     const start = resultPage * SEARCH_PAGE_SIZE;
-    return results.slice(start, start + SEARCH_PAGE_SIZE);
+    return sortedResults().slice(start, start + SEARCH_PAGE_SIZE);
   }
 
   function resultRange() {
@@ -552,6 +604,10 @@
     return queue.some((item) => item.fileId === track.fileId) ? queue : [track];
   }
 
+  function shuffledQueueFrom(tracks: PlayerTrack[], current: PlayerTrack) {
+    return [current, ...shuffled(tracks.filter((item) => item.fileId !== current.fileId))];
+  }
+
   function queueForTrack(track: PlayerTrack, mode: PlayerMode, origin: PlayerOrigin = playerOrigin) {
     const library = sortedLibraryTracks();
     if (!library.some((item) => item.fileId === track.fileId)) return [track];
@@ -559,9 +615,11 @@
     if (origin === 'audiobook') return mode === 'single' ? [track] : contextualQueue;
     if (origin !== 'direct') {
       if (mode === 'folder') return contextualQueue.filter((item) => item.folder === track.folder);
+      if (mode === 'shuffle') return shuffledQueueFrom(contextualQueue, track);
       return contextualQueue;
     }
     if (mode === 'all') return library;
+    if (mode === 'shuffle') return shuffledQueueFrom(library, track);
     if (mode === 'folder') return library.filter((item) => item.folder === track.folder);
     return [track];
   }
@@ -740,11 +798,12 @@
     indexedBytes = snapshot.indexedBytes;
     napstrFolder = snapshot.settings.napstrFolder;
     nostrRelays = snapshot.settings.nostrRelays;
+    relaysOverTor = snapshot.settings.relaysOverTor;
     displayName = snapshot.settings.displayName;
     profileAbout = snapshot.settings.profileAbout;
     profilePicture = snapshot.settings.profilePicture;
     localAudiobooks = snapshot.audiobooks;
-    sharedFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: 0 }));
+    sharedFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: seedingStats[file.fileId]?.activeGrants ?? 0, delivered: seedingStats[file.fileId]?.delivered ?? 0, otherSeeders: seedingStats[file.fileId]?.otherSeeders ?? 0 }));
     localFileIds = new Set(snapshot.files.map((file) => file.fileId));
     downloadLibraryPage = Math.min(downloadLibraryPage, localPageCount(snapshot.files) - 1);
     sharedLibraryPage = Math.min(sharedLibraryPage, localPageCount(visibleSharedFiles()) - 1);
@@ -805,6 +864,15 @@
       const cached = JSON.parse(window.localStorage.getItem(cacheKey) ?? 'null') as { checkedAt?: number; release?: GitHubRelease | null } | null;
       cachedRelease = cached?.release ?? null;
     } catch { /* ignore invalid old cache data */ }
+    if (relaysOverTor) {
+      // The update check is a direct clearnet request; in privacy mode rely on the cache only.
+      release = cachedRelease;
+      if (typeof release?.tag_name !== 'string' || !validNapstrReleaseUrl(release.html_url)) return;
+      if (compareSemver(release.tag_name, appVersion) > 0) {
+        newRelease = { version: release.tag_name.replace(/^v/, ''), url: release.html_url };
+      }
+      return;
+    }
     try {
       const response = await fetch('https://api.github.com/repos/lnbits/napstr/releases/latest', {
         headers: { Accept: 'application/vnd.github+json' }
@@ -1033,7 +1101,7 @@
       const snapshot = await invoke<Snapshot>('get_snapshot');
       indexedBytes = snapshot.indexedBytes;
       localAudiobooks = snapshot.audiobooks;
-      const nextFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: 0 }));
+      const nextFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: seedingStats[file.fileId]?.activeGrants ?? 0, delivered: seedingStats[file.fileId]?.delivered ?? 0, otherSeeders: seedingStats[file.fileId]?.otherSeeders ?? 0 }));
       const removedCurrentTrack = currentTrack && !nextFiles.some((file) => file.fileId === currentTrack?.fileId);
       sharedFiles = nextFiles;
       localFileIds = new Set(nextFiles.map((file) => file.fileId));
@@ -1069,7 +1137,9 @@
         ...file,
         name: file.filename,
         readableSize: readableSize(file.size),
-        peers: merged.get(file.fileId)?.peers ?? 0
+        peers: merged.get(file.fileId)?.peers ?? 0,
+        delivered: merged.get(file.fileId)?.delivered ?? 0,
+        otherSeeders: merged.get(file.fileId)?.otherSeeders ?? 0
       });
     }
     sharedFiles = [...merged.values()].sort((left, right) => left.filename.localeCompare(right.filename));
@@ -1087,11 +1157,13 @@
   async function connectNetwork() {
     if (!nativeReady || networkConnectPending) return;
     networkConnectPending = true;
-    activityMessage = 'Connecting to Nostr relays and opening encrypted inbox…';
+    activityMessage = 'Connecting to the music network and opening your encrypted inbox…';
     try {
       const status = await invoke<NetworkStatus>('start_network');
       applyNetworkStatus(status);
-      activityMessage = `Nostr connected · loading the most available audio from ${status.relayCount} relay(s)…`;
+      activityMessage = status.relaysViaTor
+        ? 'Connected privately through Tor · loading the most available music…'
+        : 'Connected · loading the most available music…';
       await search();
       if (status.torError) activityMessage = `Tor failed: ${status.torError} · click the connection panel to retry`;
     } catch (error) {
@@ -1229,7 +1301,7 @@
       } else if (nativeReady) {
         try {
           const matches = await invoke<NativeFile[]>('search_catalog', { query: query.trim() });
-          results = mergeAudiobooks(mapFiles(matches.filter((item) => minimumSources <= 1 && item.size <= maximumBytes() && matchesType(item.mime, item.format))), [], query.trim());
+          results = mergeAudiobooks(mapFiles(matches.filter((item) => minimumSources <= 1 && item.size <= maximumBytes() && matchesType(item.mime, item.format) && matchesSelectedFormat(item.format))), [], query.trim());
           resultsAreNetwork = false;
           activityMessage = `${results.length} local match(es) found`;
         } catch (error) { activityMessage = `Search failed: ${String(error)}`; }
@@ -1269,7 +1341,7 @@
   async function surpriseMe() {
     if (searchAction) return;
     if (!networkConnected) {
-      activityMessage = 'Connect to Nostr before asking for a surprise';
+      activityMessage = 'Connect first, then ask for a surprise';
       return;
     }
     browseGeneration += 1;
@@ -1304,6 +1376,33 @@
     }
   }
 
+  async function showSourceCatalogue(profile: SourceDetail) {
+    if (searchAction || !networkConnected) return;
+    searchAction = 'source';
+    const label = profile.displayName || `${profile.npub.slice(0, 12)}…`;
+    searchedQuery = `Music shared by ${label}`;
+    activityMessage = `Loading everything shared by ${label}…`;
+    try {
+      const matches = await invoke<NetworkResult[]>('network_search', { query: '' });
+      const shared = matches
+        .filter((item) => item.sources.some((source) => source.pubkey === profile.pubkey))
+        .sort((left, right) => left.filename.localeCompare(right.filename));
+      results = mapNetworkFiles(shared);
+      resultsAreNetwork = true;
+      resultPage = 0;
+      selectResult(results[0] ?? null, true);
+      sourceProfile = null;
+      activeView = 'Search';
+      activityMessage = shared.length
+        ? `${shared.length} track${shared.length === 1 ? '' : 's'} shared by ${label}`
+        : `${label} is not sharing anything right now`;
+    } catch (error) {
+      activityMessage = `Could not load their shared music: ${String(error)}`;
+    } finally {
+      searchAction = null;
+    }
+  }
+
   async function startDownload() {
     const target = selected;
     if (!target) return;
@@ -1326,10 +1425,10 @@
       startingDownloads = new Set(startingDownloads).add(target.fileId);
       transfers = [{
         id: Date.now(), fileId: target.fileId, name: target.name, size: target.size,
-        speed: 'Contacting seeders…', progress: 0, status: 'Sending encrypted NIP-17 request', destination: ''
+        speed: 'Contacting sources…', progress: 0, status: 'Sending encrypted request', destination: ''
       }, ...transfers];
       const candidateCount = Math.min(sources.length, 3);
-      activityMessage = `Racing ${candidateCount} seeder${candidateCount === 1 ? '' : 's'} for the fastest Tor connection…`;
+      activityMessage = `Asking ${candidateCount} source${candidateCount === 1 ? '' : 's'} for this track · the fastest private connection wins…`;
       try {
         await invoke('request_network_download', { fileId: target.fileId, sourcePubkeys: sources.map((source) => source.pubkey) });
         transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers'));
@@ -1695,10 +1794,102 @@
   async function persistSettings() {
     if (!nativeReady) return;
     try {
-      applySnapshot(await invoke<Snapshot>('save_settings', { settings: { napstrFolder, nostrRelays, displayName, profileAbout, profilePicture } }));
+      applySnapshot(await invoke<Snapshot>('save_settings', { settings: { napstrFolder, nostrRelays, displayName, profileAbout, profilePicture, relaysOverTor } }));
       if (networkConnected) await invoke('publish_profile');
       activityMessage = networkConnected ? 'Settings saved and profile published' : 'Settings saved';
     } catch (error) { activityMessage = `Could not save settings: ${String(error)}`; }
+  }
+
+  function startBackupExport() {
+    if (!nativeReady) { activityMessage = 'Account backup is available in the packaged desktop app'; return; }
+    backupDialog = 'export';
+    backupPassphrase = '';
+    backupPassphraseRepeat = '';
+    backupError = '';
+  }
+
+  async function startBackupImport() {
+    if (!nativeReady) { activityMessage = 'Account restore is available in the packaged desktop app'; return; }
+    const selectedPath = await open({ multiple: false, title: 'Choose your Napstr account backup', filters: [{ name: 'Napstr backup', extensions: ['ncryptsec', 'txt'] }] });
+    if (!selectedPath || Array.isArray(selectedPath)) return;
+    backupImportPath = selectedPath;
+    backupDialog = 'import';
+    backupPassphrase = '';
+    backupRestoreNpub = '';
+    backupAcknowledged = false;
+    backupError = '';
+  }
+
+  function closeBackupDialog() {
+    if (backupBusy) return;
+    backupDialog = null;
+    backupPassphrase = '';
+    backupPassphraseRepeat = '';
+    backupRestoreNpub = '';
+    backupAcknowledged = false;
+    backupError = '';
+  }
+
+  async function submitBackup() {
+    backupError = '';
+    if (backupDialog === 'export') {
+      if (backupPassphrase.length < 8) { backupError = 'Use at least 8 characters.'; return; }
+      if (backupPassphrase !== backupPassphraseRepeat) { backupError = 'The passphrases do not match.'; return; }
+      const path = await save({ title: 'Save your account backup', defaultPath: 'napstr-account.ncryptsec' });
+      if (!path) return;
+      backupBusy = true;
+      try {
+        await invoke('export_identity_backup', { path, passphrase: backupPassphrase });
+        backupBusy = false;
+        closeBackupDialog();
+        activityMessage = 'Backup saved. Keep the file and the passphrase safe — there is no reset.';
+      } catch (error) { backupError = String(error); }
+      finally { backupBusy = false; }
+    } else if (backupDialog === 'import') {
+      // Read-only step: prove the passphrase and name the account before anything is replaced.
+      backupBusy = true;
+      try {
+        const preview = await invoke<{ restoredNpub: string; currentNpub: string; currentBackedUp: boolean }>('inspect_identity_backup', { path: backupImportPath, passphrase: backupPassphrase });
+        backupRestoreNpub = preview.restoredNpub;
+        backupCurrentNpub = preview.currentNpub;
+        backupCurrentBackedUp = preview.currentBackedUp;
+        backupDialog = 'import-confirm';
+      } catch (error) { backupError = String(error); }
+      finally { backupBusy = false; }
+    }
+  }
+
+  async function loadArchivedIdentities() {
+    if (!nativeReady) return;
+    try { archivedIdentities = await invoke<ArchivedIdentity[]>('archived_identities'); }
+    catch { archivedIdentities = []; }
+  }
+
+  async function adoptArchived(entry: ArchivedIdentity) {
+    if (backupBusy) return;
+    backupBusy = true;
+    try {
+      identityNpub = await invoke<string>('adopt_archived_identity', { keyringAccount: entry.keyringAccount });
+      activityMessage = 'Switched back to the earlier account. The one it replaced was kept too.';
+      await refreshSnapshot();
+      await loadArchivedIdentities();
+    } catch (error) { activityMessage = `Could not switch account: ${String(error)}`; }
+    finally { backupBusy = false; }
+  }
+
+  async function confirmRestore() {
+    if (backupBusy) return;
+    backupBusy = true;
+    backupError = '';
+    try {
+      const npub = await invoke<string>('import_identity_backup', { path: backupImportPath, passphrase: backupPassphrase });
+      identityNpub = npub;
+      closeBackupDialog();
+      activityMessage = 'Account restored. The replaced account was kept on this computer under Previous accounts.';
+      await refreshSnapshot();
+      await loadArchivedIdentities();
+    } catch (error) { backupError = String(error); }
+    finally { backupBusy = false; }
   }
 
   const windowCommand = async (command: 'minimise_window' | 'toggle_maximise' | 'close_window') => {
@@ -1756,17 +1947,20 @@
     desktopRuntime = '__TAURI_INTERNALS__' in window;
     if (!desktopRuntime) return;
     const savedPlayerMode = window.localStorage.getItem('napstr-player-mode');
-    if (savedPlayerMode === 'single' || savedPlayerMode === 'folder' || savedPlayerMode === 'all') playerMode = savedPlayerMode;
+    if (savedPlayerMode === 'single' || savedPlayerMode === 'folder' || savedPlayerMode === 'all' || savedPlayerMode === 'shuffle') playerMode = savedPlayerMode;
     const savedPlayerVolume = Number(window.localStorage.getItem('napstr-player-volume'));
     if (Number.isFinite(savedPlayerVolume) && savedPlayerVolume >= 0 && savedPlayerVolume <= 1) playerVolume = savedPlayerVolume;
     const savedTransferHeight = Number(window.localStorage.getItem('napstr-transfer-pane-height'));
     setTransferPaneHeight(Number.isFinite(savedTransferHeight) && savedTransferHeight > 0 ? savedTransferHeight : window.innerHeight < 700 ? 94 : 119);
     const clampTransferPane = () => setTransferPaneHeight(transferPaneHeight);
     window.addEventListener('resize', clampTransferPane);
-    refreshSnapshot().then(connectNetwork);
+    const snapshotReady = refreshSnapshot();
+    void snapshotReady.then(connectNetwork);
+    void loadArchivedIdentities();
     void getVersion()
-      .then((version) => {
+      .then(async (version) => {
         appVersion = version;
+        await snapshotReady.catch(() => undefined);
         return checkForNewRelease();
       })
       .catch(() => {
@@ -1863,6 +2057,11 @@
       transferPollPending = true;
       try {
         const items = await invoke<NativeTransfer[]>('get_transfers');
+        try {
+          const stats = await invoke<SeedingStat[]>('get_seeding_stats');
+          seedingStats = Object.fromEntries(stats.map((stat) => [stat.fileId, stat]));
+          sharedFiles = sharedFiles.map((file) => ({ ...file, peers: seedingStats[file.fileId]?.activeGrants ?? 0, delivered: seedingStats[file.fileId]?.delivered ?? 0, otherSeeders: seedingStats[file.fileId]?.otherSeeders ?? 0 }));
+        } catch { /* seeding stats are cosmetic; the next poll retries */ }
         const previouslyComplete = new Set(transfers.filter(isCompleteTransfer).map((transfer) => transfer.fileId));
         const updated = mapTransfers(items);
         const newlyComplete = updated.filter((transfer) => isCompleteTransfer(transfer) && !previouslyComplete.has(transfer.fileId));
@@ -1948,7 +2147,7 @@
         </button>
       {/if}
       <button class="connection-box" onclick={connectNetwork} title={torError || networkError || 'Reconnect Nostr and Tor'}>
-        <span class="connection-status"><i class:amber={!networkConnected} class="led"></i><strong>{networkConnected ? 'Nostr connected' : 'Connect Nostr'}</strong></span>
+        <span class="connection-status"><i class:amber={!networkConnected} class="led"></i><strong>{networkConnected ? 'Connected' : 'Connect'}</strong></span>
         <span class="connection-status"><i class:amber={!torRunning} class:error={Boolean(torError)} class="led"></i><strong>{torStatusLabel()}</strong></span>
       </button>
       <button class="tool-button help-button" onclick={() => (aboutOpen = true)}><span class="tool-icon">?</span><span>About</span></button>
@@ -1980,6 +2179,7 @@
           <option value="single">Stop</option>
           <option value="folder">Play folder</option>
           <option value="all">Play all</option>
+          <option value="shuffle">Shuffle</option>
         </select>
       </label>
       <label class="player-volume">Vol <input aria-label="Volume" type="range" min="0" max="1" step="0.05" value={playerVolume} oninput={changePlayerVolume} /></label>
@@ -1993,7 +2193,7 @@
             <label for="search-query">Search:</label>
             <input id="search-query" bind:value={query} placeholder="punk, rock, jazz, audiobook" />
             <label for="format">File type:</label>
-            <select id="format" bind:value={format} disabled={searchAction !== null} onchange={() => void search()}><option>Audio only</option><option>Audiobooks</option></select>
+            <select id="format" bind:value={format} disabled={searchAction !== null} onchange={() => void search()}><option>Audio only</option><option>Audiobooks</option><option>FLAC</option><option>MP3</option><option>WAV</option><option>OGG</option><option>OPUS</option></select>
             <button class="classic-button primary search-button" type="submit" disabled={searchAction !== null} aria-busy={searchAction === 'search'}>
               {#if searchAction === 'search'}<span class="search-spinner" aria-hidden="true"></span>{/if}
               {searchAction === 'search' ? 'Searching' : 'Search'}
@@ -2014,7 +2214,7 @@
             <div class="section-caption"><span>Search results for “{searchedQuery}”</span><small>{format === 'Audiobooks' ? `${results.length} audiobook${results.length === 1 ? '' : 's'} found` : browseTotalAvailable ? `${results.length} loaded of ${availableResultTotal()} available` : `${results.length} file IDs found`}</small></div>
             <div class="table-wrap">
               <table class="file-table">
-                <thead><tr><th class="name-col">Name</th><th>Type</th><th class="number">Size</th><th class="number">Seeders</th><th>Line speed</th><th>Length</th></tr></thead>
+                <thead><tr><th class="name-col"><button class="sort-header" onclick={() => toggleSort('name')}>Name{sortIndicator('name')}</button></th><th><button class="sort-header" onclick={() => toggleSort('format')}>Type{sortIndicator('format')}</button></th><th class="number"><button class="sort-header" onclick={() => toggleSort('bytes')}>Size{sortIndicator('bytes')}</button></th><th class="number"><button class="sort-header" onclick={() => toggleSort('sources')}>Seeders{sortIndicator('sources')}</button></th><th>Line speed</th><th>Length</th></tr></thead>
                 <tbody>
                   {#each paginatedResults() as item}
                     <tr class:selected={selected?.id === item.id} onclick={() => selectResult(item)} ondblclick={activateSelected}>
@@ -2023,6 +2223,9 @@
                   {/each}
                 </tbody>
               </table>
+              {#if results.length === 0}
+                <p class="empty-state">{networkConnected ? 'Nothing found — try fewer or different words.' : nativeReady ? 'You are only seeing your own files. Press “Connect” at the top right to search everyone’s shared music.' : 'Starting up…'}</p>
+              {/if}
             </div>
             <div class="results-pager">
               <button onclick={() => void changeResultPage(resultPage - 1)} disabled={resultPage === 0}>◀ Previous</button>
@@ -2091,7 +2294,7 @@
                 </div>
               </section>
               {/if}
-            {:else}<p class="empty-state">Select a result to see active seeders.</p>{/if}
+            {:else}<p class="empty-state">{networkConnected ? 'Select a result to see who is sharing it right now.' : 'Not connected yet — press “Connect” at the top right to see who is sharing music.'}</p>{/if}
           </aside>
         </div>
       {:else if activeView === 'Downloads'}
@@ -2150,9 +2353,10 @@
           </div>
           {#if !currentFolderAudiobook() && libraryFolderView.toLowerCase().includes('audiobook') && audiobookFolderFiles().length >= 1}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>Possible audiobook detected</b><small>Review the natural chapter order before making the collection public.</small></div><button class="classic-button primary" onclick={openAudiobookEditor}>Group as audiobook…</button></div>{/if}
           {#if currentFolderAudiobook()}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>{currentFolderAudiobook()?.title}</b><small>{currentFolderAudiobook()?.author || 'Unknown author'} · {currentFolderAudiobook()?.chapters.length} ordered chapters · published as one audiobook</small></div><button class="classic-button primary" onclick={() => playAudiobook(currentFolderAudiobook()!)}>▶ Play book</button></div>{/if}
-          <table class="file-table shared-table"><thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Catalogue</th><th>Active peers</th></tr></thead><tbody>{#each paginatedSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? 'Published' : 'Indexed'}</td><td>{file.peers}</td></tr>{/each}</tbody></table>
+          <table class="file-table shared-table"><thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Catalogue</th><th>Uploads</th></tr></thead><tbody>{#each paginatedSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? `Published${file.otherSeeders ? ` · +${file.otherSeeders} others` : ''}` : 'Indexed'}</td><td>{file.delivered || file.peers ? `${file.delivered} delivered${file.peers ? ` · ${file.peers} active` : ''}` : '—'}</td></tr>{/each}</tbody></table>
           {#if visibleSharedFiles().length > LOCAL_PAGE_SIZE}<div class="results-pager"><button disabled={sharedLibraryPage === 0} onclick={() => changeSharedLibraryPage(sharedLibraryPage - 1)}>◀ Previous</button><span>{localPageRange(sharedLibraryPage, visibleSharedFiles().length)} of {visibleSharedFiles().length} · Page {sharedLibraryPage + 1} of {localPageCount(visibleSharedFiles())}</span><button disabled={sharedLibraryPage + 1 >= localPageCount(visibleSharedFiles())} onclick={() => changeSharedLibraryPage(sharedLibraryPage + 1)}>Next ▶</button></div>{/if}
           <p class="privacy-note wide"><span>♜</span> Only validated MP3, FLAC, WAV, Ogg Vorbis, and Opus audio is indexed recursively. Put book folders or complete one-file books inside Audiobooks for automatic grouping. Existing contents are never replaced. Folder names remain local and embedded cover artwork is allowed.</p>
+          <p class="privacy-note wide"><span>i</span> Removing a file from your folder removes only your own listing. Copies that other people already share stay available — “+N others” shows who else is offering the same file right now.</p>
         </section>
       {:else if activeView === 'Trollbox'}
         <section class="full-panel trollbox-view">
@@ -2215,13 +2419,41 @@
         <section class="full-panel profile-view">
           <div class="panel-title"><span></span><b>Napstr Profile</b><span></span></div>
           <div class="profile-card"><div class="avatar"><img src="/napstr-logo.png" alt="Napstr mascot" /></div><div><h2>{displayName}</h2><p>Your dedicated Napstr Nostr identity.</p><code>{identityNpub || 'Connect to create identity'}</code><div class="profile-stats"><span><b>{sharedFiles.length}</b> shared files</span><span><b>{transfers.length}</b> transfers</span><span><b>{networkConnected ? 'Nostr online' : 'Offline'}</b></span></div></div></div>
-          <fieldset class="edit-profile"><legend>Profile</legend><label>Display name <input bind:value={displayName} /></label><label>About <input bind:value={profileAbout} /></label><label>Picture URL <input bind:value={profilePicture} placeholder="https://…" /></label><button class="classic-button primary" onclick={persistSettings}>Save profile</button></fieldset>
-          <p class="privacy-note wide"><span>i</span> Your profile and shared catalogue are public on Nostr. Transfer addresses and credentials are never published.</p>
+          <fieldset class="edit-profile"><legend>Profile</legend><label>Display name <input bind:value={displayName} /></label><label>About <input bind:value={profileAbout} /></label><label>Picture URL <input bind:value={profilePicture} placeholder="https://…" /></label><button class="classic-button primary" onclick={persistSettings}>Save profile</button><div class="backup-actions"><button class="classic-button" onclick={startBackupExport}>Back up account…</button><button class="classic-button" onclick={() => void startBackupImport()}>Restore backup…</button></div></fieldset>
+          {#if archivedIdentities.length}
+            <fieldset class="edit-profile"><legend>Previous accounts on this computer</legend>
+              <p>Accounts replaced by a restore are kept here so a mistaken restore can be undone. They live in this computer's keychain only.</p>
+              <ul class="archived-identities">
+                {#each archivedIdentities as entry (entry.keyringAccount)}
+                  <li><code>{entry.npub}</code><span>replaced {new Date(entry.archivedAt).toLocaleDateString()}</span><button class="classic-button" disabled={backupBusy} onclick={() => void adoptArchived(entry)}>Switch back</button></li>
+                {/each}
+              </ul>
+            </fieldset>
+          {/if}
+          <div class="public-panel">
+            <fieldset><legend>What everyone can see</legend>
+              <ul>
+                <li>Your account key, display name, about text, and picture link</li>
+                <li>Names, sizes, formats, and tags of every file you share — downloads you keep in the Napstr folder are shared too</li>
+                <li>That you are online while the app is sharing</li>
+                <li>Every chat message, signed by this account</li>
+              </ul>
+            </fieldset>
+            <fieldset><legend>What is never published</legend>
+              <ul>
+                <li>Your internet address — transfers run through Tor</li>
+                <li>The music itself, until someone you granted downloads it</li>
+                <li>Download requests and transfer credentials — encrypted end to end</li>
+                <li>Your folder names and anything outside the Napstr folder</li>
+              </ul>
+            </fieldset>
+          </div>
+          <p class="privacy-note wide"><span>i</span> Everything public above is tied to this one account: your chat, your shared music, and your profile can be linked to each other by anyone.</p>
         </section>
       {:else}
         <section class="full-panel settings-view">
           <div class="panel-title"><span></span><b>Napstr Settings</b><span></span></div>
-          <fieldset><legend>Network</legend><label><input type="checkbox" checked disabled /> Connect automatically at startup</label><label><input type="checkbox" checked disabled /> Never allow direct-IP file transfer</label><label>Nostr relays <input bind:value={nostrRelays} /></label><label>Tor <input value="Bundled, managed automatically" readonly /></label></fieldset>
+          <fieldset><legend>Network</legend><label><input type="checkbox" checked disabled /> Connect automatically at startup</label><label><input type="checkbox" checked disabled /> Never allow direct-IP file transfer</label><label><input type="checkbox" bind:checked={relaysOverTor} /> Extra privacy: reach the music network only through Tor (connecting takes longer; applies the next time you connect)</label><label>Nostr relays <input bind:value={nostrRelays} /></label><label>Tor <input value="Bundled, managed automatically" readonly /></label></fieldset>
           <fieldset><legend>Files</legend><label>Downloads and shared audio <input value={napstrFolder} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>Browse…</button></label><label>Transfer mode <select disabled><option>Whole file</option></select></label><label><input type="checkbox" checked disabled /> Downloaded audio is automatically shared</label><label><input type="checkbox" checked disabled /> Verify the complete file with SHA-256</label></fieldset>
           <div class="settings-actions"><button class="classic-button primary" onclick={persistSettings}>OK</button><button class="classic-button" onclick={refreshSnapshot}>Cancel</button><button class="classic-button" onclick={persistSettings}>Apply</button></div>
         </section>
@@ -2270,7 +2502,46 @@
       <dialog class="dialog" open aria-label="Napstr public profile" onclick={(e) => e.stopPropagation()}>
         <header class="titlebar"><div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>Public Napstr Profile</span></div><div class="window-controls"><button onclick={() => (sourceProfile = null)}>×</button></div></header>
         <div class="dialog-body"><div class="about-logo">☺</div><div><h2>{sourceProfile.displayName}</h2><p>{sourceProfile.about || 'No profile description published.'}</p><code>{sourceProfile.npub}</code></div></div>
-        <div class="dialog-actions"><button class="classic-button primary" onclick={() => (sourceProfile = null)}>OK</button></div>
+        <div class="dialog-actions">{#if networkConnected}<button class="classic-button primary" onclick={() => sourceProfile && showSourceCatalogue(sourceProfile)}>Show their shared music</button>{/if}<button class="classic-button" onclick={() => (sourceProfile = null)}>OK</button></div>
+      </dialog>
+    </div>
+  {/if}
+
+  {#if backupDialog}
+    <div class="modal-backdrop" role="presentation" onclick={closeBackupDialog}>
+      <dialog class="dialog confirm-dialog" open aria-label={backupDialog === 'export' ? 'Back up account' : backupDialog === 'import-confirm' ? 'Confirm account replacement' : 'Restore account'} onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') closeBackupDialog(); }}>
+        <header class="titlebar"><div class="title-left"><span class="app-icon">🔑</span><span>{backupDialog === 'export' ? 'Back up account' : backupDialog === 'import-confirm' ? 'Replace this account?' : 'Restore account'}</span></div><div class="window-controls"><button disabled={backupBusy} onclick={closeBackupDialog}>×</button></div></header>
+        <div class="dialog-body"><div class="backup-body">
+          {#if backupDialog === 'export'}
+            <p>Choose a passphrase for the backup file. The file is useless without it.</p>
+            <label>Passphrase <input type="password" bind:value={backupPassphrase} minlength="8" autocomplete="new-password" /></label>
+            <label>Repeat <input type="password" bind:value={backupPassphraseRepeat} autocomplete="new-password" /></label>
+            <p class="backup-warning">There is no reset. If you lose the file or the passphrase, this account cannot be recovered — by anyone.</p>
+          {:else if backupDialog === 'import'}
+            <p>Enter the passphrase for this backup file. Nothing is replaced yet — you will see which account it holds before anything changes.</p>
+            <label>Passphrase <input type="password" bind:value={backupPassphrase} autocomplete="current-password" /></label>
+          {:else}
+            {#if backupCurrentNpub && backupCurrentNpub !== backupRestoreNpub}
+              <p>Replacing: <code>{backupCurrentNpub}</code></p>
+              <p>Restoring: <code>{backupRestoreNpub}</code></p>
+              {#if backupCurrentBackedUp}
+                <p>The account being replaced has its own backup file, and a copy also stays on this computer under Previous accounts.</p>
+                <label class="backup-ack"><input type="checkbox" bind:checked={backupAcknowledged} /> I understand that this account stops being the one Napstr uses.</label>
+              {:else}
+                <p class="backup-warning">The account being replaced has never been saved to a backup file. Napstr will keep a copy on this computer under Previous accounts, but that copy is all that will exist — if this computer is lost, wiped, or reinstalled, the account is gone for good.</p>
+                <label class="backup-ack"><input type="checkbox" bind:checked={backupAcknowledged} /> I understand that the account I am replacing has no backup file, and will survive only on this computer.</label>
+              {/if}
+            {:else if backupCurrentNpub === backupRestoreNpub}
+              <p>This backup holds the account already in use here. Restoring it changes nothing.</p>
+              <p>Account: <code>{backupRestoreNpub}</code></p>
+            {:else}
+              <p>No account exists on this computer yet, so nothing is replaced.</p>
+              <p>Restoring: <code>{backupRestoreNpub}</code></p>
+            {/if}
+          {/if}
+          {#if backupError}<p class="backup-error">{backupError}</p>{/if}
+        </div></div>
+        <div class="dialog-actions">{#if backupDialog === 'import-confirm'}<button class="classic-button primary" disabled={backupBusy || (!!backupCurrentNpub && backupCurrentNpub !== backupRestoreNpub && !backupAcknowledged)} onclick={() => void confirmRestore()}>{backupBusy ? 'Replacing…' : 'Replace my account'}</button><button class="classic-button" disabled={backupBusy} onclick={closeBackupDialog}>Cancel</button>{:else}<button class="classic-button primary" disabled={backupBusy} onclick={() => void submitBackup()}>{backupBusy ? 'Working…' : backupDialog === 'export' ? 'Encrypt and save' : 'Continue'}</button><button class="classic-button" disabled={backupBusy} onclick={closeBackupDialog}>Cancel</button>{/if}</div>
       </dialog>
     </div>
   {/if}

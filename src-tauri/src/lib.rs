@@ -102,6 +102,7 @@ struct Settings {
     display_name: String,
     profile_about: String,
     profile_picture: String,
+    relays_over_tor: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +205,16 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
            narrator TEXT NOT NULL DEFAULT '',
            updated_at TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS archived_identities (
+           npub TEXT PRIMARY KEY,
+           keyring_account TEXT NOT NULL,
+           archived_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS upload_stats (
+           file_id TEXT PRIMARY KEY,
+           delivered INTEGER NOT NULL DEFAULT 0,
+           last_delivered_at TEXT
+         );
          DROP TABLE IF EXISTS download_chunks;"
     ).map_err(|error| error.to_string())?;
     // Pre-release databases used these transfer fields in the library table.
@@ -284,6 +295,7 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         ),
         ("profile_picture", "".to_string()),
         ("profile_event_fingerprint", "".to_string()),
+        ("relays_over_tor", "off".to_string()),
     ] {
         connection
             .execute(
@@ -347,6 +359,16 @@ fn get_setting(connection: &Connection, key: &str) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
+fn set_setting(connection: &Connection, key: &str, value: &str) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn load_settings(connection: &Connection) -> Result<Settings, String> {
     Ok(Settings {
         napstr_folder: get_setting(connection, "shared_folder")?,
@@ -354,6 +376,9 @@ fn load_settings(connection: &Connection) -> Result<Settings, String> {
         display_name: get_setting(connection, "display_name")?,
         profile_about: get_setting(connection, "profile_about")?,
         profile_picture: get_setting(connection, "profile_picture")?,
+        relays_over_tor: get_setting(connection, "relays_over_tor")
+            .map(|value| value == "on")
+            .unwrap_or(false),
     })
 }
 
@@ -1499,6 +1524,10 @@ async fn save_settings(
             ("display_name", settings.display_name),
             ("profile_about", settings.profile_about),
             ("profile_picture", settings.profile_picture),
+            (
+                "relays_over_tor",
+                if settings.relays_over_tor { "on" } else { "off" }.to_string(),
+            ),
         ] {
             connection
                 .execute(
@@ -1841,6 +1870,196 @@ fn save_file_tags(
 }
 
 #[tauri::command]
+async fn export_identity_backup(
+    path: String,
+    passphrase: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if passphrase.chars().count() < 8 {
+        return Err("the passphrase needs at least 8 characters".into());
+    }
+    let ncryptsec =
+        tauri::async_runtime::spawn_blocking(move || network::export_identity(&passphrase))
+            .await
+            .map_err(|error| error.to_string())??;
+    fs::write(&path, format!("{ncryptsec}\n")).map_err(|error| error.to_string())?;
+    // Remember which account is now recoverable, so a later restore can tell the user
+    // whether the key it is about to replace exists anywhere else.
+    if let Some(npub) = network::current_identity_npub() {
+        let connection = open_db(&state)?;
+        set_setting(&connection, "identity_backed_up_npub", &npub)?;
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestorePreview {
+    restored_npub: String,
+    current_npub: String,
+    current_backed_up: bool,
+}
+
+#[tauri::command]
+async fn inspect_identity_backup(
+    path: String,
+    passphrase: String,
+    state: State<'_, AppState>,
+) -> Result<RestorePreview, String> {
+    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let ncryptsec = content.trim().to_string();
+    let restored_npub = tauri::async_runtime::spawn_blocking(move || {
+        network::preview_identity_backup(&ncryptsec, &passphrase)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    let current_npub = network::current_identity_npub().unwrap_or_default();
+    let connection = open_db(&state)?;
+    let backed_up = get_setting(&connection, "identity_backed_up_npub").unwrap_or_default();
+    Ok(RestorePreview {
+        current_backed_up: !current_npub.is_empty() && backed_up == current_npub,
+        restored_npub,
+        current_npub,
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchivedIdentity {
+    npub: String,
+    keyring_account: String,
+    archived_at: String,
+}
+
+fn record_archived_identity(connection: &Connection, npub: &str, slot: &str) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO archived_identities (npub, keyring_account, archived_at) VALUES (?1, ?2, ?3)",
+            params![npub, slot, Utc::now().to_rfc3339()],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Preserves whatever identity is active before it is overwritten. Called on every path that
+/// replaces the key, so replacement is a move rather than a deletion.
+fn preserve_current_identity(connection: &Connection) -> Result<(), String> {
+    if let Some((npub, slot)) = network::archive_current_identity()? {
+        record_archived_identity(connection, &npub, &slot)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn archived_identities(state: State<'_, AppState>) -> Result<Vec<ArchivedIdentity>, String> {
+    let connection = open_db(&state)?;
+    let mut statement = connection
+        .prepare("SELECT npub, keyring_account, archived_at FROM archived_identities ORDER BY archived_at DESC")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ArchivedIdentity {
+                npub: row.get(0)?,
+                keyring_account: row.get(1)?,
+                archived_at: row.get(2)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn adopt_archived_identity(
+    keyring_account: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let connection = open_db(&state)?;
+    preserve_current_identity(&connection)?;
+    drop(connection);
+    let npub = tauri::async_runtime::spawn_blocking(move || {
+        network::adopt_archived_identity(&keyring_account)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    state.network.stop().await;
+    state.network.clear_cached_identity().await;
+    let _ = state.network.restart().await;
+    Ok(npub)
+}
+
+#[tauri::command]
+async fn import_identity_backup(
+    path: String,
+    passphrase: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let ncryptsec = content.trim().to_string();
+    let connection = open_db(&state)?;
+    preserve_current_identity(&connection)?;
+    drop(connection);
+    let npub = tauri::async_runtime::spawn_blocking(move || {
+        network::import_identity(&ncryptsec, &passphrase)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    state.network.stop().await;
+    state.network.clear_cached_identity().await;
+    // The identity is already replaced; reconnecting may legitimately fail offline.
+    let _ = state.network.restart().await;
+    Ok(npub)
+}
+
+fn other_seeder_counts(
+    connection: &Connection,
+    own_pubkey: &str,
+) -> Result<Vec<(String, i64)>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT file_id, COUNT(DISTINCT source_pubkey) FROM remote_catalogue
+             WHERE source_pubkey != ?1 AND file_id IN (SELECT file_id FROM files)
+             GROUP BY file_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let counts = statement
+        .query_map([own_pubkey], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(counts)
+}
+
+#[tauri::command]
+async fn get_seeding_stats(state: State<'_, AppState>) -> Result<Vec<transfer::SeedingStat>, String> {
+    let mut stats = state.network.transfers().seeding_stats().await?;
+    let own_pubkey = state
+        .network
+        .status()
+        .await
+        .map(|status| status.pubkey)
+        .unwrap_or_default();
+    let connection = open_db(&state)?;
+    let by_id: HashMap<String, usize> = stats
+        .iter()
+        .enumerate()
+        .map(|(index, stat)| (stat.file_id.clone(), index))
+        .collect();
+    for (file_id, count) in other_seeder_counts(&connection, &own_pubkey)? {
+        match by_id.get(&file_id) {
+            Some(&index) => stats[index].other_seeders = count.max(0) as u32,
+            None => stats.push(transfer::SeedingStat {
+                file_id,
+                delivered: 0,
+                active_grants: 0,
+                other_seeders: count.max(0) as u32,
+            }),
+        }
+    }
+    Ok(stats)
+}
+
+#[tauri::command]
 async fn start_network(state: State<'_, AppState>) -> Result<network::NetworkStatus, String> {
     let tor = state.tor.clone();
     tauri::async_runtime::spawn(async move {
@@ -2113,8 +2332,12 @@ pub fn run() {
             initialise_database(&db_path, &app_data)?;
             let tor = Arc::new(tor::TorManager::new(app_data.clone(), resource_dir));
             let transfers = Arc::new(transfer::TransferService::new(db_path.clone(), tor.clone()));
-            let network =
-                network::NetworkService::new(db_path.clone(), transfers, app.handle().clone());
+            let network = network::NetworkService::new(
+                db_path.clone(),
+                transfers,
+                tor.clone(),
+                app.handle().clone(),
+            );
             let mobile =
                 mobile::MobileService::new(db_path.clone(), app_data.clone(), network.clone())?;
             let scan_lock = Arc::new(Mutex::new(()));
@@ -2197,6 +2420,12 @@ pub fn run() {
             save_settings,
             remove_transfer,
             get_transfers,
+            get_seeding_stats,
+            export_identity_backup,
+            inspect_identity_backup,
+            import_identity_backup,
+            archived_identities,
+            adopt_archived_identity,
             open_napstr_folder,
             open_release_url,
             open_napstrfy_website,
@@ -2640,6 +2869,102 @@ mod tests {
             get_setting(&connection, "profile_event_fingerprint").unwrap(),
             ""
         );
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn replaced_accounts_are_recorded_so_a_restore_can_be_undone() {
+        let directory = test_directory("archived-identity-test");
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+
+        record_archived_identity(&connection, "npub1replaced", "nostr-identity-archived-1").unwrap();
+        let (npub, slot): (String, String) = connection
+            .query_row(
+                "SELECT npub, keyring_account FROM archived_identities",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(npub, "npub1replaced");
+        assert_eq!(slot, "nostr-identity-archived-1");
+
+        // Archiving the same account twice must not create a second, duplicate row.
+        record_archived_identity(&connection, "npub1replaced", "nostr-identity-archived-2").unwrap();
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM archived_identities", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn only_the_exported_account_counts_as_backed_up() {
+        let directory = test_directory("backed-up-marker-test");
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+
+        // No export has happened, so nothing is recoverable from a file.
+        assert!(get_setting(&connection, "identity_backed_up_npub").unwrap_or_default() != "npub1current");
+
+        set_setting(&connection, "identity_backed_up_npub", "npub1current").unwrap();
+        assert_eq!(get_setting(&connection, "identity_backed_up_npub").unwrap(), "npub1current");
+        // A later account is not covered by the earlier account's backup file.
+        assert!(get_setting(&connection, "identity_backed_up_npub").unwrap() != "npub1rotated");
+
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn relay_privacy_defaults_to_clearnet_and_round_trips() {
+        let directory = test_directory("relay-privacy-test");
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        assert!(!load_settings(&connection).unwrap().relays_over_tor);
+        connection
+            .execute("UPDATE settings SET value='on' WHERE key='relays_over_tor'", [])
+            .unwrap();
+        assert!(load_settings(&connection).unwrap().relays_over_tor);
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn withdrawal_reality_counts_only_foreign_seeders_of_own_files() {
+        let directory = test_directory("other-seeders-test");
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files(file_id,filename,path,size,format,indexed_at,mime)
+                 VALUES('own-file','song.flac','/tmp/song.flac',10,'FLAC','now','audio/flac')",
+                [],
+            )
+            .unwrap();
+        for (file_id, pubkey) in [
+            ("own-file", "me"),
+            ("own-file", "peer-a"),
+            ("own-file", "peer-b"),
+            ("foreign-file", "peer-a"),
+        ] {
+            connection.execute(
+                "INSERT INTO remote_catalogue(file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,event_id,seen_at)
+                 VALUES(?1,?2,'song.flac','','','','FLAC','audio/flac',10,'unspecified','event','now')",
+                params![file_id, pubkey],
+            ).unwrap();
+        }
+
+        let counts = other_seeder_counts(&connection, "me").unwrap();
+
+        assert_eq!(counts, vec![("own-file".to_string(), 2)]);
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }

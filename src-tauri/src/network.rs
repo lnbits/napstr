@@ -1,13 +1,16 @@
+use crate::tor::TorManager;
 use crate::transfer::{DownloadOffer, TransferService};
 use chrono::Utc;
 use futures_util::{stream, StreamExt};
 use keyring::Entry;
+use nostr_sdk::prelude::Connection as RelayConnection;
 use nostr_sdk::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    net::SocketAddr,
     path::PathBuf,
     str::FromStr,
     sync::{
@@ -73,6 +76,7 @@ pub struct NetworkStatus {
     pub npub: String,
     pub pubkey: String,
     pub relay_count: usize,
+    pub relays_via_tor: bool,
     pub tor_running: bool,
     pub tor_starting: bool,
     pub tor_progress: u8,
@@ -551,6 +555,7 @@ struct AvailabilitySnapshot {
 pub struct NetworkService {
     db_path: PathBuf,
     transfers: Arc<TransferService>,
+    tor: Arc<TorManager>,
     app_handle: tauri::AppHandle,
     client: RwLock<Option<Client>>,
     keys: RwLock<Option<Keys>>,
@@ -567,6 +572,7 @@ pub struct NetworkService {
     trollbox_cache_lock: Mutex<()>,
     track_discussion_subscription_lock: Mutex<()>,
     connected: AtomicBool,
+    relays_via_tor: AtomicBool,
     generation: AtomicU64,
     last_error: RwLock<String>,
     trollbox_profiles: RwLock<HashMap<String, String>>,
@@ -576,11 +582,13 @@ impl NetworkService {
     pub fn new(
         db_path: PathBuf,
         transfers: Arc<TransferService>,
+        tor: Arc<TorManager>,
         app_handle: tauri::AppHandle,
     ) -> Arc<Self> {
         Arc::new(Self {
             db_path,
             transfers,
+            tor,
             app_handle,
             client: RwLock::new(None),
             keys: RwLock::new(None),
@@ -597,6 +605,7 @@ impl NetworkService {
             trollbox_cache_lock: Mutex::new(()),
             track_discussion_subscription_lock: Mutex::new(()),
             connected: AtomicBool::new(false),
+            relays_via_tor: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             last_error: RwLock::new(String::new()),
             trollbox_profiles: RwLock::new(HashMap::new()),
@@ -746,9 +755,20 @@ impl NetworkService {
         if relays.is_empty() {
             return Err("at least one Nostr relay is required".into());
         }
+        let relays_over_tor = super::get_setting(&connection, "relays_over_tor")
+            .map(|value| value == "on")
+            .unwrap_or(false);
         drop(connection);
 
-        let client = nostr_client(keys.clone());
+        let proxy = if relays_over_tor {
+            let socks_port = self.tor.start().await.map_err(|error| {
+                format!("private connection mode needs the built-in Tor: {error}")
+            })?;
+            Some(SocketAddr::from(([127, 0, 0, 1], socks_port)))
+        } else {
+            None
+        };
+        let client = nostr_client(keys.clone(), proxy);
         // Chat history is an optional local acceleration layer and must never
         // prevent the Nostr client itself from connecting.
         let _ = self.hydrate_trollbox_cache(&client).await;
@@ -787,6 +807,7 @@ impl NetworkService {
         *self.client.write().await = Some(client.clone());
         *self.keys.write().await = Some(keys);
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.relays_via_tor.store(relays_over_tor, Ordering::SeqCst);
         self.connected.store(true, Ordering::SeqCst);
         *self.last_error.write().await = String::new();
 
@@ -869,6 +890,10 @@ impl NetworkService {
         }
     }
 
+    pub async fn clear_cached_identity(&self) {
+        *self.keys.write().await = None;
+    }
+
     pub async fn restart(self: &Arc<Self>) -> Result<NetworkStatus, String> {
         self.stop().await;
         match self.start().await {
@@ -906,6 +931,8 @@ impl NetworkService {
             npub,
             pubkey,
             relay_count,
+            relays_via_tor: self.connected.load(Ordering::SeqCst)
+                && self.relays_via_tor.load(Ordering::SeqCst),
             tor_running: false,
             tor_starting: false,
             tor_progress: 0,
@@ -2583,12 +2610,20 @@ fn trollbox_filter(limit: usize) -> Filter {
     public_chat_filter(TROLLBOX_HASHTAG, limit)
 }
 
-fn nostr_client(keys: Keys) -> Client {
+fn nostr_client(keys: Keys, proxy: Option<SocketAddr>) -> Client {
     let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
         events: true,
         max_events: Some(LIVE_NOSTR_EVENT_LIMIT),
     });
-    Client::builder().signer(keys).database(database).build()
+    let mut builder = Client::builder().signer(keys).database(database);
+    if let Some(address) = proxy {
+        builder = builder.opts(ClientOptions::new().connection(
+            RelayConnection::new()
+                .proxy(address)
+                .target(ConnectionTarget::All),
+        ));
+    }
+    builder.build()
 }
 
 fn public_chat_filter(topic: &str, limit: usize) -> Filter {
@@ -2855,12 +2890,128 @@ pub fn load_network_transfers(connection: &Connection) -> Result<Vec<super::Tran
         .map_err(|error| error.to_string())
 }
 
+const BACKUP_SCRYPT_LOG_N: u8 = 16;
+
+pub fn encrypt_identity_backup(keys: &Keys, passphrase: &str) -> Result<String, String> {
+    encrypt_identity_backup_with_log_n(keys, passphrase, BACKUP_SCRYPT_LOG_N)
+}
+
+fn encrypt_identity_backup_with_log_n(
+    keys: &Keys,
+    passphrase: &str,
+    log_n: u8,
+) -> Result<String, String> {
+    EncryptedSecretKey::new(keys.secret_key(), passphrase, log_n, KeySecurity::Medium)
+        .map_err(|error| error.to_string())?
+        .to_bech32()
+        .map_err(|error| error.to_string())
+}
+
+pub fn decrypt_identity_backup(ncryptsec: &str, passphrase: &str) -> Result<Keys, String> {
+    let encrypted = EncryptedSecretKey::from_bech32(ncryptsec)
+        .map_err(|_| "this is not a Napstr account backup".to_string())?;
+    let secret = encrypted
+        .decrypt(passphrase)
+        .map_err(|_| "wrong passphrase for this backup".to_string())?;
+    Ok(Keys::new(secret))
+}
+
+pub fn export_identity(passphrase: &str) -> Result<String, String> {
+    let keys = load_or_create_identity()?;
+    encrypt_identity_backup(&keys, passphrase)
+}
+
+const KEYRING_SERVICE: &str = "social.napstr.desktop";
+
+/// Reads the identity already on this computer without creating one. `load_or_create_identity`
+/// would mint a key as a side effect, which would make "is there an account here?" a
+/// destructive question to ask.
+pub fn current_identity_npub() -> Option<String> {
+    let keys = if let Ok(nsec) = std::env::var("NAPSTR_NSEC") {
+        Keys::parse(&nsec).ok()?
+    } else {
+        let account = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref()).ok()?;
+        let secret = Entry::new(KEYRING_SERVICE, &account).ok()?.get_password().ok()?;
+        Keys::parse(&secret).ok()?
+    };
+    keys.public_key().to_bech32().ok()
+}
+
+/// Copies the identity currently in the keyring to a second, dated keyring entry so that
+/// replacing it is recoverable. Returns the archived account's npub and keyring slot, or
+/// `None` when there was no identity to preserve.
+pub fn archive_current_identity() -> Result<Option<(String, String)>, String> {
+    let base = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref())?;
+    let Ok(nsec) = Entry::new(KEYRING_SERVICE, &base)
+        .map_err(|error| error.to_string())?
+        .get_password()
+    else {
+        return Ok(None);
+    };
+    let keys = Keys::parse(&nsec).map_err(|error| error.to_string())?;
+    let npub = keys
+        .public_key()
+        .to_bech32()
+        .map_err(|error| error.to_string())?;
+    let slot = format!("{base}-archived-{}", Utc::now().timestamp());
+    Entry::new(KEYRING_SERVICE, &slot)
+        .map_err(|error| error.to_string())?
+        .set_password(&nsec)
+        .map_err(|error| {
+            format!("could not preserve the account being replaced in the operating-system keyring: {error}")
+        })?;
+    Ok(Some((npub, slot)))
+}
+
+/// Promotes a previously archived identity back to the active one. The caller archives the
+/// current identity first, so switching back and forth never destroys either side.
+pub fn adopt_archived_identity(slot: &str) -> Result<String, String> {
+    let nsec = Entry::new(KEYRING_SERVICE, slot)
+        .map_err(|error| error.to_string())?
+        .get_password()
+        .map_err(|_| "that archived account is no longer in the operating-system keyring".to_string())?;
+    let keys = Keys::parse(&nsec).map_err(|error| error.to_string())?;
+    store_identity(&keys)?;
+    keys.public_key()
+        .to_bech32()
+        .map_err(|error| error.to_string())
+}
+
+/// Decrypts a backup purely to report whose account it holds. Stores nothing, so
+/// the caller can name the account being replaced before anything is overwritten.
+pub fn preview_identity_backup(ncryptsec: &str, passphrase: &str) -> Result<String, String> {
+    decrypt_identity_backup(ncryptsec, passphrase)?
+        .public_key()
+        .to_bech32()
+        .map_err(|error| error.to_string())
+}
+
+pub fn import_identity(ncryptsec: &str, passphrase: &str) -> Result<String, String> {
+    let keys = decrypt_identity_backup(ncryptsec, passphrase)?;
+    store_identity(&keys)?;
+    keys.public_key()
+        .to_bech32()
+        .map_err(|error| error.to_string())
+}
+
+fn store_identity(keys: &Keys) -> Result<(), String> {
+    let account = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref())?;
+    let entry = Entry::new(KEYRING_SERVICE, &account).map_err(|error| error.to_string())?;
+    let nsec = keys
+        .secret_key()
+        .to_bech32()
+        .map_err(|error| error.to_string())?;
+    entry.set_password(&nsec).map_err(|error| {
+        format!("could not store the restored identity in the operating-system keyring: {error}")
+    })
+}
+
 fn load_or_create_identity() -> Result<Keys, String> {
     if let Ok(nsec) = std::env::var("NAPSTR_NSEC") {
         return Keys::parse(&nsec).map_err(|error| error.to_string());
     }
     let account = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref())?;
-    let entry = Entry::new("social.napstr.desktop", &account).map_err(|error| error.to_string())?;
+    let entry = Entry::new(KEYRING_SERVICE, &account).map_err(|error| error.to_string())?;
     if let Ok(secret) = entry.get_password() {
         return Keys::parse(&secret).map_err(|error| error.to_string());
     }
@@ -3143,7 +3294,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalogue_search_filters_are_server_side_and_bounded() {
+    fn previewing_a_backup_names_the_account_without_storing_it() {
+        let keys = Keys::generate();
+        let backup = encrypt_identity_backup_with_log_n(&keys, "correct horse battery", 10).unwrap();
+
+        let named = preview_identity_backup(&backup, "correct horse battery").unwrap();
+
+        assert_eq!(named, keys.public_key().to_bech32().unwrap());
+        assert!(preview_identity_backup(&backup, "wrong passphrase").is_err());
+    }
+
+    #[test]
+    fn identity_backup_round_trips_only_with_the_right_passphrase() {
+        let keys = Keys::generate();
+
+        // log_n 10 keeps the suite fast; the production wrapper only changes the work factor.
+        let backup =
+            encrypt_identity_backup_with_log_n(&keys, "correct horse battery", 10).unwrap();
+
+        assert!(backup.starts_with("ncryptsec1"));
+        let restored = decrypt_identity_backup(&backup, "correct horse battery").unwrap();
+        assert_eq!(restored.public_key(), keys.public_key());
+        assert!(decrypt_identity_backup(&backup, "wrong passphrase").is_err());
+        assert!(decrypt_identity_backup("nsec1notabackup", "correct horse battery").is_err());
+    }
+
+    #[test]
+        fn catalogue_search_filters_are_server_side_and_bounded() {
         let named = serde_json::to_value(catalogue_name_search_filter("metallica")).unwrap();
         assert_eq!(named["kinds"], serde_json::json!([CATALOGUE_KIND]));
         assert_eq!(named["#t"], serde_json::json!(["napstr"]));
@@ -3339,7 +3516,7 @@ mod tests {
     #[tokio::test]
     async fn public_chat_events_are_queryable_without_a_relay_echo() {
         let keys = Keys::generate();
-        let client = nostr_client(keys.clone());
+        let client = nostr_client(keys.clone(), None);
         let event = EventBuilder::new(Kind::from(TROLLBOX_MESSAGE_KIND), "hello")
             .tag(Tag::hashtag(TROLLBOX_HASHTAG))
             .sign_with_keys(&keys)
