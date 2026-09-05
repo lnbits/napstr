@@ -99,7 +99,9 @@
   let displayName = 'napstr-user';
   let profileAbout = 'Sharing files privately with Napstr. napstr.net';
   let profilePicture = '';
-  let backupDialog: 'export' | 'import' | null = null;
+  let backupDialog: 'export' | 'import' | 'import-confirm' | null = null;
+  let backupRestoreNpub = '';
+  let backupAcknowledged = false;
   let backupPassphrase = '';
   let backupPassphraseRepeat = '';
   let backupImportPath = '';
@@ -1149,6 +1151,8 @@
     backupImportPath = selectedPath;
     backupDialog = 'import';
     backupPassphrase = '';
+    backupRestoreNpub = '';
+    backupAcknowledged = false;
     backupError = '';
   }
 
@@ -1157,6 +1161,8 @@
     backupDialog = null;
     backupPassphrase = '';
     backupPassphraseRepeat = '';
+    backupRestoreNpub = '';
+    backupAcknowledged = false;
     backupError = '';
   }
 
@@ -1176,17 +1182,28 @@
       } catch (error) { backupError = String(error); }
       finally { backupBusy = false; }
     } else if (backupDialog === 'import') {
+      // Read-only step: prove the passphrase and name the account before anything is replaced.
       backupBusy = true;
       try {
-        const npub = await invoke<string>('import_identity_backup', { path: backupImportPath, passphrase: backupPassphrase });
-        identityNpub = npub;
-        backupBusy = false;
-        closeBackupDialog();
-        activityMessage = 'Account restored — reconnecting with the restored identity…';
-        await refreshSnapshot();
+        backupRestoreNpub = await invoke<string>('inspect_identity_backup', { path: backupImportPath, passphrase: backupPassphrase });
+        backupDialog = 'import-confirm';
       } catch (error) { backupError = String(error); }
       finally { backupBusy = false; }
     }
+  }
+
+  async function confirmRestore() {
+    if (backupBusy) return;
+    backupBusy = true;
+    backupError = '';
+    try {
+      const npub = await invoke<string>('import_identity_backup', { path: backupImportPath, passphrase: backupPassphrase });
+      identityNpub = npub;
+      closeBackupDialog();
+      activityMessage = 'Account restored — reconnecting with the restored identity…';
+      await refreshSnapshot();
+    } catch (error) { backupError = String(error); }
+    finally { backupBusy = false; }
   }
 
   const windowCommand = async (command: 'minimise_window' | 'toggle_maximise' | 'close_window') => {
@@ -1673,21 +1690,34 @@
 
   {#if backupDialog}
     <div class="modal-backdrop" role="presentation" onclick={closeBackupDialog}>
-      <dialog class="dialog confirm-dialog" open aria-label={backupDialog === 'export' ? 'Back up account' : 'Restore account'} onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') closeBackupDialog(); }}>
-        <header class="titlebar"><div class="title-left"><span class="app-icon">🔑</span><span>{backupDialog === 'export' ? 'Back up account' : 'Restore account'}</span></div><div class="window-controls"><button disabled={backupBusy} onclick={closeBackupDialog}>×</button></div></header>
+      <dialog class="dialog confirm-dialog" open aria-label={backupDialog === 'export' ? 'Back up account' : backupDialog === 'import-confirm' ? 'Confirm account replacement' : 'Restore account'} onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') closeBackupDialog(); }}>
+        <header class="titlebar"><div class="title-left"><span class="app-icon">🔑</span><span>{backupDialog === 'export' ? 'Back up account' : backupDialog === 'import-confirm' ? 'Replace this account?' : 'Restore account'}</span></div><div class="window-controls"><button disabled={backupBusy} onclick={closeBackupDialog}>×</button></div></header>
         <div class="dialog-body"><div class="backup-body">
           {#if backupDialog === 'export'}
             <p>Choose a passphrase for the backup file. The file is useless without it.</p>
             <label>Passphrase <input type="password" bind:value={backupPassphrase} minlength="8" autocomplete="new-password" /></label>
             <label>Repeat <input type="password" bind:value={backupPassphraseRepeat} autocomplete="new-password" /></label>
             <p class="backup-warning">There is no reset. If you lose the file or the passphrase, this account cannot be recovered — by anyone.</p>
-          {:else}
-            <p>This replaces the account on this computer. The current account survives only in its own backup files.</p>
+          {:else if backupDialog === 'import'}
+            <p>Enter the passphrase for this backup file. Nothing is replaced yet — you will see which account it holds before anything changes.</p>
             <label>Passphrase <input type="password" bind:value={backupPassphrase} autocomplete="current-password" /></label>
+          {:else}
+            {#if identityNpub && identityNpub !== backupRestoreNpub}
+              <p class="backup-warning">This permanently replaces the account on this computer. Unless you already saved a backup of it, it cannot be recovered — by anyone.</p>
+              <p>Losing now: <code>{identityNpub}</code></p>
+              <p>Restoring: <code>{backupRestoreNpub}</code></p>
+              <label class="backup-ack"><input type="checkbox" bind:checked={backupAcknowledged} /> I have a backup of the account being replaced, or I accept losing it.</label>
+            {:else if identityNpub === backupRestoreNpub}
+              <p>This backup holds the account already in use here. Restoring it changes nothing.</p>
+              <p>Account: <code>{backupRestoreNpub}</code></p>
+            {:else}
+              <p>No account exists on this computer yet, so nothing will be replaced.</p>
+              <p>Restoring: <code>{backupRestoreNpub}</code></p>
+            {/if}
           {/if}
           {#if backupError}<p class="backup-error">{backupError}</p>{/if}
         </div></div>
-        <div class="dialog-actions"><button class="classic-button primary" disabled={backupBusy} onclick={() => void submitBackup()}>{backupBusy ? 'Working…' : backupDialog === 'export' ? 'Encrypt and save' : 'Replace account'}</button><button class="classic-button" disabled={backupBusy} onclick={closeBackupDialog}>Cancel</button></div>
+        <div class="dialog-actions">{#if backupDialog === 'import-confirm'}<button class="classic-button primary" disabled={backupBusy || (!!identityNpub && identityNpub !== backupRestoreNpub && !backupAcknowledged)} onclick={() => void confirmRestore()}>{backupBusy ? 'Replacing…' : 'Replace my account'}</button><button class="classic-button" disabled={backupBusy} onclick={closeBackupDialog}>Cancel</button>{:else}<button class="classic-button primary" disabled={backupBusy} onclick={() => void submitBackup()}>{backupBusy ? 'Working…' : backupDialog === 'export' ? 'Encrypt and save' : 'Continue'}</button><button class="classic-button" disabled={backupBusy} onclick={closeBackupDialog}>Cancel</button>{/if}</div>
       </dialog>
     </div>
   {/if}

@@ -1071,6 +1071,17 @@ async fn export_identity_backup(path: String, passphrase: String) -> Result<(), 
 }
 
 #[tauri::command]
+async fn inspect_identity_backup(path: String, passphrase: String) -> Result<String, String> {
+    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let ncryptsec = content.trim().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        network::preview_identity_backup(&ncryptsec, &passphrase)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn import_identity_backup(
     path: String,
     passphrase: String,
@@ -1421,6 +1432,7 @@ pub fn run() {
             get_transfers,
             get_seeding_stats,
             export_identity_backup,
+            inspect_identity_backup,
             import_identity_backup,
             open_napstr_folder,
             open_release_url,

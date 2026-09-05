@@ -1541,6 +1541,15 @@ pub fn export_identity(passphrase: &str) -> Result<String, String> {
     encrypt_identity_backup(&keys, passphrase)
 }
 
+/// Decrypts a backup purely to report whose account it holds. Stores nothing, so
+/// the caller can name the account being replaced before anything is overwritten.
+pub fn preview_identity_backup(ncryptsec: &str, passphrase: &str) -> Result<String, String> {
+    decrypt_identity_backup(ncryptsec, passphrase)?
+        .public_key()
+        .to_bech32()
+        .map_err(|error| error.to_string())
+}
+
 pub fn import_identity(ncryptsec: &str, passphrase: &str) -> Result<String, String> {
     let keys = decrypt_identity_backup(ncryptsec, passphrase)?;
     store_identity(&keys)?;
@@ -1728,6 +1737,17 @@ fn mime_for_format(format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn previewing_a_backup_names_the_account_without_storing_it() {
+        let keys = Keys::generate();
+        let backup = encrypt_identity_backup_with_log_n(&keys, "correct horse battery", 10).unwrap();
+
+        let named = preview_identity_backup(&backup, "correct horse battery").unwrap();
+
+        assert_eq!(named, keys.public_key().to_bech32().unwrap());
+        assert!(preview_identity_backup(&backup, "wrong passphrase").is_err());
+    }
 
     #[test]
     fn identity_backup_round_trips_only_with_the_right_passphrase() {
