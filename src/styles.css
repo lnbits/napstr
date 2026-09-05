@@ -305,3 +305,8 @@ body.resizing-transfer-pane, body.resizing-transfer-pane * { cursor: ns-resize !
   .selected-file { padding-top: 5px; padding-bottom: 5px; }
   .details-pane fieldset { margin-top: 4px; margin-bottom: 4px; }
 }
+
+.archived-identities { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.archived-identities li { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.archived-identities code { flex: 1 1 260px; overflow-wrap: anywhere; font-size: 11px; }
+.archived-identities span { opacity: 0.75; font-size: 11px; }

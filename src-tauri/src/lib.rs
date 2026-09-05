@@ -159,6 +159,11 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
          CREATE TABLE IF NOT EXISTS blocked_pubkeys (
            pubkey TEXT PRIMARY KEY, reason TEXT NOT NULL, created_at TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS archived_identities (
+           npub TEXT PRIMARY KEY,
+           keyring_account TEXT NOT NULL,
+           archived_at TEXT NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS upload_stats (
            file_id TEXT PRIMARY KEY,
            delivered INTEGER NOT NULL DEFAULT 0,
@@ -256,6 +261,16 @@ fn get_setting(connection: &Connection, key: &str) -> Result<String, String> {
         .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
             row.get(0)
         })
+        .map_err(|error| error.to_string())
+}
+
+fn set_setting(connection: &Connection, key: &str, value: &str) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )
+        .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
@@ -1059,7 +1074,11 @@ fn save_file_tags(
 }
 
 #[tauri::command]
-async fn export_identity_backup(path: String, passphrase: String) -> Result<(), String> {
+async fn export_identity_backup(
+    path: String,
+    passphrase: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     if passphrase.chars().count() < 8 {
         return Err("the passphrase needs at least 8 characters".into());
     }
@@ -1067,18 +1086,110 @@ async fn export_identity_backup(path: String, passphrase: String) -> Result<(), 
         tauri::async_runtime::spawn_blocking(move || network::export_identity(&passphrase))
             .await
             .map_err(|error| error.to_string())??;
-    fs::write(&path, format!("{ncryptsec}\n")).map_err(|error| error.to_string())
+    fs::write(&path, format!("{ncryptsec}\n")).map_err(|error| error.to_string())?;
+    // Remember which account is now recoverable, so a later restore can tell the user
+    // whether the key it is about to replace exists anywhere else.
+    if let Some(npub) = network::current_identity_npub() {
+        let connection = open_db(&state)?;
+        set_setting(&connection, "identity_backed_up_npub", &npub)?;
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestorePreview {
+    restored_npub: String,
+    current_npub: String,
+    current_backed_up: bool,
 }
 
 #[tauri::command]
-async fn inspect_identity_backup(path: String, passphrase: String) -> Result<String, String> {
+async fn inspect_identity_backup(
+    path: String,
+    passphrase: String,
+    state: State<'_, AppState>,
+) -> Result<RestorePreview, String> {
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     let ncryptsec = content.trim().to_string();
-    tauri::async_runtime::spawn_blocking(move || {
+    let restored_npub = tauri::async_runtime::spawn_blocking(move || {
         network::preview_identity_backup(&ncryptsec, &passphrase)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())??;
+    let current_npub = network::current_identity_npub().unwrap_or_default();
+    let connection = open_db(&state)?;
+    let backed_up = get_setting(&connection, "identity_backed_up_npub").unwrap_or_default();
+    Ok(RestorePreview {
+        current_backed_up: !current_npub.is_empty() && backed_up == current_npub,
+        restored_npub,
+        current_npub,
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchivedIdentity {
+    npub: String,
+    keyring_account: String,
+    archived_at: String,
+}
+
+fn record_archived_identity(connection: &Connection, npub: &str, slot: &str) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO archived_identities (npub, keyring_account, archived_at) VALUES (?1, ?2, ?3)",
+            params![npub, slot, Utc::now().to_rfc3339()],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Preserves whatever identity is active before it is overwritten. Called on every path that
+/// replaces the key, so replacement is a move rather than a deletion.
+fn preserve_current_identity(connection: &Connection) -> Result<(), String> {
+    if let Some((npub, slot)) = network::archive_current_identity()? {
+        record_archived_identity(connection, &npub, &slot)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn archived_identities(state: State<'_, AppState>) -> Result<Vec<ArchivedIdentity>, String> {
+    let connection = open_db(&state)?;
+    let mut statement = connection
+        .prepare("SELECT npub, keyring_account, archived_at FROM archived_identities ORDER BY archived_at DESC")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ArchivedIdentity {
+                npub: row.get(0)?,
+                keyring_account: row.get(1)?,
+                archived_at: row.get(2)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn adopt_archived_identity(
+    keyring_account: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let connection = open_db(&state)?;
+    preserve_current_identity(&connection)?;
+    drop(connection);
+    let npub = tauri::async_runtime::spawn_blocking(move || {
+        network::adopt_archived_identity(&keyring_account)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    state.network.stop().await;
+    state.network.clear_cached_identity().await;
+    let _ = state.network.restart().await;
+    Ok(npub)
 }
 
 #[tauri::command]
@@ -1089,6 +1200,9 @@ async fn import_identity_backup(
 ) -> Result<String, String> {
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     let ncryptsec = content.trim().to_string();
+    let connection = open_db(&state)?;
+    preserve_current_identity(&connection)?;
+    drop(connection);
     let npub = tauri::async_runtime::spawn_blocking(move || {
         network::import_identity(&ncryptsec, &passphrase)
     })
@@ -1434,6 +1548,8 @@ pub fn run() {
             export_identity_backup,
             inspect_identity_backup,
             import_identity_backup,
+            archived_identities,
+            adopt_archived_identity,
             open_napstr_folder,
             open_release_url,
             player::play_audio,
@@ -1605,6 +1721,54 @@ mod tests {
             get_setting(&connection, "profile_event_fingerprint").unwrap(),
             ""
         );
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn replaced_accounts_are_recorded_so_a_restore_can_be_undone() {
+        let directory = test_directory("archived-identity-test");
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+
+        record_archived_identity(&connection, "npub1replaced", "nostr-identity-archived-1").unwrap();
+        let (npub, slot): (String, String) = connection
+            .query_row(
+                "SELECT npub, keyring_account FROM archived_identities",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(npub, "npub1replaced");
+        assert_eq!(slot, "nostr-identity-archived-1");
+
+        // Archiving the same account twice must not create a second, duplicate row.
+        record_archived_identity(&connection, "npub1replaced", "nostr-identity-archived-2").unwrap();
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM archived_identities", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn only_the_exported_account_counts_as_backed_up() {
+        let directory = test_directory("backed-up-marker-test");
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+
+        // No export has happened, so nothing is recoverable from a file.
+        assert!(get_setting(&connection, "identity_backed_up_npub").unwrap_or_default() != "npub1current");
+
+        set_setting(&connection, "identity_backed_up_npub", "npub1current").unwrap();
+        assert_eq!(get_setting(&connection, "identity_backed_up_npub").unwrap(), "npub1current");
+        // A later account is not covered by the earlier account's backup file.
+        assert!(get_setting(&connection, "identity_backed_up_npub").unwrap() != "npub1rotated");
+
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }

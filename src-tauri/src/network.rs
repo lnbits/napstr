@@ -1541,6 +1541,62 @@ pub fn export_identity(passphrase: &str) -> Result<String, String> {
     encrypt_identity_backup(&keys, passphrase)
 }
 
+const KEYRING_SERVICE: &str = "social.napstr.desktop";
+
+/// Reads the identity already on this computer without creating one. `load_or_create_identity`
+/// would mint a key as a side effect, which would make "is there an account here?" a
+/// destructive question to ask.
+pub fn current_identity_npub() -> Option<String> {
+    let keys = if let Ok(nsec) = std::env::var("NAPSTR_NSEC") {
+        Keys::parse(&nsec).ok()?
+    } else {
+        let account = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref()).ok()?;
+        let secret = Entry::new(KEYRING_SERVICE, &account).ok()?.get_password().ok()?;
+        Keys::parse(&secret).ok()?
+    };
+    keys.public_key().to_bech32().ok()
+}
+
+/// Copies the identity currently in the keyring to a second, dated keyring entry so that
+/// replacing it is recoverable. Returns the archived account's npub and keyring slot, or
+/// `None` when there was no identity to preserve.
+pub fn archive_current_identity() -> Result<Option<(String, String)>, String> {
+    let base = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref())?;
+    let Ok(nsec) = Entry::new(KEYRING_SERVICE, &base)
+        .map_err(|error| error.to_string())?
+        .get_password()
+    else {
+        return Ok(None);
+    };
+    let keys = Keys::parse(&nsec).map_err(|error| error.to_string())?;
+    let npub = keys
+        .public_key()
+        .to_bech32()
+        .map_err(|error| error.to_string())?;
+    let slot = format!("{base}-archived-{}", Utc::now().timestamp());
+    Entry::new(KEYRING_SERVICE, &slot)
+        .map_err(|error| error.to_string())?
+        .set_password(&nsec)
+        .map_err(|error| {
+            format!("could not preserve the account being replaced in the operating-system keyring: {error}")
+        })?;
+    Ok(Some((npub, slot)))
+}
+
+/// Promotes a previously archived identity back to the active one. The caller archives the
+/// current identity first, so switching back and forth never destroys either side.
+pub fn adopt_archived_identity(slot: &str) -> Result<String, String> {
+    let nsec = Entry::new(KEYRING_SERVICE, slot)
+        .map_err(|error| error.to_string())?
+        .get_password()
+        .map_err(|_| "that archived account is no longer in the operating-system keyring".to_string())?;
+    let keys = Keys::parse(&nsec).map_err(|error| error.to_string())?;
+    store_identity(&keys)?;
+    keys.public_key()
+        .to_bech32()
+        .map_err(|error| error.to_string())
+}
+
 /// Decrypts a backup purely to report whose account it holds. Stores nothing, so
 /// the caller can name the account being replaced before anything is overwritten.
 pub fn preview_identity_backup(ncryptsec: &str, passphrase: &str) -> Result<String, String> {
@@ -1560,7 +1616,7 @@ pub fn import_identity(ncryptsec: &str, passphrase: &str) -> Result<String, Stri
 
 fn store_identity(keys: &Keys) -> Result<(), String> {
     let account = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref())?;
-    let entry = Entry::new("social.napstr.desktop", &account).map_err(|error| error.to_string())?;
+    let entry = Entry::new(KEYRING_SERVICE, &account).map_err(|error| error.to_string())?;
     let nsec = keys
         .secret_key()
         .to_bech32()
@@ -1575,7 +1631,7 @@ fn load_or_create_identity() -> Result<Keys, String> {
         return Keys::parse(&nsec).map_err(|error| error.to_string());
     }
     let account = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref())?;
-    let entry = Entry::new("social.napstr.desktop", &account).map_err(|error| error.to_string())?;
+    let entry = Entry::new(KEYRING_SERVICE, &account).map_err(|error| error.to_string())?;
     if let Ok(secret) = entry.get_password() {
         return Keys::parse(&secret).map_err(|error| error.to_string());
     }
