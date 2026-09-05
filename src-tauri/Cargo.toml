@@ -30,7 +30,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 tokio = { version = "1", features = ["full"] }
 tokio-socks = "0.5"
-nostr-sdk = { version = "0.44.1", features = ["nip44", "nip59"] }
+nostr-sdk = { version = "0.44.1", features = ["nip44", "nip49", "nip59"] }
 rand = "0.9"
 futures-util = "0.3"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
