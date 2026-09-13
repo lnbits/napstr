@@ -64,11 +64,9 @@ Profile edits are published when the profile changes.
 Relay selection is user-configurable. The reference defaults are:
 
 ```text
-wss://relay.damus.io
 wss://nos.lol
 wss://relay.nostr.com
 wss://relay.primal.net
-wss://relay.snort.social
 wss://nostr.mom
 wss://relay.nostr.band
 ```

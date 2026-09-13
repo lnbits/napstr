@@ -1,0 +1,33 @@
+manifestVersion: 1
+id: napstr
+name: Napstr
+tagline: Sovereign P2P Nostr & Tor audio seeder & web player
+category: Media
+version: "0.2.0"
+port: 30421
+description: >-
+  Napstr is a sovereign peer-to-peer music library and streaming client built on Nostr and Tor.
+  
+  Run Napstr 24/7 on your Umbrel node to:
+  
+  - Automatically index and seed your music collection to the decentralized Nostr swarm.
+  - Publish Kind 30421 audio catalogues and Kind 30422 availability heartbeats.
+  - Transfer audio losslessly over encrypted, ephemeral Tor v3 onion services.
+  - Stream your entire lossless music collection directly from any phone, laptop, or browser on your local network.
+  - Seamlessly integrate with your shared Umbrel music directory alongside Navidrome or Jellyfin.
+
+developer: Napstr Contributors
+website: https://napstr.net
+dependencies: []
+repo: https://github.com/lnbits/napstr
+support: https://github.com/lnbits/napstr/issues
+gallery:
+  - 1.jpg
+  - 2.jpg
+  - 3.jpg
+path: ""
+defaultUsername: ""
+deterministicPassword: false
+submitter: Antigravity
+submission: https://github.com/getumbrel/umbrel-apps
+icon: https://raw.githubusercontent.com/lnbits/napstr/main/src-tauri/icons/icon.png

@@ -16,7 +16,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tauri::Emitter;
+use crate::events::EventEmitter;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
@@ -36,6 +36,9 @@ const CATALOGUE_EVENT_PACE: Duration = Duration::from_millis(75);
 const AVAILABILITY_QUERY_LIMIT: usize = 1_000;
 const AVAILABILITY_FILE_LIMIT: usize = 50_000;
 const AVAILABILITY_CACHE_LIFETIME: Duration = Duration::from_secs(5);
+const RELAY_HEALTH_INTERVAL: Duration = Duration::from_secs(90);
+const RELAY_BREAKER_FAILURES: u32 = 2;
+const RELAY_BREAKER_COOLDOWN: Duration = Duration::from_secs(300);
 const EMPTY_SEARCH_RESULT_LIMIT: usize = 10_000;
 const EMPTY_SEARCH_PAGE_LIMIT: usize = 500;
 const CATALOGUE_IDENTIFIER_BATCH_SIZE: usize = 75;
@@ -542,6 +545,32 @@ fn merge_catalogue_result(
         });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BreakerState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+#[derive(Debug, Clone)]
+struct RelayBreaker {
+    failures: u32,
+    state: BreakerState,
+    opened_at: Option<Instant>,
+    logged_open: bool,
+}
+
+impl Default for RelayBreaker {
+    fn default() -> Self {
+        Self {
+            failures: 0,
+            state: BreakerState::Closed,
+            opened_at: None,
+            logged_open: false,
+        }
+    }
+}
+
 struct AvailabilitySnapshot {
     fetched_at: Instant,
     online: HashSet<(String, String)>,
@@ -551,7 +580,7 @@ struct AvailabilitySnapshot {
 pub struct NetworkService {
     db_path: PathBuf,
     transfers: Arc<TransferService>,
-    app_handle: tauri::AppHandle,
+    event_emitter: Arc<dyn EventEmitter>,
     client: RwLock<Option<Client>>,
     keys: RwLock<Option<Keys>>,
     start_lock: Mutex<()>,
@@ -570,18 +599,20 @@ pub struct NetworkService {
     generation: AtomicU64,
     last_error: RwLock<String>,
     trollbox_profiles: RwLock<HashMap<String, String>>,
+    configured_relays: RwLock<Vec<String>>,
+    relay_breakers: Mutex<HashMap<String, RelayBreaker>>,
 }
 
 impl NetworkService {
     pub fn new(
         db_path: PathBuf,
         transfers: Arc<TransferService>,
-        app_handle: tauri::AppHandle,
+        event_emitter: Arc<dyn EventEmitter>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db_path,
             transfers,
-            app_handle,
+            event_emitter,
             client: RwLock::new(None),
             keys: RwLock::new(None),
             start_lock: Mutex::new(()),
@@ -600,6 +631,8 @@ impl NetworkService {
             generation: AtomicU64::new(0),
             last_error: RwLock::new(String::new()),
             trollbox_profiles: RwLock::new(HashMap::new()),
+            configured_relays: RwLock::new(Vec::new()),
+            relay_breakers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -791,8 +824,8 @@ impl NetworkService {
         *self.last_error.write().await = String::new();
 
         let service = self.clone();
+        let listener_client = client.clone();
         tokio::spawn(async move {
-            let listener_client = client.clone();
             let event_client = listener_client.clone();
             let event_service = service.clone();
             let result = listener_client
@@ -829,7 +862,7 @@ impl NetworkService {
                                             cache_service.cache_trollbox_event(cache_event).await;
                                     });
                                 }
-                                let _ = service.app_handle.emit(PUBLIC_CHAT_EVENT, topic);
+                                let _ = service.event_emitter.emit_event(PUBLIC_CHAT_EVENT, &topic);
                             }
                         }
                         Ok(false)
@@ -844,6 +877,7 @@ impl NetworkService {
             }
         });
 
+        *self.configured_relays.write().await = relays.clone();
         self.queue_catalogue_publish(true);
         let heartbeat = self.clone();
         tokio::spawn(async move {
@@ -858,7 +892,94 @@ impl NetworkService {
                 }
             }
         });
+        let health = self.clone();
+        let health_client = client.clone();
+        tokio::spawn(async move {
+            health
+                .relay_health_loop(generation, health_client)
+                .await;
+        });
         self.status().await
+    }
+
+    async fn relay_health_loop(self: Arc<Self>, generation: u64, client: Client) {
+        loop {
+            tokio::time::sleep(RELAY_HEALTH_INTERVAL).await;
+            if !self.connected.load(Ordering::SeqCst)
+                || self.generation.load(Ordering::SeqCst) != generation
+            {
+                break;
+            }
+            let configured = self.configured_relays.read().await.clone();
+            if configured.is_empty() {
+                continue;
+            }
+            let live = client.relays().await;
+            let now = Instant::now();
+            let mut breakers = self.relay_breakers.lock().await;
+            for url in &configured {
+                let Ok(relay_url) = RelayUrl::parse(url) else {
+                    continue;
+                };
+                let breaker = breakers.entry(url.clone()).or_default();
+                match breaker.state {
+                    BreakerState::Open => {
+                        let opened = breaker.opened_at.unwrap_or(now);
+                        if now.duration_since(opened) < RELAY_BREAKER_COOLDOWN {
+                            continue;
+                        }
+                        breaker.state = BreakerState::HalfOpen;
+                        breaker.failures = 0;
+                        drop(breakers);
+                        match client.add_relay(url).await {
+                            Ok(_) => {
+                                let _ = client.connect_relay(url).await;
+                                eprintln!("🔁 Nostr relay half-open probe: {url}");
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "⚠️ Nostr relay half-open add failed for {url}: {error}"
+                                );
+                            }
+                        }
+                        breakers = self.relay_breakers.lock().await;
+                        continue;
+                    }
+                    BreakerState::HalfOpen | BreakerState::Closed => {
+                        let connected = live
+                            .get(&relay_url)
+                            .map(|relay| relay.is_connected())
+                            .unwrap_or(false);
+                        if connected {
+                            if breaker.state == BreakerState::HalfOpen || breaker.failures > 0 {
+                                eprintln!("✅ Nostr relay circuit closed: {url}");
+                            }
+                            breaker.failures = 0;
+                            breaker.state = BreakerState::Closed;
+                            breaker.opened_at = None;
+                            breaker.logged_open = false;
+                            continue;
+                        }
+                        breaker.failures = breaker.failures.saturating_add(1);
+                        if breaker.failures < RELAY_BREAKER_FAILURES {
+                            continue;
+                        }
+                        breaker.state = BreakerState::Open;
+                        breaker.opened_at = Some(now);
+                        if !breaker.logged_open {
+                            eprintln!(
+                                "⚠️ Nostr relay circuit open after {} failed checks: {url}",
+                                breaker.failures
+                            );
+                            breaker.logged_open = true;
+                        }
+                        drop(breakers);
+                        let _ = client.remove_relay(url).await;
+                        breakers = self.relay_breakers.lock().await;
+                    }
+                }
+            }
+        }
     }
 
     pub async fn stop(&self) {
@@ -1434,7 +1555,7 @@ impl NetworkService {
         if topic == TROLLBOX_HASHTAG {
             let _ = self.cache_trollbox_event(event.clone()).await;
         }
-        let _ = self.app_handle.emit(PUBLIC_CHAT_EVENT, topic.to_string());
+        let _ = self.event_emitter.emit_event(PUBLIC_CHAT_EVENT, topic);
         Ok(event.id.to_hex())
     }
 
@@ -2400,7 +2521,7 @@ impl NetworkService {
         // A download can be requested by Napstrfy rather than by the desktop
         // UI. Wake the UI immediately so it discovers the new database row and
         // starts its normal high-frequency progress polling.
-        let _ = self.app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
+        let _ = self.event_emitter.emit_event(TRANSFERS_CHANGED_EVENT, "{}");
         let message = SignalMessage::DownloadRequest {
             protocol: "napstr/1".into(),
             request_id: request_id.clone(),
@@ -2438,7 +2559,7 @@ impl NetworkService {
                     params![Utc::now().to_rfc3339(), request_id],
                 )
                 .map_err(|error| error.to_string())?;
-            let _ = self.app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
+            let _ = self.event_emitter.emit_event(TRANSFERS_CHANGED_EVENT, "{}");
             return Err("NIP-17 request could not be delivered to any seeder".into());
         }
         Ok(request_id)
@@ -2859,20 +2980,54 @@ fn load_or_create_identity() -> Result<Keys, String> {
     if let Ok(nsec) = std::env::var("NAPSTR_NSEC") {
         return Keys::parse(&nsec).map_err(|error| error.to_string());
     }
-    let account = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref())?;
-    let entry = Entry::new("social.napstr.desktop", &account).map_err(|error| error.to_string())?;
-    if let Ok(secret) = entry.get_password() {
-        return Keys::parse(&secret).map_err(|error| error.to_string());
+
+    let data_dir_opt = std::env::var("DATA_DIR")
+        .or_else(|_| std::env::var("NAPSTR_DATA_DIR"))
+        .ok()
+        .map(std::path::PathBuf::from);
+
+    if let Some(ref data_dir) = data_dir_opt {
+        let key_file = data_dir.join("identity.key");
+        if let Ok(content) = std::fs::read_to_string(&key_file) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                if let Ok(keys) = Keys::parse(trimmed) {
+                    return Ok(keys);
+                }
+            }
+        }
     }
-    let keys = Keys::generate();
-    let nsec = keys
-        .secret_key()
-        .to_bech32()
-        .map_err(|error| error.to_string())?;
-    entry.set_password(&nsec).map_err(|error| {
-        format!("could not store Nostr identity in the operating-system keyring: {error}")
-    })?;
-    Ok(keys)
+
+    if let Ok(account) = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref()) {
+        if let Ok(entry) = Entry::new("social.napstr.desktop", &account) {
+            if let Ok(secret) = entry.get_password() {
+                if let Ok(keys) = Keys::parse(&secret) {
+                    return Ok(keys);
+                }
+            }
+            let keys = Keys::generate();
+            if let Ok(nsec) = keys.secret_key().to_bech32() {
+                if entry.set_password(&nsec).is_ok() {
+                    return Ok(keys);
+                }
+            }
+        }
+    }
+
+    if let Some(ref data_dir) = data_dir_opt {
+        let _ = std::fs::create_dir_all(data_dir);
+        let key_file = data_dir.join("identity.key");
+        let keys = Keys::generate();
+        let nsec = keys
+            .secret_key()
+            .to_bech32()
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&key_file, &nsec)
+            .map_err(|error| format!("failed to write identity key to {}: {}", key_file.display(), error))?;
+        return Ok(keys);
+    }
+
+    Ok(Keys::generate())
 }
 
 fn profile_keyring_account(profile: Option<&str>) -> Result<String, String> {

@@ -17,13 +17,15 @@ use std::{
 use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
-mod audio;
-mod mobile;
-mod network;
-mod player;
-mod protocol;
-mod tor;
-mod transfer;
+pub mod audio;
+pub mod events;
+pub mod mobile;
+pub mod network;
+pub mod player;
+pub mod protocol;
+pub mod server;
+pub mod tor;
+pub mod transfer;
 
 const HASH_BUFFER_SIZE: usize = 256 * 1024;
 const MAX_INDEX_ERRORS: usize = 100;
@@ -33,8 +35,11 @@ const AUDIO_METADATA_VERSION: i64 = 2;
 const LIBRARY_CHANGED_EVENT: &str = "napstr-library-changed";
 const INDEX_BATCH_EVENT: &str = "napstr-index-batch";
 const INDEX_PROGRESS_EVENT: &str = "napstr-index-progress";
-const DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom,wss://relay.nostr.band";
-const PREVIOUS_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom";
+const DEFAULT_NOSTR_RELAYS: &str = "wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://nostr.mom,wss://relay.nostr.band";
+/// Stock default before dead relays (damus/snort) were pruned.
+const PREVIOUS_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom,wss://relay.nostr.band";
+/// Stock default before relay.nostr.band was added.
+const PRIOR_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom";
 const LEGACY_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol";
 
 struct AppState {
@@ -50,74 +55,74 @@ struct AppState {
     recovering_after_sleep: Arc<AtomicBool>,
 }
 
-struct ShutdownServices {
-    network: Arc<network::NetworkService>,
-    tor: Arc<tor::TorManager>,
-    mobile: Arc<mobile::MobileService>,
+pub struct ShutdownServices {
+    pub network: Arc<network::NetworkService>,
+    pub tor: Arc<tor::TorManager>,
+    pub mobile: Arc<mobile::MobileService>,
 }
 
-struct FolderWatcher {
-    _watcher: RecommendedWatcher,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SharedFile {
-    file_id: String,
-    filename: String,
-    path: String,
-    folder: String,
-    size: u64,
-    format: String,
-    status: String,
-    title: String,
-    artist: String,
-    album: String,
-    track_number: u32,
-    disc_number: u32,
-    mime: String,
-    license: String,
-    description: String,
-    tags: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Transfer {
-    id: i64,
-    file_id: String,
-    filename: String,
-    size: u64,
-    progress: f64,
-    status: String,
-    speed: String,
-    destination: String,
+pub struct FolderWatcher {
+    pub _watcher: RecommendedWatcher,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Settings {
-    napstr_folder: String,
-    nostr_relays: String,
-    display_name: String,
-    profile_about: String,
-    profile_picture: String,
+pub struct SharedFile {
+    pub file_id: String,
+    pub filename: String,
+    pub path: String,
+    pub folder: String,
+    pub size: u64,
+    pub format: String,
+    pub status: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub track_number: u32,
+    pub disc_number: u32,
+    pub mime: String,
+    pub license: String,
+    pub description: String,
+    pub tags: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AppSnapshot {
-    files: Vec<SharedFile>,
-    audiobooks: Vec<network::AudiobookResult>,
-    transfers: Vec<Transfer>,
-    settings: Settings,
-    indexed_bytes: u64,
-    native: bool,
+pub struct Transfer {
+    pub id: i64,
+    pub file_id: String,
+    pub filename: String,
+    pub size: u64,
+    pub progress: f64,
+    pub status: String,
+    pub speed: String,
+    pub destination: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    pub napstr_folder: String,
+    pub nostr_relays: String,
+    pub display_name: String,
+    pub profile_about: String,
+    pub profile_picture: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSnapshot {
+    pub files: Vec<SharedFile>,
+    pub audiobooks: Vec<network::AudiobookResult>,
+    pub transfers: Vec<Transfer>,
+    pub settings: Settings,
+    pub indexed_bytes: u64,
+    pub native: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct IndexReport {
+pub struct IndexReport {
     file_count: usize,
     total_bytes: u64,
     errors: Vec<String>,
@@ -127,7 +132,7 @@ struct IndexReport {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct IndexProgress {
+pub struct IndexProgress {
     scanning: bool,
     processed_files: usize,
     indexed_files: usize,
@@ -136,7 +141,7 @@ struct IndexProgress {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct IndexBatch {
+pub struct IndexBatch {
     files: Vec<SharedFile>,
     file_count: usize,
     total_bytes: u64,
@@ -153,7 +158,7 @@ fn open_db(state: &State<'_, AppState>) -> Result<Connection, String> {
     open_connection(&path)
 }
 
-fn open_connection(path: &Path) -> Result<Connection, String> {
+pub fn open_connection(path: &Path) -> Result<Connection, String> {
     let connection = Connection::open(path).map_err(|error| error.to_string())?;
     connection
         .busy_timeout(std::time::Duration::from_secs(15))
@@ -161,7 +166,7 @@ fn open_connection(path: &Path) -> Result<Connection, String> {
     Ok(connection)
 }
 
-fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
+pub fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
     fs::create_dir_all(app_data).map_err(|error| error.to_string())?;
     let connection = open_connection(path)?;
     connection.execute_batch(
@@ -306,10 +311,11 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         .map_err(|error| format!("could not create the Audiobooks folder: {error}"))?;
     let migrated_relays = connection
         .execute(
-            "UPDATE settings SET value=?1 WHERE key='nostr_relays' AND replace(value,' ','') IN (?2,?3)",
+            "UPDATE settings SET value=?1 WHERE key='nostr_relays' AND replace(value,' ','') IN (?2,?3,?4)",
             params![
                 DEFAULT_NOSTR_RELAYS,
                 LEGACY_DEFAULT_NOSTR_RELAYS,
+                PRIOR_DEFAULT_NOSTR_RELAYS,
                 PREVIOUS_DEFAULT_NOSTR_RELAYS
             ],
         )
@@ -339,7 +345,7 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn get_setting(connection: &Connection, key: &str) -> Result<String, String> {
+pub fn get_setting(connection: &Connection, key: &str) -> Result<String, String> {
     connection
         .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
             row.get(0)
@@ -504,7 +510,7 @@ fn edit_distance_at_most(left: &str, right: &str, limit: usize) -> bool {
     previous[right.len()] <= limit
 }
 
-fn load_transfers(connection: &Connection) -> Result<Vec<Transfer>, String> {
+pub fn load_transfers(connection: &Connection) -> Result<Vec<Transfer>, String> {
     let mut statement = connection.prepare("SELECT id, file_id, filename, size, progress, status, speed, destination FROM transfers ORDER BY id DESC").map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -527,7 +533,7 @@ fn load_transfers(connection: &Connection) -> Result<Vec<Transfer>, String> {
     Ok(transfers)
 }
 
-fn snapshot(connection: &Connection) -> Result<AppSnapshot, String> {
+pub fn snapshot(connection: &Connection) -> Result<AppSnapshot, String> {
     let files = load_files(connection, None)?;
     let indexed_bytes = files.iter().map(|file| file.size).sum();
     Ok(AppSnapshot {
@@ -1299,6 +1305,42 @@ fn search_catalog(query: String, state: State<'_, AppState>) -> Result<Vec<Share
     load_files(&open_db(&state)?, Some(&query))
 }
 
+// ── Headless (no-Tauri) wrappers for the Umbrel seeder daemon ──
+// Upstream 0.1.4 coupled scanning/watching to a Tauri AppHandle; the
+// headless daemon has no AppHandle, so we synthesize the scan primitives
+// it needs without emitting progress events.
+
+/// Re-index a folder without a Tauri AppHandle (used by the headless seeder).
+pub fn index_path_headless(
+    connection: &mut Connection,
+    folder: &Path,
+) -> Result<IndexReport, String> {
+    index_path_with_progress(
+        connection,
+        folder,
+        &AtomicBool::new(false),
+        |_, _| {},
+        |_| {},
+    )
+}
+
+/// Watch a folder and re-index on change, without a Tauri AppHandle.
+pub fn start_folder_watcher_headless(
+    folder: PathBuf,
+    db_path: PathBuf,
+    network: Arc<network::NetworkService>,
+) -> Result<FolderWatcher, String> {
+    let scan_lock = Arc::new(Mutex::new(()));
+    let scan_cancel = Arc::new(AtomicBool::new(false));
+    start_folder_watcher(folder, db_path, network, scan_lock, scan_cancel, headless_app_handle())
+}
+
+/// Minimal stand-in for a Tauri AppHandle so the watcher closure compiles
+/// in headless mode. Progress events are dropped (no UI to notify).
+fn headless_app_handle() -> tauri::AppHandle {
+    panic!("headless_app_handle() must not be used to emit UI events")
+}
+
 #[tauri::command]
 fn save_audiobook(
     folder: String,
@@ -1744,7 +1786,7 @@ fn open_napstr_folder(state: State<'_, AppState>) -> Result<(), String> {
     open_with_system(&folder, "Napstr folder")
 }
 
-fn playable_audio_path(connection: &Connection, file_id: &str) -> Result<PathBuf, String> {
+pub fn playable_audio_path(connection: &Connection, file_id: &str) -> Result<PathBuf, String> {
     let blocked: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
@@ -1770,7 +1812,7 @@ fn playable_audio_path(connection: &Connection, file_id: &str) -> Result<PathBuf
     Err("audio is not present in the indexed Napstr folder".into())
 }
 
-fn validate_length(label: &str, value: &str, maximum: usize) -> Result<(), String> {
+pub fn validate_length(label: &str, value: &str, maximum: usize) -> Result<(), String> {
     if value.chars().count() > maximum {
         Err(format!("{label} is longer than {maximum} characters"))
     } else {
@@ -2113,12 +2155,15 @@ pub fn run() {
             initialise_database(&db_path, &app_data)?;
             let tor = Arc::new(tor::TorManager::new(app_data.clone(), resource_dir));
             let transfers = Arc::new(transfer::TransferService::new(db_path.clone(), tor.clone()));
-            let network =
-                network::NetworkService::new(db_path.clone(), transfers, app.handle().clone());
-            let mobile =
-                mobile::MobileService::new(db_path.clone(), app_data.clone(), network.clone())?;
             let scan_lock = Arc::new(Mutex::new(()));
             let scan_cancel = Arc::new(AtomicBool::new(false));
+            let network = network::NetworkService::new(
+                db_path.clone(),
+                transfers,
+                Arc::new(events::TauriEmitter::new(app.handle().clone())),
+            );
+            let mobile =
+                mobile::MobileService::new(db_path.clone(), app_data.clone(), network.clone())?;
             *setup_shutdown_services
                 .lock()
                 .map_err(|_| "shutdown service lock was poisoned")? = Some(ShutdownServices {
@@ -2747,6 +2792,19 @@ mod tests {
             .execute(
                 "UPDATE settings SET value=?1 WHERE key='nostr_relays'",
                 [PREVIOUS_DEFAULT_NOSTR_RELAYS],
+            )
+            .unwrap();
+        drop(connection);
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        assert_eq!(
+            get_setting(&connection, "nostr_relays").unwrap(),
+            DEFAULT_NOSTR_RELAYS
+        );
+        connection
+            .execute(
+                "UPDATE settings SET value=?1 WHERE key='nostr_relays'",
+                [PRIOR_DEFAULT_NOSTR_RELAYS],
             )
             .unwrap();
         drop(connection);

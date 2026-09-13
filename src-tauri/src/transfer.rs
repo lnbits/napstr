@@ -210,6 +210,7 @@ pub struct TransferService {
     session_onion: Mutex<Option<Arc<OnionLease>>>,
     active: Arc<Mutex<HashMap<String, Arc<DownloadCoordinator>>>>,
     globally_paused: AtomicBool,
+    persistent_onion: bool,
 }
 
 struct DownloadCoordinator {
@@ -237,6 +238,15 @@ impl DownloadCoordinator {
 
 impl TransferService {
     pub fn new(db_path: PathBuf, tor: Arc<TorManager>) -> Self {
+        Self::new_with_onion_mode(db_path, tor, false)
+    }
+
+    /// Daemon / always-on seeder: persist the session onion across restarts.
+    pub fn new_persistent(db_path: PathBuf, tor: Arc<TorManager>) -> Self {
+        Self::new_with_onion_mode(db_path, tor, true)
+    }
+
+    fn new_with_onion_mode(db_path: PathBuf, tor: Arc<TorManager>, persistent_onion: bool) -> Self {
         Self {
             db_path,
             tor,
@@ -245,6 +255,15 @@ impl TransferService {
             session_onion: Mutex::new(None),
             active: Arc::new(Mutex::new(HashMap::new())),
             globally_paused: AtomicBool::new(false),
+            persistent_onion,
+        }
+    }
+
+    async fn obtain_session_onion(&self, port: u16) -> Result<Arc<OnionLease>, String> {
+        if self.persistent_onion {
+            self.tor.create_onion_persistent(port).await
+        } else {
+            self.tor.create_onion(port).await
         }
     }
 
@@ -256,7 +275,7 @@ impl TransferService {
         let port = self.ensure_listener().await?;
         let mut session_onion = self.session_onion.lock().await;
         if session_onion.is_none() {
-            *session_onion = Some(self.tor.create_onion(port).await?);
+            *session_onion = Some(self.obtain_session_onion(port).await?);
         }
         Ok(())
     }
@@ -312,7 +331,7 @@ impl TransferService {
         let onion_lease = {
             let mut session_onion = self.session_onion.lock().await;
             if session_onion.is_none() {
-                *session_onion = Some(self.tor.create_onion(port).await?);
+                *session_onion = Some(self.obtain_session_onion(port).await?);
             }
             session_onion
                 .as_ref()

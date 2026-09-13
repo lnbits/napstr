@@ -276,7 +276,31 @@ impl TorManager {
         }
     }
 
+    fn seeder_onion_key_path(&self) -> PathBuf {
+        self.app_data.join("onion").join("seeder.v3.key")
+    }
+
+    /// Ephemeral onion for desktop sessions (`DiscardPK`).
     pub async fn create_onion(&self, target_port: u16) -> Result<Arc<OnionLease>, String> {
+        self.create_onion_inner(target_port, false).await
+    }
+
+    /// Persistent onion for always-on daemon seeders.
+    ///
+    /// Stores the ED25519-V3 private key under `{app_data}/onion/seeder.v3.key`
+    /// so restarts advertise the same `.onion`.
+    pub async fn create_onion_persistent(
+        &self,
+        target_port: u16,
+    ) -> Result<Arc<OnionLease>, String> {
+        self.create_onion_inner(target_port, true).await
+    }
+
+    async fn create_onion_inner(
+        &self,
+        target_port: u16,
+        persistent: bool,
+    ) -> Result<Arc<OnionLease>, String> {
         self.start().await?;
         let (control_port, cookie) = {
             let guard = self.runtime.lock().await;
@@ -291,11 +315,70 @@ impl TorManager {
             &format!("AUTHENTICATE {}", hex::encode(cookie)),
         )
         .await?;
-        let response = control_command(
-            &mut stream,
-            &format!("ADD_ONION NEW:BEST Flags=DiscardPK Port=80,127.0.0.1:{target_port}"),
-        )
-        .await?;
+
+        let response = if persistent {
+            let key_path = self.seeder_onion_key_path();
+            if let Ok(existing) = fs::read_to_string(&key_path).await {
+                let key = existing.trim();
+                if key.is_empty() {
+                    return Err("persistent onion key file is empty".into());
+                }
+                control_command(
+                    &mut stream,
+                    &format!(
+                        "ADD_ONION ED25519-V3:{key} Port=80,127.0.0.1:{target_port}"
+                    ),
+                )
+                .await?
+            } else {
+                let created = control_command(
+                    &mut stream,
+                    &format!("ADD_ONION NEW:BEST Port=80,127.0.0.1:{target_port}"),
+                )
+                .await?;
+                let private_key = created
+                    .iter()
+                    .find_map(|line| line.strip_prefix("250-PrivateKey="))
+                    .ok_or("Tor did not return a PrivateKey for persistent onion")?
+                    .to_string();
+                // Tor returns `ED25519-V3:<blob>`; store only the blob for reload.
+                let blob = private_key
+                    .strip_prefix("ED25519-V3:")
+                    .unwrap_or(private_key.as_str())
+                    .trim()
+                    .to_string();
+                if let Some(parent) = key_path.parent() {
+                    fs::create_dir_all(parent)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                fs::write(&key_path, format!("{blob}\n"))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = fs::metadata(&key_path)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .permissions();
+                    perms.set_mode(0o600);
+                    fs::set_permissions(&key_path, perms)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                created
+            }
+        } else {
+            control_command(
+                &mut stream,
+                &format!(
+                    "ADD_ONION NEW:BEST Flags=DiscardPK Port=80,127.0.0.1:{target_port}"
+                ),
+            )
+            .await?
+        };
+
         let service_id = response
             .iter()
             .find_map(|line| line.strip_prefix("250-ServiceID="))
