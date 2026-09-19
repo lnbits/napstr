@@ -1,6 +1,40 @@
 import { test, expect } from '@playwright/test';
 import { mockNative } from './helpers/native.mjs';
 
+test('Napstr compact player keeps only playback controls visible and restores the full window', async ({ page }) => {
+  await mockNative(page, { app: 'napstr', saved: 'en' });
+  await page.goto('http://127.0.0.1:15173');
+  await expect(page.locator('.search-button')).toBeEnabled();
+
+  await page.locator('.compact-toggle').click();
+  await expect(page.locator('.app-window')).toHaveClass(/compact/);
+  await expect(page.locator('.player-bar')).toBeVisible();
+  await expect(page.locator('.resize-e')).toBeVisible();
+  await expect(page.locator('.resize-w')).toBeVisible();
+  await expect(page.locator('.resize-se')).toBeVisible();
+  await expect(page.locator('.resize-n')).toBeHidden();
+  await expect(page.locator('.resize-s')).toBeHidden();
+  await expect(page.locator('.toolbar')).toBeHidden();
+  await expect(page.locator('.network-strip')).toBeHidden();
+  await expect(page.locator('.workspace')).toBeHidden();
+  await expect(page.locator('.transfer-dock')).toBeHidden();
+  await expect(page.locator('.statusbar')).toBeHidden();
+  await expect.poll(() => page.evaluate(() => window.calls.some(({ cmd, args }) => cmd === 'set_compact_mode' && args.compact === true))).toBe(true);
+
+  for (const width of [1180, 850, 650, 560]) {
+    await page.setViewportSize({ width, height: 84 });
+    const playerFits = await page.locator('.player-bar').evaluate((node) =>
+      node.scrollWidth <= node.clientWidth + 2 && node.getBoundingClientRect().right <= innerWidth + 1
+    );
+    expect(playerFits, `compact player fits at ${width}px`).toBe(true);
+  }
+
+  await page.locator('.compact-toggle').click();
+  await expect(page.locator('.app-window')).not.toHaveClass(/compact/);
+  await expect(page.locator('.toolbar')).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.calls.some(({ cmd, args }) => cmd === 'set_compact_mode' && args.compact === false))).toBe(true);
+});
+
 for (const language of ['en', 'fr', 'ar']) {
   test(`Napstr layout: compact panels and transfers remain usable in ${language}`, async ({ page }) => {
     test.setTimeout(90_000);
