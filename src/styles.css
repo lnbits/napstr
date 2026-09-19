@@ -40,6 +40,14 @@ button { color: #111; }
   grid-template-rows: 25px 70px 22px 55px minmax(120px, 1fr) var(--transfer-height, 119px) 23px;
   position: relative;
 }
+.app-window.compact { height: 84px; max-height: 84px; grid-template-rows: 25px 55px; }
+.app-window.compact .toolbar,
+.app-window.compact .network-strip,
+.app-window.compact .workspace,
+.app-window.compact .transfer-dock,
+.app-window.compact .statusbar { display: none; }
+.app-window.compact .resize-n,
+.app-window.compact .resize-s { display: none; }
 
 .window-resize-handle { position: fixed; z-index: 20; display: block; min-width: 0; min-height: 0; margin: 0; padding: 0; border: 0; outline: 0; background: transparent; }
 .resize-n { top: 0; left: 8px; right: 8px; height: 5px; cursor: n-resize; }
@@ -64,15 +72,18 @@ button { color: #111; }
   font-weight: 700;
   letter-spacing: .2px;
 }
-.title-left { display: flex; align-items: center; gap: 6px; }
+.title-left { min-width: 0; display: flex; align-items: center; gap: 6px; }
+.title-left > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .app-icon { width: 16px; height: 16px; display: block; overflow: hidden; background: var(--face); border: 1px solid; border-color: white #404040 #404040 white; }
 .app-icon img { display: block; width: auto; max-width: none; height: 14px; filter: drop-shadow(1px 1px 0 #555); }
+.title-actions { display: flex; gap: 2px; }
 .window-controls { display: flex; gap: 2px; }
-.window-controls button, .dock-title button, .tiny-button {
+.compact-toggle, .window-controls button, .dock-title button, .tiny-button {
   min-width: 18px; height: 18px; padding: 0 3px; line-height: 13px; font-weight: bold;
   background: var(--face); border: 2px solid; border-color: var(--light) #333 #333 var(--light);
 }
-.window-controls button:active, .dock-title button:active, .classic-button:active, .tool-button:active { border-color: #333 var(--light) var(--light) #333; padding-top: 1px; padding-left: 1px; }
+.compact-toggle:active:not(:disabled), .window-controls button:active, .dock-title button:active, .classic-button:active, .tool-button:active { border-color: #333 var(--light) var(--light) #333; padding-top: 1px; padding-left: 1px; }
+.compact-toggle:disabled { color: #777; }
 
 .toolbar { display: flex; align-items: stretch; gap: 2px; padding: 5px 6px 4px; border-top: 1px solid white; border-bottom: 1px solid #777; }
 .toolbar-brand { width: 190px; margin: 1px 2px 1px 0; padding: 3px 7px; display: flex; align-items: center; overflow: hidden; background: transparent; border: 1px solid transparent; box-shadow: none; }
