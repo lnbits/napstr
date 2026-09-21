@@ -13,23 +13,37 @@ pub struct NativePlayer {
     stream_error: Arc<Mutex<Option<String>>>,
 }
 
-#[derive(Default)]
 struct NativePlayerState {
     output: Option<MixerDeviceSink>,
     player: Option<Player>,
     file_id: Option<String>,
     duration: f64,
+    volume: f32,
+}
+
+impl Default for NativePlayerState {
+    fn default() -> Self {
+        Self {
+            output: None,
+            player: None,
+            file_id: None,
+            duration: 0.0,
+            // Silence is never the volume anyone meant to leave it at.
+            volume: 1.0,
+        }
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackStatus {
-    file_id: String,
-    current_time: f64,
-    duration: f64,
-    playing: bool,
-    ended: bool,
-    error: String,
+    pub file_id: String,
+    pub current_time: f64,
+    pub duration: f64,
+    pub playing: bool,
+    pub ended: bool,
+    pub error: String,
+    pub volume: f32,
 }
 
 impl Default for NativePlayer {
@@ -72,6 +86,7 @@ impl NativePlayer {
                     .unwrap_or(false),
             ended,
             error,
+            volume: native.volume,
         }
     }
 
@@ -167,7 +182,92 @@ impl NativePlayer {
         native.player = Some(player);
         native.file_id = Some(file_id);
         native.duration = duration;
+        native.volume = volume.clamp(0.0, 1.0);
         Ok(self.status_for(&native))
+    }
+
+    /// The current state, without side effects, for callers that only report it.
+    pub fn status(&self) -> Result<PlaybackStatus, String> {
+        let native = self
+            .inner
+            .lock()
+            .map_err(|_| "audio player lock poisoned")?;
+        Ok(self.status_for(&native))
+    }
+
+    /// Pause when playing, resume when paused: what a single button means.
+    ///
+    /// An error when nothing is loaded, which is what a phone pressing play on
+    /// an idle computer has to be told rather than left guessing.
+    pub fn toggle(&self) -> Result<PlaybackStatus, String> {
+        let native = self
+            .inner
+            .lock()
+            .map_err(|_| "audio player lock poisoned")?;
+        let player = native
+            .player
+            .as_ref()
+            .ok_or_else(|| "no track is loaded".to_string())?;
+        if player.is_paused() {
+            player.play();
+        } else {
+            player.pause();
+        }
+        Ok(self.status_for(&native))
+    }
+
+    pub fn stop_playback(&self) -> Result<PlaybackStatus, String> {
+        let mut native = self
+            .inner
+            .lock()
+            .map_err(|_| "audio player lock poisoned")?;
+        if let Some(player) = native.player.take() {
+            player.stop();
+        }
+        native.output.take();
+        Ok(self.status_for(&native))
+    }
+
+    pub fn seek(&self, seconds: f64) -> Result<PlaybackStatus, String> {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err("invalid playback position".into());
+        }
+        let native = self
+            .inner
+            .lock()
+            .map_err(|_| "audio player lock poisoned")?;
+        let player = native
+            .player
+            .as_ref()
+            .ok_or_else(|| "no track is loaded".to_string())?;
+        player
+            .try_seek(Duration::from_secs_f64(seconds.min(native.duration)))
+            .map_err(|error| format!("could not seek in this track: {error}"))?;
+        Ok(self.status_for(&native))
+    }
+
+    pub fn set_volume(&self, volume: f32) -> Result<PlaybackStatus, String> {
+        if !volume.is_finite() {
+            return Err("invalid playback volume".into());
+        }
+        let mut native = self
+            .inner
+            .lock()
+            .map_err(|_| "audio player lock poisoned")?;
+        let volume = volume.clamp(0.0, 1.0);
+        if let Some(player) = native.player.as_ref() {
+            player.set_volume(volume);
+        }
+        native.volume = volume;
+        Ok(self.status_for(&native))
+    }
+
+    /// The file the desktop last loaded, so a phone can name what it is showing.
+    pub fn file_id(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|native| native.file_id.clone())
     }
 
     pub fn reset_after_sleep(&self) {
@@ -208,71 +308,22 @@ pub async fn play_audio(
 
 #[tauri::command]
 pub fn toggle_audio(state: State<'_, AppState>) -> Result<PlaybackStatus, String> {
-    let native = state
-        .player
-        .inner
-        .lock()
-        .map_err(|_| "audio player lock poisoned")?;
-    let player = native
-        .player
-        .as_ref()
-        .ok_or_else(|| "no track is loaded".to_string())?;
-    if player.is_paused() {
-        player.play();
-    } else {
-        player.pause();
-    }
-    Ok(state.player.status_for(&native))
+    state.player.toggle()
 }
 
 #[tauri::command]
 pub fn stop_audio(state: State<'_, AppState>) -> Result<PlaybackStatus, String> {
-    let mut native = state
-        .player
-        .inner
-        .lock()
-        .map_err(|_| "audio player lock poisoned")?;
-    if let Some(player) = native.player.take() {
-        player.stop();
-    }
-    native.output.take();
-    Ok(state.player.status_for(&native))
+    state.player.stop_playback()
 }
 
 #[tauri::command]
 pub fn seek_audio(seconds: f64, state: State<'_, AppState>) -> Result<PlaybackStatus, String> {
-    if !seconds.is_finite() || seconds < 0.0 {
-        return Err("invalid playback position".into());
-    }
-    let native = state
-        .player
-        .inner
-        .lock()
-        .map_err(|_| "audio player lock poisoned")?;
-    let player = native
-        .player
-        .as_ref()
-        .ok_or_else(|| "no track is loaded".to_string())?;
-    player
-        .try_seek(Duration::from_secs_f64(seconds.min(native.duration)))
-        .map_err(|error| format!("could not seek in this track: {error}"))?;
-    Ok(state.player.status_for(&native))
+    state.player.seek(seconds)
 }
 
 #[tauri::command]
 pub fn set_audio_volume(volume: f32, state: State<'_, AppState>) -> Result<PlaybackStatus, String> {
-    if !volume.is_finite() {
-        return Err("invalid playback volume".into());
-    }
-    let native = state
-        .player
-        .inner
-        .lock()
-        .map_err(|_| "audio player lock poisoned")?;
-    if let Some(player) = native.player.as_ref() {
-        player.set_volume(volume.clamp(0.0, 1.0));
-    }
-    Ok(state.player.status_for(&native))
+    state.player.set_volume(volume)
 }
 
 #[tauri::command]

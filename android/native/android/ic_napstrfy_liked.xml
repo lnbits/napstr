@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The same heart, filled, for a track that is already in Liked Songs. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#ffffff"
+        android:pathData="M12,20.3c-1.4,-1 -7.2,-5.2 -7.2,-9.4A4.2,4.2 0 0 1 12,8.2a4.2,4.2 0 0 1 7.2,2.7c0,4.2 -5.8,8.4 -7.2,9.4z" />
+</vector>

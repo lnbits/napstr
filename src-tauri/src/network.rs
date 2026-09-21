@@ -3,6 +3,7 @@ use ::rand::seq::SliceRandom;
 use chrono::Utc;
 use futures_util::{stream, StreamExt};
 use keyring::Entry;
+use napstr_remote_protocol::{MAX_REPORT_NOTE_CHARS, REPORT_REASONS};
 use nostr_sdk::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,9 @@ use std::{
 use tauri::Emitter;
 use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
+
+use crate::cover;
+pub use crate::cover::AlbumCover;
 
 pub const CATALOGUE_KIND: u16 = 30421;
 pub const AVAILABILITY_KIND: u16 = 30422;
@@ -49,6 +53,13 @@ const EMPTY_SEARCH_RESULT_LIMIT: usize = 10_000;
 const EMPTY_SEARCH_PAGE_LIMIT: usize = 500;
 const CATALOGUE_IDENTIFIER_BATCH_SIZE: usize = 75;
 const CATALOGUE_IDENTIFIER_CONCURRENCY: usize = 8;
+/// Album covers are cosmetic, so one call resolves a bounded number of albums
+/// with the NIP's own batching (75 `#d` values, four concurrent queries).
+const COVER_KEY_LIMIT: usize = 200;
+const COVER_KEY_BATCH_SIZE: usize = 75;
+const COVER_KEY_CONCURRENCY: usize = 4;
+const COVER_QUERY_LIMIT: usize = 500;
+const COVER_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 const CATALOGUE_BROWSE_SESSION_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const CATALOGUE_BROWSE_SESSION_LIMIT: usize = 8;
 const NETWORK_SEARCH_RESULT_LIMIT: usize = 500;
@@ -355,6 +366,136 @@ async fn fetch_catalogue_identifiers(
         ));
     }
     Ok((events_by_id.into_values().collect(), retry_file_ids))
+}
+
+fn cover_lookup_filter(selectors: &[String]) -> Filter {
+    Filter::new()
+        .kind(Kind::from(cover::COVER_KIND))
+        .hashtag(cover::COVER_MARKER)
+        .identifiers(selectors.iter().cloned())
+        .limit(COVER_QUERY_LIMIT)
+}
+
+/// Fetch cover claims for `keys`, querying each verbatim key together with its
+/// canonical alias in the same `#d` filter, as the NIP requires.
+///
+/// Returns the key/event pairs to store plus the keys whose query failed, so a
+/// relay outage can never be remembered as "this album has no cover".
+async fn fetch_cover_claims(
+    client: &Client,
+    keys: &[String],
+) -> (Vec<(String, Event)>, HashSet<String>) {
+    let mut selectors = Vec::new();
+    let mut keys_by_selector: HashMap<String, Vec<String>> = HashMap::new();
+    for key in keys {
+        for selector in cover::cover_lookup_keys(key) {
+            keys_by_selector
+                .entry(selector.clone())
+                .or_default()
+                .push(key.clone());
+            selectors.push(selector);
+        }
+    }
+    selectors.sort_unstable();
+    selectors.dedup();
+    let batches = selectors
+        .chunks(COVER_KEY_BATCH_SIZE)
+        .map(|batch| batch.to_vec())
+        .collect::<Vec<_>>();
+    let fetched = stream::iter(batches)
+        .map(|batch| {
+            let client = client.clone();
+            async move {
+                let result = client
+                    .fetch_events(cover_lookup_filter(&batch), COVER_QUERY_TIMEOUT)
+                    .await;
+                (batch, result)
+            }
+        })
+        .buffer_unordered(COVER_KEY_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut claims = Vec::new();
+    let mut claimed = HashSet::new();
+    let mut unresolved = HashSet::new();
+    for (batch, result) in fetched {
+        match result {
+            Ok(events) => {
+                for event in events {
+                    if event.kind != Kind::from(cover::COVER_KIND) {
+                        continue;
+                    }
+                    // Only coordinates we asked for, matched exactly, are
+                    // eligible; a relay may return anything.
+                    let Some(answered) = event
+                        .tags
+                        .identifier()
+                        .and_then(|identifier| keys_by_selector.get(identifier))
+                    else {
+                        continue;
+                    };
+                    for key in answered {
+                        if claimed.insert((key.clone(), event.id)) {
+                            claims.push((key.clone(), event.clone()));
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                for selector in batch {
+                    if let Some(answered) = keys_by_selector.get(&selector) {
+                        unresolved.extend(answered.iter().cloned());
+                    }
+                }
+            }
+        }
+    }
+    (claims, unresolved)
+}
+
+/// Mark covers whose author is an active seeder of a track of that album.
+///
+/// This is the only trust signal in the NIP that needs the catalogue and its
+/// availability heartbeats rather than the cover event itself. Stored flags are
+/// kept, so an offline read still prefers a claim that was proven
+/// seeder-authored earlier.
+fn apply_cover_seeders(
+    connection: &Connection,
+    mut covers: Vec<AlbumCover>,
+    availability: Option<&AvailabilitySnapshot>,
+) -> Result<Vec<AlbumCover>, String> {
+    let Some(availability) = availability else {
+        return Ok(covers);
+    };
+    let pending = covers
+        .iter()
+        .filter(|cover| !cover.seeder)
+        .map(|cover| cover.key.clone())
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(covers);
+    }
+    let candidates = cover::album_seeder_candidates(connection, &pending)?;
+    for cover in &mut covers {
+        if cover.seeder {
+            continue;
+        }
+        let Some(rows) = candidates.get(&cover.key) else {
+            continue;
+        };
+        let seeded = rows.iter().any(|(file_id, pubkey)| {
+            pubkey == &cover.author
+                && availability
+                    .available_by_file
+                    .get(file_id)
+                    .is_some_and(|sources| sources.contains(pubkey))
+        });
+        if seeded {
+            cover.seeder = true;
+            cover::mark_cover_seeder(connection, &cover.key, &cover.author)?;
+        }
+    }
+    Ok(covers)
 }
 
 fn catalogue_search_tokens(fields: &[&str]) -> Vec<String> {
@@ -1925,9 +2066,9 @@ impl NetworkService {
             ).map_err(|error| error.to_string())?;
             for chapter in &content.chapters {
                 transaction.execute(
-                    "INSERT OR REPLACE INTO remote_catalogue(file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'unspecified','','audiobook',?10,?11)",
-                    params![chapter.file_id, pubkey, chapter.filename, chapter.title, content.author, content.title, chapter.format, chapter.mime, chapter.size as i64, event.id.to_hex(), Utc::now().to_rfc3339()],
+                    "INSERT OR REPLACE INTO remote_catalogue(file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at,cover_key,canonical_cover_key)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'unspecified','','audiobook',?10,?11,?12,?13)",
+                    params![chapter.file_id, pubkey, chapter.filename, chapter.title, content.author, content.title, chapter.format, chapter.mime, chapter.size as i64, event.id.to_hex(), Utc::now().to_rfc3339(), super::cover::cover_key(&content.author, &content.title).unwrap_or_default(), super::cover::canonical_cover_key(&content.author, &content.title).unwrap_or_default()],
                 ).map_err(|error| error.to_string())?;
             }
             aggregated
@@ -2401,8 +2542,8 @@ impl NetworkService {
             };
             let catalogue_name = content.filename.clone();
             connection.execute(
-                "INSERT OR REPLACE INTO remote_catalogue (file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-                params![content.file_id, pubkey, catalogue_name, content.title, content.artist, content.album, content.format, content.mime, content.size as i64, "unspecified", "", catalogue_tags, event.id.to_hex(), Utc::now().to_rfc3339()],
+                "INSERT OR REPLACE INTO remote_catalogue (file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at,cover_key,canonical_cover_key) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                params![content.file_id, pubkey, catalogue_name, content.title, content.artist, content.album, content.format, content.mime, content.size as i64, "unspecified", "", catalogue_tags, event.id.to_hex(), Utc::now().to_rfc3339(), super::cover::cover_key(&content.artist, &content.album).unwrap_or_default(), super::cover::canonical_cover_key(&content.artist, &content.album).unwrap_or_default()],
             ).map_err(|error| error.to_string())?;
             cached_source_pairs.insert((pubkey, content.file_id.clone()));
             merge_catalogue_result(&mut aggregated, content, catalogue_tags, source);
@@ -2528,6 +2669,84 @@ impl NetworkService {
             NETWORK_SEARCH_RESULT_LIMIT
         });
         Ok((results, next_browse_cursor, total_available))
+    }
+
+    /// Winning album covers for `keys`, best effort.
+    ///
+    /// Covers are additive metadata, so this never fails a caller outright: if
+    /// a relay query is unavailable it answers with whatever was already
+    /// stored. A key is only refreshed when it is new, when a cached miss
+    /// expired, or when a cached hit aged out.
+    pub async fn album_covers(&self, keys: Vec<String>) -> Result<Vec<AlbumCover>, String> {
+        let requested = cover::normalised_request(&keys, COVER_KEY_LIMIT);
+        if requested.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.client.read().await.clone();
+        // Every database block is scoped so no `Connection` is ever held across
+        // an await; `rusqlite::Connection` is not `Sync`.
+        let stale = {
+            let connection = super::open_connection(&self.db_path)?;
+            cover::stale_cover_keys(&connection, &requested)?
+        };
+        let mut claims = Vec::new();
+        let mut answered = Vec::new();
+        if !stale.is_empty() {
+            if let Some(client) = client.as_ref() {
+                let (fetched, unresolved) = fetch_cover_claims(client, &stale).await;
+                answered = stale
+                    .iter()
+                    .filter(|key| !unresolved.contains(*key))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                claims = fetched;
+            }
+        }
+        // Availability heartbeats say whether a claim's author is an active
+        // seeder of the album, which is the NIP's strongest trust signal.
+        let availability = match client.as_ref() {
+            Some(client) => self.availability_snapshot(client).await.ok(),
+            None => None,
+        };
+        let connection = super::open_connection(&self.db_path)?;
+        if !answered.is_empty() {
+            cover::store_cover_events(&connection, &claims)?;
+            let hits = claims
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<HashSet<_>>();
+            cover::mark_cover_keys_checked(&connection, &answered, &hits)?;
+        }
+        let covers = cover::load_cover_claims(&connection, &requested)?;
+        apply_cover_seeders(&connection, covers, availability.as_deref())
+    }
+
+    /// Covers for rendering: the winning claim where somebody made one, and
+    /// otherwise the best art this computer resolved for itself.
+    ///
+    /// This is deliberately not [`NetworkService::album_covers`]. That answers
+    /// "does somebody assert a cover for this album", which is what the scanner
+    /// must ask before it signs anything; this answers "what picture should be
+    /// drawn", and a local resolution — which no relay has ever seen and which
+    /// nobody's key signs — is only ever good enough for the second question.
+    pub async fn best_known_covers(&self, keys: Vec<String>) -> Result<Vec<AlbumCover>, String> {
+        let covers = self.album_covers(keys.clone()).await?;
+        let requested = cover::normalised_request(&keys, COVER_KEY_LIMIT);
+        let claimed = covers
+            .iter()
+            .map(|cover| cover.key.clone())
+            .collect::<HashSet<_>>();
+        let missing = requested
+            .into_iter()
+            .filter(|key| !claimed.contains(key))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(covers);
+        }
+        let connection = super::open_connection(&self.db_path)?;
+        let mut covers = covers;
+        covers.extend(cover::resolved_covers(&connection, &missing)?);
+        Ok(covers)
     }
 
     pub async fn request_download(
@@ -2852,6 +3071,99 @@ impl NetworkService {
             .await
             .map_err(|error| format!("NIP-56 report publication failed: {error}"))?;
         Ok(())
+    }
+
+    /// Publish a cover this host resolved itself, and file it locally so the
+    /// desktop shows it without waiting for a relay to echo it back.
+    ///
+    /// Returns the id of the signed claim. It has reached the relays before this
+    /// returns, so a failure here is a real failure rather than a slow queue.
+    pub async fn publish_cover(&self, fields: cover::CoverClaimFields) -> Result<String, String> {
+        let event = cover::cover_event(&fields, &load_or_create_identity()?)?;
+        let event_id = event.id.to_hex();
+        self.client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?
+            .send_event(&event)
+            .await
+            .map_err(|error| format!("cover publication failed: {error}"))?;
+        let connection = super::open_connection(&self.db_path)?;
+        cover::store_cover_events(&connection, &[(fields.key, event)])?;
+        Ok(event_id)
+    }
+
+    /// NIP-56: report the winning cover published for one album key.
+    ///
+    /// A phone sends only the key and the user's own words. Deciding which event
+    /// to report, and who wrote it, is the host's job: the phone has no business
+    /// naming a pubkey it cannot verify.
+    ///
+    /// The report carries `e` and `p` with the meanings NIP-56 gives them, and
+    /// `napstr-cover` for the album key, so a consumer that only knows NIP-56
+    /// reads every tag correctly. `x` is deliberately absent: NIP-56 defines it
+    /// as the SHA-256 of the reported content, so putting an `artist|album` key
+    /// there would hand a compliant reader a content hash it should trust.
+    ///
+    /// The key is repeated rather than left to be derived from `e` because kind
+    /// `30427` is addressable: its author can replace the claim at the same `d`
+    /// at any time, which changes the event id and orphans a report that named
+    /// only that.
+    ///
+    /// Returns the id of the signed report. It is written to the relays before
+    /// this returns, so nothing is queued behind it.
+    pub async fn report_cover(
+        &self,
+        key: String,
+        report_type: String,
+        note: String,
+    ) -> Result<String, String> {
+        let report_type = report_type.trim().to_ascii_lowercase();
+        if !REPORT_REASONS.contains(&report_type.as_str()) {
+            return Err("unsupported NIP-56 report type".into());
+        }
+        let note = note.trim().to_string();
+        if note.chars().count() > MAX_REPORT_NOTE_CHARS {
+            return Err(format!(
+                "a report note of at most {MAX_REPORT_NOTE_CHARS} characters is allowed"
+            ));
+        }
+        let key = cover::normalise_cover_key(&key).ok_or("invalid album cover key")?;
+        let cover = self
+            .album_covers(vec![key.clone()])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or("no cover is published for this album yet")?;
+        let content = if note.is_empty() {
+            format!("Album cover for {key} reported as {report_type}")
+        } else {
+            note
+        };
+        let tags = vec![
+            Tag::parse(["e", cover.event_id.as_str(), report_type.as_str()]),
+            Tag::parse(["p", cover.author.as_str(), report_type.as_str()]),
+            Tag::parse(["napstr-cover", key.as_str()]),
+            Tag::parse(["client", "Napstr"]),
+        ]
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+        let event = EventBuilder::new(Kind::from(1984), content)
+            .tags(tags)
+            .sign_with_keys(&load_or_create_identity()?)
+            .map_err(|error| error.to_string())?;
+        let report_id = event.id.to_hex();
+        self.client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?
+            .send_event(&event)
+            .await
+            .map_err(|error| format!("NIP-56 report publication failed: {error}"))?;
+        Ok(report_id)
     }
 
     async fn handle_signal(&self, sender: PublicKey, content: &str) -> Result<(), String> {
@@ -3562,12 +3874,49 @@ pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> 
            event_id TEXT PRIMARY KEY, pubkey TEXT NOT NULL, event_json TEXT NOT NULL, created_at INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS trollbox_events_recent
-           ON trollbox_events(created_at DESC,event_id DESC);"
+           ON trollbox_events(created_at DESC,event_id DESC);
+         CREATE TABLE IF NOT EXISTS album_covers (
+           cover_key TEXT NOT NULL, source_pubkey TEXT NOT NULL, art TEXT NOT NULL, thumb TEXT NOT NULL,
+           mbid TEXT NOT NULL, year TEXT NOT NULL, genre TEXT NOT NULL, collection TEXT NOT NULL,
+           source TEXT NOT NULL, cover_file_id TEXT NOT NULL, mime TEXT NOT NULL,
+           event_id TEXT NOT NULL, created_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
+           seeder INTEGER NOT NULL DEFAULT 0, seen_at TEXT NOT NULL,
+           PRIMARY KEY(cover_key, source_pubkey)
+         );
+         CREATE INDEX IF NOT EXISTS album_covers_key ON album_covers(cover_key);
+         CREATE TABLE IF NOT EXISTS album_cover_queries (
+           cover_key TEXT PRIMARY KEY, checked_at TEXT NOT NULL, hit INTEGER NOT NULL DEFAULT 0
+         );"
     ).map_err(|error| error.to_string())
+    .and_then(|_| {
+        // A claim somebody signed is the other half of what this computer would
+        // report about art, so the revision is declared next to the table it
+        // watches. The `album_art_lookups` half, and the table both halves move,
+        // is declared in `cover::initialise_cover_schema`.
+        connection
+            .execute_batch(&format!(
+                "{cover_revision_table}
+                 CREATE TRIGGER IF NOT EXISTS album_covers_cover_revision
+                 AFTER INSERT ON album_covers BEGIN
+                   UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS album_covers_cover_revision_updated
+                 AFTER UPDATE ON album_covers BEGIN
+                   UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS album_covers_cover_revision_deleted
+                 AFTER DELETE ON album_covers BEGIN
+                   UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+                 END;",
+                cover_revision_table = cover::COVER_REVISION_TABLE
+            ))
+            .map_err(|error| error.to_string())
+    })
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "description", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "tags", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::ensure_column(connection, "published_catalogue", "fingerprint", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::ensure_column(connection, "network_downloads", "destination_folder", "TEXT NOT NULL DEFAULT ''"))
+    .and_then(|_| super::cover::initialise_cover_schema(connection))
 }
 
 pub fn load_network_transfers(connection: &Connection) -> Result<Vec<super::Transfer>, String> {

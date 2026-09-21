@@ -1,12 +1,14 @@
 use crate::{
-    build_local_audiobooks, build_local_audiobooks_from_files, load_files, load_files_by_id,
-    load_transfers, open_connection, search_matches,
+    build_local_audiobooks, build_local_audiobooks_from_files, cover_publish::CoverAlbumNote,
+    cover_publish::CoverPublisher, load_files, load_files_by_id, load_transfers, open_connection,
+    search_matches,
 };
 use chrono::Utc;
 use iroh::{endpoint::presets, Endpoint, SecretKey};
 use napstr_remote_protocol::{
-    ClientRequest, PairingTicket, RemoteAudiobook, RemoteAudiobookSummary, RemoteSource,
-    RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_PAGE_SIZE,
+    ClientRequest, CoverReportResult, PairingTicket, PlaybackCommand, RemoteAlbumCover,
+    RemoteAudiobook, RemoteAudiobookSummary, RemoteSource, RemoteTrack, RemoteTransfer,
+    ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAY_QUEUE,
     PROTOCOL_VERSION,
 };
 use qrcode::{render::svg, QrCode};
@@ -79,6 +81,12 @@ pub struct MobileService {
     db_path: PathBuf,
     key_path: PathBuf,
     network: Arc<crate::network::NetworkService>,
+    /// The cover worker, so a phone's own results join the queue the window
+    /// fills. The phone has no MusicBrainz client and resolves art only from
+    /// kind `30427`, so an album that only it has shown would otherwise never be
+    /// looked up at all.
+    covers: Arc<CoverPublisher>,
+    playback: Arc<crate::playback_bridge::PlaybackBridge>,
     endpoint: tokio::sync::RwLock<Option<Endpoint>>,
     start_lock: tokio::sync::Mutex<()>,
     pairing: Mutex<Vec<PairingSession>>,
@@ -95,12 +103,16 @@ impl MobileService {
         db_path: PathBuf,
         app_data: PathBuf,
         network: Arc<crate::network::NetworkService>,
+        covers: Arc<CoverPublisher>,
+        playback: Arc<crate::playback_bridge::PlaybackBridge>,
     ) -> Result<Arc<Self>, String> {
         initialise_schema(&db_path)?;
         Ok(Arc::new(Self {
             db_path,
             key_path: app_data.join("iroh-identity"),
             network,
+            covers,
+            playback,
             endpoint: tokio::sync::RwLock::new(None),
             start_lock: tokio::sync::Mutex::new(()),
             pairing: Mutex::new(Vec::new()),
@@ -213,15 +225,27 @@ impl MobileService {
         stream_only: bool,
     ) -> Result<MobilePairingOffer, String> {
         self.start().await?;
+        if let Some(endpoint) = self.endpoint.read().await.clone() {
+            // Waiting briefly gives the ticket a relay path as well as the
+            // endpoint identity. A DNS lookup remains available if it times out.
+            let _ = tokio::time::timeout(Duration::from_secs(12), endpoint.online()).await;
+        }
+        self.issue_pairing(stream_only).await
+    }
+
+    /// Mint a one-use code for the endpoint that is already running.
+    ///
+    /// This starts nothing on purpose: it is also reached from request handling,
+    /// and a request that arrived over Iroh has already proved the endpoint is
+    /// up. Calling `start` from there would make `start` reachable through its
+    /// own spawned tasks, which the compiler cannot type (E0391).
+    async fn issue_pairing(&self, stream_only: bool) -> Result<MobilePairingOffer, String> {
         let endpoint = self
             .endpoint
             .read()
             .await
             .clone()
             .ok_or("Iroh is not running")?;
-        // Waiting briefly gives the ticket a relay path as well as the endpoint
-        // identity. A DNS lookup remains available if this times out.
-        let _ = tokio::time::timeout(Duration::from_secs(12), endpoint.online()).await;
         let endpoint_addr = serde_json::to_string(&endpoint.addr())
             .map_err(|error| format!("could not encode the Iroh address: {error}"))?;
         let token = hex::encode(rand::random::<[u8; 32]>());
@@ -240,9 +264,7 @@ impl MobileService {
                 stream_only,
             });
         }
-        let desktop_name = open_connection(&self.db_path)
-            .and_then(|connection| crate::get_setting(&connection, "display_name"))
-            .unwrap_or_else(|_| "Napstr".into());
+        let desktop_name = self.desktop_name();
         let ticket = PairingTicket {
             version: PROTOCOL_VERSION,
             endpoint_id: endpoint.id().to_string(),
@@ -281,6 +303,13 @@ impl MobileService {
             updates.remove(endpoint_id);
         }
         Ok(())
+    }
+
+    /// The name shown to a phone. One place, so every answer agrees.
+    fn desktop_name(&self) -> String {
+        open_connection(&self.db_path)
+            .and_then(|connection| crate::get_setting(&connection, "display_name"))
+            .unwrap_or_else(|_| "Napstr".into())
     }
 
     fn remember_error(&self, message: String) -> String {
@@ -475,9 +504,7 @@ impl MobileService {
                 send,
                 &ServerResponse::Paired {
                     stream_only,
-                    desktop_name: open_connection(&self.db_path)
-                        .and_then(|connection| crate::get_setting(&connection, "display_name"))
-                        .unwrap_or_else(|_| "Napstr".into()),
+                    desktop_name: self.desktop_name(),
                 },
             )
             .await;
@@ -545,6 +572,26 @@ impl MobileService {
                         .then_with(|| left.filename.cmp(&right.filename))
                 });
                 tracks.truncate(MAX_PAGE_SIZE);
+                // Hand the albums this phone is about to see to the cover worker,
+                // which is what lets a phone get art by proxy. It has no
+                // MusicBrainz client of its own, so an album that only this phone
+                // has shown is never looked up unless the search says so here.
+                // Reporting is a local write and does nothing while both cover
+                // switches are off; a failure to queue must not fail the search.
+                // It is still said out loud, because a queue write that fails
+                // silently is exactly how a phone ends up with no art and no
+                // reason why.
+                if let Err(error) = self.covers.note_visible(
+                    &tracks
+                        .iter()
+                        .map(|track| CoverAlbumNote {
+                            artist: track.artist.clone(),
+                            album: track.album.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                ) {
+                    eprintln!("Could not queue the albums a phone searched for: {error}");
+                }
                 write_response(send, &ServerResponse::Search { tracks }).await
             }
             ClientRequest::Audiobooks { query } => {
@@ -710,12 +757,92 @@ impl MobileService {
                 )
                 .await
             }
+            ClientRequest::AlbumCovers { keys } => {
+                if keys.len() > MAX_COVER_KEYS {
+                    return Err("Too many album covers were requested at once".into());
+                }
+                // The rendering view, not the assertion view: a phone should
+                // see the art this computer resolved for itself, exactly as the
+                // desktop's own window does. Reporting one of those is refused
+                // by `report_cover`, because there is no claim to report.
+                let covers = self
+                    .network
+                    .best_known_covers(keys)
+                    .await?
+                    .into_iter()
+                    .map(remote_album_cover)
+                    .collect();
+                write_response(send, &ServerResponse::AlbumCovers { covers }).await
+            }
             ClientRequest::Status => {
                 write_response(
                     send,
                     &ServerResponse::Status {
                         library_revision: library_revision(&self.db_path)?,
+                        cover_revision: cover_revision(&self.db_path)?,
                         stream_only,
+                    },
+                )
+                .await
+            }
+            ClientRequest::Playback { command } => {
+                let state = self
+                    .playback
+                    .apply(&self.db_path, bounded_playback(command)?)?;
+                write_response(send, &ServerResponse::Playback { state }).await
+            }
+            ClientRequest::PlaybackState => {
+                write_response(
+                    send,
+                    &ServerResponse::Playback {
+                        state: self.playback.state(&self.db_path),
+                    },
+                )
+                .await
+            }
+            ClientRequest::ReadOnlyTicket => {
+                // Only a read-only code can come out of here, which is what lets
+                // a phone with write access lend its access on without ever
+                // widening it: whoever scans this browses and plays, no more.
+                let offer = self.issue_pairing(true).await?;
+                let desktop_name = self.desktop_name();
+                let mut qr_svg = offer.qr_svg;
+                let candidate = ServerResponse::ReadOnlyTicket {
+                    uri: offer.ticket.clone(),
+                    qr_svg: qr_svg.clone(),
+                    expires_at: offer.expires_at,
+                    desktop_name: desktop_name.clone(),
+                };
+                if serde_json::to_vec(&candidate)
+                    .map(|encoded| encoded.len())
+                    .unwrap_or(usize::MAX)
+                    > MAX_CONTROL_FRAME_BYTES
+                {
+                    // The QR is around a hundred kilobytes of path data. Drop
+                    // the image rather than failing the request that carries
+                    // the code itself.
+                    qr_svg.clear();
+                }
+                write_response(
+                    send,
+                    &ServerResponse::ReadOnlyTicket {
+                        uri: offer.ticket,
+                        qr_svg,
+                        expires_at: offer.expires_at,
+                        desktop_name,
+                    },
+                )
+                .await
+            }
+            ClientRequest::ReportCover { key, reason, note } => {
+                let report_id = self.network.report_cover(key, reason, note).await?;
+                write_response(
+                    send,
+                    &ServerResponse::CoverReported {
+                        report: CoverReportResult {
+                            report_id,
+                            queued: false,
+                        },
                     },
                 )
                 .await
@@ -822,14 +949,75 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
         | ClientRequest::Audiobook { .. }
         | ClientRequest::FetchAudio { .. }
         | ClientRequest::Available { .. }
+        | ClientRequest::AlbumCovers { .. }
+        // Seeing what the computer is playing is not a way of changing it.
+        | ClientRequest::PlaybackState
         | ClientRequest::Status
         | ClientRequest::Ping => Ok(()),
+        ClientRequest::Playback { .. } => Err(
+            "This phone has read-only access, so it cannot control Napstr on the computer.".into(),
+        ),
+        ClientRequest::ReadOnlyTicket => Err(
+            "This phone has read-only access, so it cannot lend access to another device.".into(),
+        ),
+        ClientRequest::ReportCover { .. } => Err(
+            "This phone has read-only access, so it cannot publish reports.".into(),
+        ),
         _ => Err("This phone has read-only access. Downloads on the Napstr host are not permitted.".into()),
     }
 }
 
 fn is_sha256_file_id(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// A playback command with anything a phone should not be able to say removed.
+///
+/// A queue a phone sends is a list it built from what it could see, so entries
+/// that are not file ids are dropped rather than refused: the queue still makes
+/// sense without them, and refusing the whole request would be a worse answer
+/// than playing the part of it that does. The track being asked for is not
+/// dropped, because a request that cannot play its own track is a broken one.
+fn bounded_playback(command: PlaybackCommand) -> Result<PlaybackCommand, String> {
+    match command {
+        PlaybackCommand::PlayTrack { file_id, queue } => {
+            if !is_sha256_file_id(&file_id) {
+                return Err("That is not a track this computer can look up".into());
+            }
+            if queue.len() > MAX_PLAY_QUEUE {
+                return Err(format!(
+                    "A queue of more than {MAX_PLAY_QUEUE} tracks is more than one request can carry"
+                ));
+            }
+            Ok(PlaybackCommand::PlayTrack {
+                file_id,
+                queue: queue
+                    .into_iter()
+                    .filter(|candidate| is_sha256_file_id(candidate))
+                    .collect(),
+            })
+        }
+        other => Ok(other),
+    }
+}
+
+/// Trim the host's bookkeeping (event ids, timestamps) from a resolved cover
+/// before it crosses the wire.
+fn remote_album_cover(cover: crate::network::AlbumCover) -> RemoteAlbumCover {
+    RemoteAlbumCover {
+        key: cover.key,
+        art: cover.art,
+        thumb: cover.thumb,
+        mbid: cover.mbid,
+        year: cover.year,
+        genre: cover.genre,
+        collection: cover.collection,
+        source: cover.source,
+        cover_file_id: cover.cover_file_id,
+        mime: cover.mime,
+        author: cover.author,
+        seeder: cover.seeder,
+    }
 }
 
 fn remote_audiobook(
@@ -1035,6 +1223,16 @@ fn library_revision(db_path: &Path) -> Result<u64, String> {
         })
         .map_err(|error| error.to_string())?;
     Ok(revision.max(0) as u64)
+}
+
+/// How many times the art this host would report has changed.
+///
+/// A phone caches covers, including "this host has none", so this is what tells
+/// it that a cached answer may be stale rather than making it guess or ask
+/// again on every render.
+fn cover_revision(db_path: &Path) -> Result<u64, String> {
+    let connection = open_connection(db_path)?;
+    crate::cover::cover_revision(&connection)
 }
 
 fn local_track(db_path: &Path, file_id: &str) -> Result<RemoteTrack, String> {
@@ -1290,6 +1488,42 @@ mod tests {
             }
         )
         .is_ok());
+    }
+
+    #[test]
+    fn a_play_queue_is_bounded_and_filtered_to_file_ids() {
+        let track = "a".repeat(64);
+        let queued = "b".repeat(64);
+        let PlaybackCommand::PlayTrack { file_id, queue } = bounded_playback(
+            PlaybackCommand::PlayTrack {
+                file_id: track.clone(),
+                queue: vec![queued.clone(), "not-a-file".into(), String::new()],
+            },
+        )
+        .unwrap()
+        else {
+            panic!("a play command must stay a play command")
+        };
+        assert_eq!(file_id, track);
+        assert_eq!(queue, vec![queued]);
+
+        // The track being asked for is never quietly swapped for another.
+        assert!(bounded_playback(PlaybackCommand::PlayTrack {
+            file_id: "nope".into(),
+            queue: Vec::new(),
+        })
+        .is_err());
+        assert!(bounded_playback(PlaybackCommand::PlayTrack {
+            file_id: track,
+            queue: vec!["c".repeat(64); MAX_PLAY_QUEUE + 1],
+        })
+        .is_err());
+
+        // Anything that is not about a queue passes through untouched.
+        assert_eq!(
+            bounded_playback(PlaybackCommand::Next).unwrap(),
+            PlaybackCommand::Next
+        );
     }
 
     #[test]

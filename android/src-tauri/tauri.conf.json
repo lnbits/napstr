@@ -21,7 +21,17 @@
       "resizable": true
     }],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; media-src 'self' https: http://127.0.0.1:*; connect-src 'self' ipc: http://ipc.localhost https://itunes.apple.com https://musicbrainz.org https://coverartarchive.org"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; media-src 'self' https: http://127.0.0.1:*; connect-src 'self' ipc: http://ipc.localhost https://itunes.apple.com"
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "mobile": [
+        { "scheme": ["napstrfy"], "appLink": false }
+      ],
+      "desktop": {
+        "schemes": ["napstrfy"]
+      }
     }
   },
   "bundle": {

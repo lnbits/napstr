@@ -4,6 +4,25 @@ import { languages, direction } from '../../shared/i18n/core.js';
 import { mockNative, serveAudio, silentAudio } from './helpers/native.mjs';
 const catalogs = Object.fromEntries(await Promise.all(languages.map(async ({ code }) => [code, JSON.parse(await readFile(new URL(`../../shared/i18n/locales/${code}.json`, import.meta.url)))])));
 
+// Ours keeps the search field on its own tab and the transport inside the
+// now-playing sheet, which the bar opens. A wide desktop window pins the sheet
+// as its own column, so it is on screen without being opened.
+async function openSearchTab(page) {
+  await page.locator('.bottom-nav button').nth(1).click();
+  await expect(page.getByRole('textbox', { name: 'Search tracks', exact: true })).toBeVisible();
+}
+
+async function openPlayer(page) {
+  // Resizing the window can hand the pinned desktop column back to the phone's
+  // bar between the count and the click, so the sheet is torn down instead of
+  // opened and the click lands on nothing. Retry the whole decision until the
+  // sheet is actually on screen rather than trusting one count.
+  await expect(async () => {
+    if (await page.locator('.now-sheet').count() === 0) await page.locator('.now-open').click();
+    await expect(page.locator('.now-sheet')).toBeVisible({ timeout: 1000 });
+  }).toPass({ timeout: 15_000 });
+}
+
 for (const platform of ['android', 'linux']) {
   test(`Napstrfy ${platform}: opening screen has a readable language selector without a dialog`, async ({ page }) => {
     await mockNative(page, { paired: false, platform });
@@ -39,24 +58,35 @@ for (const platform of ['android', 'linux']) {
     await page.goto('http://127.0.0.1:15174');
     const back = page.getByRole('button', { name: 'Back 15 seconds', exact: true });
     const forward = page.getByRole('button', { name: 'Forward 15 seconds', exact: true });
-    await expect(back).toBeDisabled();
-    await expect(forward).toBeDisabled();
+    // Nothing is loaded yet, so there is nothing to seek. A pinned desktop
+    // column is already on screen with its controls disabled; a phone has no
+    // transport at all until a track is playing.
+    if (platform === 'linux') {
+      await expect(back).toBeDisabled();
+      await expect(forward).toBeDisabled();
+    } else {
+      await expect(page.locator('.now-sheet')).toHaveCount(0);
+    }
     await page.locator('.track-open').first().click();
     const audio = page.locator('audio');
     await expect.poll(() => audio.evaluate((audio) => audio.paused)).toBe(false);
+    await openPlayer(page);
+    const timeline = page.getByRole('slider', { name: 'Seek' });
+    await expect(timeline).toHaveAttribute('max', '60');
     await page.locator('.play-main').click();
     await expect.poll(() => audio.evaluate((audio) => audio.paused)).toBe(true);
     await expect(back).toBeEnabled();
     const source = await audio.getAttribute('src');
-    await audio.evaluate((audio) => { audio.currentTime = 20; });
+    await timeline.fill('20');
+    await expect.poll(() => audio.evaluate((audio) => audio.currentTime)).toBe(20);
     await forward.click();
     await expect.poll(() => audio.evaluate((audio) => audio.currentTime)).toBe(35);
     await back.click();
     await expect.poll(() => audio.evaluate((audio) => audio.currentTime)).toBe(20);
-    await audio.evaluate((audio) => { audio.currentTime = 5; });
+    await timeline.fill('5');
     await back.click();
     await expect.poll(() => audio.evaluate((audio) => audio.currentTime)).toBe(0);
-    await audio.evaluate((audio) => { audio.currentTime = 55; });
+    await timeline.fill('55');
     await forward.click();
     await expect.poll(() => audio.evaluate((audio) => audio.currentTime)).toBe(60);
     // Dispatch immediately after changing time: no UI timeupdate can intervene.
@@ -79,7 +109,10 @@ for (const platform of ['android', 'linux']) {
     }
     for (const width of [320, 600, 800, 1100]) {
       await page.setViewportSize({ width, height: 800 });
-      const buttons = page.locator('.player-buttons button');
+      // A pinned column hands the phone's bar back when the window narrows, so
+      // open the sheet again before measuring the controls it carries.
+      await openPlayer(page);
+      const buttons = page.locator('.now-sheet-actions button');
       expect((await buttons.evaluateAll((buttons) => buttons.slice(0, 5).map((button) => button.getAttribute('aria-label')))))
         .toEqual(['Previous track', 'Back 15 seconds', 'Play', 'Forward 15 seconds', 'Next track']);
       let right = 0;
@@ -114,28 +147,35 @@ async function instrumentTiming(page) {
     });
     Object.defineProperty(navigator.mediaSession, 'metadata', {
       configurable: true,
-      set() { window.timingStats.metadata++; }
+      // Clearing the session is not a claim about what is playing.
+      set(value) { if (value) window.timingStats.metadata++; }
     });
-    navigator.mediaSession.setPositionState = (state) => window.timingStats.positions.push({ at: Date.now(), state });
+    // A call with no state clears the position rather than claiming one.
+    navigator.mediaSession.setPositionState = (state) => { if (state) window.timingStats.positions.push({ at: Date.now(), state }); };
   });
 }
 
 for (const platform of ['android', 'linux']) {
-  test(`Napstrfy ${platform}: late duration recovers without range queries or playback changes`, async ({ page }) => {
+  test(`Napstrfy ${platform}: a late duration arrives without range queries or playback changes`, async ({ page }) => {
     await mockNative(page, { platform });
     await instrumentTiming(page);
     await page.route('**/fixture.wav', serveAudio);
     await page.goto('http://127.0.0.1:15174');
     await page.locator('.track-open').first().click();
     const audio = page.locator('audio');
-    const timeline = page.getByRole('slider', { name: 'Playback position' });
     await expect.poll(() => audio.evaluate((a) => a.paused)).toBe(false);
+    await openPlayer(page);
+    const timeline = page.getByRole('slider', { name: 'Seek' });
     await page.locator('.play-main').click();
+    await expect.poll(() => audio.evaluate((a) => a.paused)).toBe(true);
+    // The element has reported no length, so there is nothing to seek against:
+    // the bar says the length is unknown instead of showing a real-looking 0:00.
     await expect(timeline).toBeDisabled();
-    await expect(page.locator('.timeline span')).toContainText('/ —');
+    await expect(page.locator('.now-sheet-meta > span').last()).toHaveText('—');
+    await expect(page.locator('.now-sheet-actions .skip-button').first()).toBeDisabled();
     expect(await page.evaluate(() => window.timingStats.positions.length)).toBe(0);
-    // Duration becomes available without any new metadata event.
-    await page.evaluate(() => { window.reportedDuration = 'actual'; });
+    // The length arrives on the element's own event; nothing polls for it.
+    await page.evaluate(() => { window.reportedDuration = 'actual'; document.querySelector('audio').dispatchEvent(new Event('durationchange')); });
     await expect(timeline).toBeEnabled();
     await expect(timeline).toHaveAttribute('max', '60');
     await timeline.fill('30');
@@ -143,110 +183,160 @@ for (const platform of ['android', 'linux']) {
     await expect.poll(() => audio.evaluate((a) => a.currentTime)).toBe(45);
     expect(await audio.evaluate((a) => a.paused)).toBe(true);
     await expect.poll(() => page.evaluate(() => window.timingStats.metadata)).toBe(1);
-    const before = await page.evaluate(() => ({ reads: window.timingStats.reads, positions: window.timingStats.positions.length }));
-    const immediate = await page.evaluate(() => {
-      for (let i = 0; i < 10000; i++) {
-        document.querySelector('audio').dispatchEvent(new Event('durationchange'));
-        document.querySelector('audio').dispatchEvent(new Event('loadedmetadata'));
-      }
-      return { reads: window.timingStats.reads, positions: window.timingStats.positions.length };
-    });
-    expect(immediate).toEqual(before);
-    await expect.poll(() => page.evaluate(() => window.timingStats.reads)).toBeGreaterThan(before.reads);
+    // One read per event and no more: the length is never asked for on a timer,
+    // and `seekable` - which WebKit can answer with another `durationchange` -
+    // is not touched at all.
+    const reads = await page.evaluate(() => window.timingStats.reads);
+    await page.evaluate(() => document.querySelector('audio').dispatchEvent(new Event('durationchange')));
+    expect(await page.evaluate(() => window.timingStats.reads)).toBe(reads + 1);
     const stats = await page.evaluate(() => window.timingStats);
-    expect(stats.reads - before.reads).toBe(1);
     expect(stats.ranges).toBe(0);
     expect(stats.metadata).toBe(1);
-    for (let i = 1; i < stats.positions.length; i++) expect(stats.positions[i].at - stats.positions[i - 1].at).toBeGreaterThanOrEqual(990);
+    // Progress events coalesce into one pending publish, so a burst of them
+    // cannot produce a single synchronous position, let alone one each.
+    expect(await page.evaluate(() => {
+      const before = window.timingStats.positions.length;
+      for (let i = 0; i < 500; i++) document.querySelector('audio').dispatchEvent(new Event('timeupdate'));
+      return window.timingStats.positions.length - before;
+    })).toBe(0);
     expect(await page.evaluate(() => window.calls.filter((c) => c.cmd === 'cache_remote_audio').length)).toBe(1);
   });
 }
 
-test('Napstrfy podcast duration hints stay estimates and cannot enable seeking or reach system controls', async ({ page }) => {
+test('Napstrfy podcast duration hints cannot enable seeking or reach system controls', async ({ page }) => {
   await mockNative(page);
   await instrumentTiming(page);
   await page.route('**/fixture.wav', serveAudio);
   await page.goto('http://127.0.0.1:15174');
-  await page.locator('.app-nav button').nth(1).click();
+  await page.locator('.bottom-nav button').nth(2).click();
   await page.locator('.podcast-open').first().click();
   await page.locator('.episode-copy').first().click();
-  const timeline = page.getByRole('slider', { name: 'Playback position' });
   await expect.poll(() => page.locator('audio').evaluate((a) => a.paused)).toBe(false);
+  await openPlayer(page);
+  const timeline = page.getByRole('slider', { name: 'Seek' });
   await page.locator('.play-main').click();
+  await expect.poll(() => page.locator('audio').evaluate((a) => a.paused)).toBe(true);
+  // The episode's own length is not a length of the audio that is playing, so
+  // it is shown as the estimate it is and must not make the bar seekable.
+  await expect(page.locator('.now-sheet-meta > span').last()).toHaveText('≈ 1:40');
   await expect(timeline).toBeDisabled();
-  await expect(page.locator('.timeline span')).toContainText('/ ≈ 1:40');
   expect(await page.evaluate(() => window.timingStats.positions.length)).toBe(0);
+  // An absurd claim is refused, and does not displace the estimate either.
   await page.evaluate(() => { window.reportedDuration = Number.MAX_VALUE; document.querySelector('audio').dispatchEvent(new Event('durationchange')); });
-  await expect.poll(() => page.evaluate(() => window.timingStats.reads)).toBeGreaterThan(1);
   await expect(timeline).toBeDisabled();
+  await expect(page.locator('.now-sheet-meta > span').last()).toHaveText('≈ 1:40');
   expect(await page.evaluate(() => window.timingStats.positions.length)).toBe(0);
-  await page.evaluate(() => { window.reportedDuration = 'actual'; document.querySelector('audio').dispatchEvent(new Event('loadedmetadata')); });
+  await page.evaluate(() => { window.reportedDuration = 'actual'; document.querySelector('audio').dispatchEvent(new Event('durationchange')); });
   await expect(timeline).toBeEnabled();
-  await expect(page.locator('.timeline span')).toContainText('/ 1:00');
+  await expect(page.locator('.now-sheet-meta > span').last()).toHaveText('1:00');
   // The next source must not inherit either the estimate or verified length.
   await page.evaluate(() => { window.reportedDuration = NaN; });
-  await page.locator('.app-nav button').first().click();
+  await page.locator('.bottom-nav button').first().click();
   await page.locator('.track-open').first().click();
   await expect(timeline).toBeDisabled();
-  await expect(page.locator('.timeline span')).toContainText('/ —');
+  await expect(page.locator('.now-sheet-meta > span').last()).toHaveText('—');
   expect(await page.evaluate(() => window.timingStats.ranges)).toBe(0);
 });
 
-test('Napstrfy banners expire after ten seconds and replacement errors get a fresh timer', async ({ page }) => {
+// `NOTICE_VISIBLE_MS` in android/src/App.svelte: a notice clears itself.
+const NOTICE_MS = 4200;
+
+test('Napstrfy notices expire on their own and an error waits to be dismissed', async ({ page }) => {
   await mockNative(page, { remote: true });
   await page.clock.install();
+  await page.addInitScript(() => {
+    // Fail both halves of a search, so the banner is the path under test.
+    const invoke = window.__TAURI_INTERNALS__.invoke;
+    window.searchError = '';
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
+      if (window.searchError && (cmd === 'remote_search' || (cmd === 'remote_library' && args.query))) throw window.searchError;
+      return invoke(cmd, args);
+    };
+  });
   await page.goto('http://127.0.0.1:15174');
   await page.locator('.track-open').first().click();
-  await expect(page.locator('.notice-banner')).toContainText('Napstr is downloading');
-  await page.clock.fastForward(9000);
-  await expect(page.locator('.notice-banner')).toBeVisible();
-  await page.clock.fastForward(1100);
-  await expect(page.locator('.notice-banner')).toHaveCount(0);
+  await expect(page.locator('.toast')).toContainText('Napstr is downloading');
+  await page.clock.fastForward(NOTICE_MS - 600);
+  await expect(page.locator('.toast')).toBeVisible();
+  await page.clock.fastForward(900);
+  await expect(page.locator('.toast')).toHaveCount(0);
+  // An error is not a notice: it stays until it is dismissed, and a newer one
+  // replaces the one on screen instead of queueing behind it.
+  await openSearchTab(page);
   const search = page.getByRole('textbox', { name: 'Search tracks', exact: true });
   for (const message of ['First search failed', 'Second search failed']) {
     await page.evaluate((message) => { window.searchError = message; }, message);
     await search.fill(message);
     await search.press('Enter');
     await expect(page.locator('.error-banner')).toContainText(message);
-    if (message.startsWith('First')) await page.clock.fastForward(9000);
+    await page.clock.fastForward(20_000);
+    await expect(page.locator('.error-banner')).toContainText(message);
   }
-  await page.clock.fastForward(2000);
   await expect(page.locator('.error-banner')).toContainText('Second search failed');
-  await page.clock.fastForward(8100);
+  await page.locator('.error-banner').click();
   await expect(page.locator('.error-banner')).toHaveCount(0);
   await search.press('Enter');
   await expect(page.locator('.error-banner')).toBeVisible();
-  await page.locator('.error-banner').click();
-  await expect(page.locator('.error-banner')).toHaveCount(0);
 });
 
-test('Napstrfy desktop player occupies its own column with artwork, likes and playback modes', async ({ page }) => {
-  await mockNative(page);
+test('Napstrfy desktop pins the player as its own column with artwork, likes and playback modes', async ({ page }) => {
+  await mockNative(page, { platform: 'linux' });
   await page.addInitScript(() => {
-    localStorage.setItem('napstrfy-artwork:v2:' + JSON.stringify(['album', 'settings', 'useralbum']), JSON.stringify({ url: '/napstr-logo-small.png', expires: Date.now() + 86400000 }));
+    // The host resolves artwork for us, so answer the way the host would.
+    const invoke = window.__TAURI_INTERNALS__.invoke;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
+      if (cmd === 'remote_covers') {
+        return (args.keys ?? []).map((key) => ({ key, art: '/napstr-logo-small.png', thumb: '/napstr-logo-small.png',
+          mbid: '', year: '', genre: '', collection: '', source: 'itunes', coverFileId: '', mime: 'image/png', author: '', seeder: false }));
+      }
+      return invoke(cmd, args);
+    };
   });
   await page.route('**/fixture.wav', serveAudio);
   await page.goto('http://127.0.0.1:15174');
   await page.locator('.track-open').first().click();
   await expect.poll(() => page.locator('audio').evaluate((audio) => audio.paused)).toBe(false);
   await page.locator('.play-main').click();
-  const cover = page.locator('.now-playing .artwork img');
+  const cover = page.locator('.now-sheet-art img');
   await expect(cover).toHaveAttribute('src', '/napstr-logo-small.png');
-  await expect(page.locator('.player-backdrop span')).toHaveCSS('background-image', /napstr-logo-small\.png/);
-  await expect(page.locator('.player-backdrop span')).toHaveCSS('filter', 'blur(20px)');
-  const like = page.locator('.player-like');
+  await expect(page.locator('.now-sheet-backdrop')).toHaveCSS('background-image', /napstr-logo-small\.png/);
+  // The art wears a blurred copy of itself behind everything, as on the phone.
+  await expect(page.locator('.now-sheet-backdrop')).toHaveCSS('filter', /blur\(\d+px\)/);
+  const like = page.locator('.now-mode-like');
+  await expect(like).toHaveAttribute('aria-pressed', 'false');
   await like.click();
   await expect(like).toHaveAttribute('aria-pressed', 'true');
-  await expect(page.locator('.track-row .like-button')).toHaveAccessibleName('Unlike Search');
-  await page.locator('.mode-button').click();
-  await expect(page.locator('.mode-label')).toHaveText('Play random');
-  expect(await page.evaluate(() => localStorage.getItem('napstrfy-play-mode'))).toBe('random');
+  // A row no longer carries a heart of its own, so the row's menu is what has to
+  // show the track as liked now.
+  await page.locator('.track-row .track-more').first().click();
+  await expect(page.locator('.actions-row', { hasText: 'Remove from Liked Songs' })).toBeVisible();
+  // The row still shows the state at a glance: a liked track's title turns gold
+  // and carries the rule under it, exactly as it does in an album's own list.
+  const likedTitle = page.locator('.track-row.liked .track-copy strong');
+  await expect(likedTitle).toHaveCSS('color', 'rgb(242, 208, 138)');
+  const rule = await likedTitle.evaluate((node) => getComputedStyle(node, '::after'));
+  expect(rule.width).toBe('40px');
+  expect(rule.height).toBe('2px');
+  // The code row carries this app's own scheme, and the code itself is drawn by
+  // the native side rather than by the page.
+  await page.getByRole('button', { name: 'Show Napstrfy Code' }).click();
+  await expect(page.locator('.actions-code-qr svg')).toBeVisible();
+  await expect(page.locator('.actions-code small')).toHaveText(`napstrfy://track/${'a'.repeat(64)}`);
+  // The panel is bottom-anchored and the menu is tall, so the scrim is only
+  // clear of it near the top of the window.
+  await page.getByRole('button', { name: 'Close the track options' }).click({ position: { x: 12, y: 12 } });
+  await expect(page.locator('.actions-panel')).toHaveCount(0);
+  // Ours has one button per mode rather than one that cycles through them.
+  const shuffle = page.getByRole('button', { name: 'Shuffle off' });
+  await shuffle.click();
+  await expect(page.getByRole('button', { name: 'Shuffle on' })).toBeVisible();
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('napstrfy-play-mode')).shuffle)).toBe(true);
   for (const width of [800, 1100, 1600]) {
     await page.setViewportSize({ width, height: 900 });
-    const nav = await page.locator('.app-nav').boundingBox();
+    const nav = await page.locator('.bottom-nav').boundingBox();
     const content = await page.locator('.app-content').boundingBox();
-    const player = await page.locator('.now-playing').boundingBox();
-    const art = await page.locator('.now-playing .artwork').boundingBox();
+    const player = await page.locator('.now-sheet').boundingBox();
+    const art = await page.locator('.now-sheet-art').boundingBox();
     expect(player.width).toBeCloseTo(nav.width * 1.5);
     expect(content.x).toBeGreaterThanOrEqual(nav.x + nav.width);
     expect(content.x + content.width).toBeLessThanOrEqual(player.x);
@@ -254,17 +344,40 @@ test('Napstrfy desktop player occupies its own column with artwork, likes and pl
     expect(art.width).toBeGreaterThan(200);
     expect(art.width).toBeCloseTo(art.height);
     expect(art.x).toBeGreaterThan(player.x);
-    await expect(page.locator('.now-playing')).toHaveCSS('position', 'relative');
-    await expect(page.locator('.mode-button')).toBeInViewport();
+    await expect(page.locator('.now-sheet')).toHaveCSS('position', 'static');
+    await expect(page.getByRole('button', { name: 'Shuffle on' })).toBeInViewport();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await page.screenshot({ path: test.info().outputPath(`desktop-player-${width}.png`) });
   }
   await page.setViewportSize({ width: 360, height: 800 });
-  await expect(like).toBeHidden();
-  await expect(page.locator('.player-backdrop')).toBeHidden();
+  // Narrowing the window hands the phone layout back: no pinned column, and the
+  // compact bar is the player again.
+  await expect(page.locator('.now-sheet')).toHaveCount(0);
   await expect(page.locator('.now-playing')).toHaveCSS('position', 'fixed');
   await expect(page.locator('audio')).toHaveCount(1);
   expect(await page.evaluate(() => window.calls.filter((call) => call.cmd === 'cache_remote_audio').length)).toBe(1);
+});
+
+test('Napstrfy marks a liked album track with the gold rule under its title', async ({ page }) => {
+  await mockNative(page, { platform: 'linux' });
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await page.goto('http://127.0.0.1:15174');
+  // An album's track list has no per-track cover to ring, so a liked row carries
+  // the gold rule under its title instead: the same signal the library rows
+  // wear as a ring, drawn where this list has room for it.
+  await page.locator('.track-row .track-more').first().click();
+  await page.getByRole('button', { name: 'Add to Liked Songs' }).click();
+  await page.getByRole('button', { name: 'Go to album' }).click();
+  await expect(page.locator('.album-view')).toBeVisible();
+  const title = page.locator('.album-tracks li.liked .album-track-copy strong');
+  await expect(title).toHaveCSS('color', 'rgb(242, 208, 138)');
+  // The rule is a pseudo-element, so it is measured as a box the row lays out
+  // rather than as a computed text style.
+  const rule = await title.evaluate((node) => getComputedStyle(node, '::after'));
+  expect(rule.content).toBe('""');
+  expect(rule.width).toBe('40px');
+  expect(rule.height).toBe('2px');
+  expect(rule.backgroundImage).toContain('linear-gradient');
 });
 
 for (const app of ['napstr', 'napstrfy']) {
@@ -274,7 +387,7 @@ for (const app of ['napstr', 'napstrfy']) {
     await mockNative(page, { app });
     await page.goto(`http://127.0.0.1:${app === 'napstr' ? 15173 : 15174}`);
     if (app === 'napstr') await page.locator('.tool-button').filter({ hasText: /Settings$/ }).click();
-    else await page.locator('.app-nav button').last().click();
+    else await page.locator('.header-icon').click();
     const selector = page.locator('[data-language-select]');
     await expect(selector).toBeVisible();
     for (const { code } of languages) {
@@ -299,9 +412,10 @@ for (const app of ['napstr', 'napstrfy']) {
       expect(await page.locator('#format').inputValue()).toBe('Audiobooks');
       await expect.poll(() => page.evaluate(() => window.calls.some((call) => call.cmd === 'network_search_audiobooks'))).toBeTruthy();
     } else {
-      await page.keyboard.press('Escape');
+      // Ours opens settings from the header, and closes it with its own button.
+      await page.locator('.settings-view .view-icon').click();
       await expect(page.locator('.track-copy strong').first()).toHaveText('Search');
-      await page.locator('.app-nav button').nth(1).click();
+      await page.locator('.bottom-nav button').nth(2).click();
       await page.locator('.podcast-open').first().click();
       await expect(page.locator('.episode-download')).toBeDisabled();
       await expect(page.locator('.episode-download')).toHaveAttribute('title', 'Downloading');
@@ -323,7 +437,7 @@ test('native language wins in automatic mode; later native responses cannot over
   await expect(page.locator('html')).toHaveAttribute('lang', 'fr');
   await page.keyboard.press('Escape');
   await page.locator('textarea').fill('napstrfy://pair/test');
-  await page.locator('.manual-pair button[type="submit"]').click();
+  await page.locator('.manual-pair button').click();
   await expect(page.locator('.track-row')).toBeVisible();
 });
 
@@ -346,12 +460,12 @@ for (const code of ['ar', 'ur', 'fr', 'bn']) {
     for (const width of [360, 430, 800, 1180]) {
       await page.setViewportSize({ width, height: 810 });
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
-      await expect(page.locator('.app-nav')).toHaveCount(1);
-      const nav = await page.locator('.app-nav').boundingBox();
+      await expect(page.locator('.bottom-nav')).toHaveCount(1);
+      const nav = await page.locator('.bottom-nav').boundingBox();
       if (width >= 800 && ['ar', 'ur'].includes(code)) expect(Math.round(nav.x + nav.width)).toBe(width);
-      await page.locator('.app-nav button').last().click();
+      await page.locator('.header-icon').click();
       await expect(page.locator('[data-language-select]')).toBeInViewport();
-      await page.keyboard.press('Escape');
+      await page.locator('.settings-view .view-icon').click();
     }
   });
 }
@@ -455,7 +569,7 @@ test('switching language during playback preserves audio and updates Android med
   await page.locator('.track-open').first().click();
   await expect.poll(() => page.locator('audio').evaluate((audio) => audio.paused)).toBe(false);
   const source = await page.locator('audio').getAttribute('src');
-  await page.locator('.app-nav button').last().click();
+  await page.locator('.header-icon').click();
   await page.locator('[data-language-select]').selectOption('fr');
   await expect.poll(() => page.evaluate(() => window.mediaUpdates.at(-1)?.labels.play)).toBe(catalogs.fr.Play);
   expect(await page.locator('audio').evaluate((audio) => audio.paused)).toBe(false);

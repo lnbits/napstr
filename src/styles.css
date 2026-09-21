@@ -234,6 +234,25 @@ body.resizing-transfer-pane, body.resizing-transfer-pane * { cursor: ns-resize !
 .about-dialog-body { display: block; }.about-summary { display: flex; gap: 18px; align-items: center; }.about-summary > div:last-child { min-width: 0; flex: 1; }.about-donation { width: 100%; margin: 14px 0 0; text-align: center; }
 .confirm-dialog .dialog-body { align-items: flex-start; padding: 18px; }.confirm-dialog h3 { margin: 1px 0 10px; font-size: 16px; }.confirm-dialog p { margin: 5px 0; overflow-wrap: anywhere; }.confirm-icon { flex: 0 0 auto; width: 38px; height: 38px; display: grid; place-items: center; color: #111; background: #f2c230; border: 2px outset white; font: bold 28px/1 Arial, sans-serif; }.confirm-dialog .dialog-actions { display: flex; justify-content: center; gap: 9px; }
 
+/* Album covers: resolving art for this folder and publishing kind 30427. */
+.cover-scan-view { display: flex; flex-direction: column; overflow: auto; background: #c6c6c6; }
+.cover-scan-controls { margin: 4px; padding: 8px 10px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; background: #d5d5d5; border: 2px solid; border-color: white #777 #777 white; }
+.cover-scan-toggle { min-width: 280px; flex: 1; display: flex; align-items: center; gap: 8px; }
+.cover-scan-toggle > span { display: flex; flex-direction: column; }
+.cover-scan-toggle small { color: #555; }
+.cover-scan-limit { display: flex; align-items: center; gap: 6px; }
+.cover-scan-limit input { width: 66px; }
+.cover-scan-status { margin: 4px; padding: 6px 10px; display: flex; flex-wrap: wrap; gap: 16px; background: #e6e6e6; border: 2px solid; border-color: #777 white white #777; }
+.cover-scan-status b { font-variant-numeric: tabular-nums; }
+.cover-scan-current, .cover-scan-message { margin: 0 8px 4px; color: #444; }
+.cover-candidate-list { margin: 4px; background: #eee; border: 2px inset white; }
+.cover-candidate { padding: 7px 9px; display: grid; grid-template-columns: minmax(0, 1fr) 84px minmax(0, 1fr); gap: 9px; align-items: center; border-bottom: 1px solid #b0b0b0; }
+.cover-candidate:last-child { border-bottom: 0; }
+.cover-candidate b, .cover-candidate small, .cover-candidate code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cover-candidate small, .cover-candidate code { color: #555; }
+.cover-candidate code { font-size: 10px; }
+.cover-candidate > span { color: #444; text-align: right; }
+
 @media (max-height: 700px) {
   .app-window { grid-template-rows: 25px 62px 22px 51px minmax(100px, 1fr) var(--transfer-height, 94px) 23px; }
   .mini-row { height: 25px; }
@@ -340,6 +359,42 @@ body.resizing-transfer-pane, body.resizing-transfer-pane * { cursor: ns-resize !
 .mini-row > * { min-width: 0; }
 .mini-status { padding-inline: 5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .mini-cancel { width: 20px; height: 20px; padding: 0; justify-self: end; }
+
+/* ---- Album art, and the two ways to show results ------------------------
+   Art is always a square tile, whether it came from a signed kind `30427`
+   claim or from this computer's own resolution. A tile with nothing in it is a
+   music note rather than an error, because the NIP treats image URLs as
+   perishable and never a reason to penalise anybody. */
+
+.cover-art { display: grid; place-items: center; flex: 0 0 auto; overflow: hidden; color: #86a5a7; background: linear-gradient(145deg, #4d7477, #21403f); border: 1px solid #2c2c2c; }
+.cover-art img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.cover-art.empty { font-family: Georgia, serif; }
+.cover-art.small { width: 28px; height: 28px; font-size: 12px; }
+.cover-art.medium { width: 52px; height: 52px; font-size: 20px; }
+.cover-art.large { width: 110px; height: 110px; font-size: 32px; box-shadow: 2px 2px 0 rgba(0, 0, 0, .35); }
+
+.detail-cover { display: grid; place-items: center; padding: 10px 10px 2px; }
+
+.results-caption-tools { display: flex; align-items: center; gap: 6px; }
+.view-toggle { width: 22px; height: 18px; padding: 0; color: #333; background: var(--face); border: 1px solid; border-color: var(--light) #555 #555 var(--light); font-size: 11px; line-height: 1; cursor: pointer; }
+.view-toggle.active { color: white; background: var(--navy); border-color: #333 var(--light) var(--light) #333; }
+.view-toggle:disabled { color: #888; cursor: default; }
+
+.result-grid { flex: 1; min-height: 0; overflow: auto; padding: 8px; display: grid; grid-template-columns: repeat(auto-fill, minmax(116px, 1fr)); gap: 8px; align-content: start; background: white; }
+.result-card { display: grid; justify-items: center; gap: 3px; padding: 6px; color: inherit; background: transparent; border: 1px solid transparent; font: inherit; text-align: center; cursor: pointer; }
+.result-card:hover { background: #eef4f6; }
+.result-card.selected { color: white; background: var(--navy); border-color: var(--navy); }
+.result-card b, .result-card small { display: block; width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-card b { font-size: 11px; }
+.result-card small { color: #555; font-size: 10px; }
+.result-card.selected small, .result-card.selected .result-card-meta { color: #ccd6ea; }
+.result-card-album { font-style: italic; }
+.result-card-meta { margin-top: 2px; display: inline-flex; align-items: center; gap: 3px; color: #444; font: 10px "Courier New", monospace; }
+.result-card-meta .source-dot { margin-right: 0; }
+.result-card .cover-art { box-shadow: 2px 2px 0 rgba(0, 0, 0, .3); }
+
+/* The middle column now names where an album came from as well as its size. */
+.cover-candidate { grid-template-columns: minmax(0, 1fr) 150px minmax(0, 1fr); }
 
 /* Text can expand when translated; keep the existing desktop grid usable. */
 .toolbar { overflow-x: auto; }

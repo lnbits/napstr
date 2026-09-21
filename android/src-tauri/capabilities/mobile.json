@@ -11,6 +11,8 @@
   ],
   "permissions": [
     "core:default",
+    "core:event:default",
+    "deep-link:default",
     "barcode-scanner:allow-scan",
     "barcode-scanner:allow-cancel",
     "barcode-scanner:allow-check-permissions",

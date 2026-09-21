@@ -1,0 +1,7 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "Get-Item": true,
+        "cargo build": true,
+        "git rev-parse": true
+    }
+}

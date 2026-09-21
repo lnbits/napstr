@@ -704,6 +704,9 @@ discriminator. Defined requests are:
 {"type":"transfers"}
 {"type":"fetchAudio","fileId":"<fileId>"}
 {"type":"available","fileIds":["<fileId>","<fileId>"]}
+{"type":"albumCovers","keys":["<artist|album>"]}
+{"type":"playback","command":{"type":"playTrack","fileId":"<fileId>","queue":["<fileId>"]}}
+{"type":"playbackState"}
 {"type":"status"}
 {"type":"ping"}
 ```
@@ -736,6 +739,33 @@ increasing local-library revision. A companion MAY poll it and should reload
 library pages only when it changes. The revision check carries no catalogue
 rows and does not affect active audio streams.
 
+It also contains `coverRevision`, which moves whenever the album art the
+desktop would report changes: a claim that arrived from a relay, or art the
+desktop resolved for itself. Artwork is requested album by album, so a
+companion that caches covers — including the albums the desktop had none for —
+MUST ask again about the ones it was told were missing when this changes,
+because an album with no art a moment ago may have art now. A desktop that has
+no cover support reports `0`, which a companion MUST read as "never
+invalidated" rather than as a revision of zero.
+
+`playback` drives the desktop's own player, and only a pairing with write access
+may send it. Its `command.type` values are `play`, `pause`, `toggle`, `stop`,
+`next`, `previous`, `seek` (`positionMs`), `volume` (`percent`, 0 to 100),
+`repeat` (`mode` of `off`, `all` or `one`), `shuffle` (`enabled`), and
+`playTrack`. Both `playback` and `playbackState` answer with a `playback`
+response carrying the host's own state, which includes its `queueLen`,
+`queueIndex`, `repeat` and `shuffle`.
+
+`playTrack` is how a companion plays a chosen track on the desktop instead of on
+itself. `fileId` is the track to begin on and `queue` is the list the companion
+was showing, in order, at most 200 entries. The desktop adopts that list as its
+queue, so "next" goes where the companion would have gone, but it plays only the
+entries it actually holds — exactly as it does for its own search results — and
+refuses a request whose track it does not have rather than playing something
+else. Commands the native player can carry out alone are applied directly;
+`next`, `previous`, `repeat`, `shuffle` and `playTrack` are handed to the
+desktop's window, because only the window knows the queue.
+
 For `fetchAudio`, an `audioReady` control frame is immediately followed on the
 same receive stream by exactly `track.size` raw bytes and then stream finish.
 The desktop MUST serve only an indexed supported-audio path contained by the
@@ -761,6 +791,12 @@ button. A report is kind `1984`:
   ]
 }
 ```
+
+`x` always carries the SHA-256 of the reported content, as NIP-56 defines it.
+A report about an album cover names the cover event with `e` and carries the
+album key in a `napstr-cover` tag; it MUST NOT put the album key in `x`. See
+[NIP-NAPSTR-COVER.md](NIP-NAPSTR-COVER.md) for the cover report shape and for
+why the key is repeated there.
 
 Supported report types are `illegal`, `malware`, `spam`, `nudity`, `profanity`,
 `impersonation`, and `other`.

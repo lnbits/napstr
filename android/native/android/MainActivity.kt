@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.view.WindowManager
 import android.webkit.WebSettings
 import android.webkit.WebView
+import androidx.activity.addCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -19,6 +20,14 @@ class MainActivity : TauriActivity() {
     super.onCreate(savedInstanceState)
     // Keep Napstrfy visible until the user locks the phone or leaves the app.
     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    // The page gets first refusal on back, then the press continues to the
+    // system so back still leaves the app when nothing is open.
+    onBackPressedDispatcher.addCallback(this) {
+      if (BackBridge.consumeBack()) return@addCallback
+      isEnabled = false
+      onBackPressedDispatcher.onBackPressed()
+      isEnabled = true
+    }
   }
 
   override fun onWebViewCreate(webView: WebView) {
@@ -27,7 +36,9 @@ class MainActivity : TauriActivity() {
     // token-protected loopback server allowed by the CSP and network policy.
     webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
     MediaControlBridge.attach(webView)
+    BackBridge.attach(webView)
     webView.addJavascriptInterface(MediaControlBridge(this), "NapstrfyMedia")
+    webView.addJavascriptInterface(BackBridge(), "NapstrfyBack")
   }
 
   fun ensureMediaNotificationPermission() {
@@ -48,6 +59,7 @@ class MainActivity : TauriActivity() {
 
   override fun onDestroy() {
     MediaControlBridge.detach()
+    BackBridge.detach()
     super.onDestroy()
   }
 

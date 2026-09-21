@@ -1,0 +1,8 @@
+# Shell scripts are executed inside the Linux build containers, which mount this
+# working tree directly rather than checking it out themselves. With
+# core.autocrlf=true a Windows working copy would hand those scripts CRLF
+# endings, and bash stops on the second line of every one of them:
+#   set: pipefail\r: invalid option name
+# Pinning them to LF keeps the mounted scripts runnable from any host.
+*.sh text eol=lf
+scripts/appimage/AppRun text eol=lf

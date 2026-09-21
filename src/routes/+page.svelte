@@ -10,6 +10,10 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { open } from '@tauri-apps/plugin-dialog';
+  import CoverArt from '$lib/CoverArt.svelte';
+  import CoverPicker from '$lib/CoverPicker.svelte';
+  import CoverReport from '$lib/CoverReport.svelte';
+  import { albumsFor, artUrl, clearCoverCache, coverFor, coverKey, type CoverAlbum } from '$lib/artwork';
 
   let appVersion = '…';
   const SEARCH_PAGE_SIZE = 100;
@@ -17,9 +21,24 @@
   const CHAT_PAGE_SIZE = 100;
   const VISIBLE_SEEDER_LIMIT = 100;
 
-  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Napstrfy';
+  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Napstrfy' | 'Covers';
   type PlayerMode = 'single' | 'folder' | 'all';
   type PlayerOrigin = 'search' | 'downloads' | 'shared' | 'audiobook' | 'direct';
+  /** Repeat, as the phone offers it and this window now plays it. */
+  type RemoteRepeat = 'off' | 'all' | 'one';
+  /**
+   * A transport instruction a phone sent, forwarded by the playback bridge.
+   * Commands the native player carries out on its own - pause, stop, seek and
+   * volume - never reach the window, so only these arrive here.
+   */
+  type RemotePlaybackCommand =
+    | { type: 'play' }
+    | { type: 'toggle' }
+    | { type: 'next' }
+    | { type: 'previous' }
+    | { type: 'repeat'; mode: RemoteRepeat }
+    | { type: 'shuffle'; enabled: boolean }
+    | { type: 'playTrack'; fileId: string; queue: string[] };
   type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
   type Result = {
     id: number;
@@ -59,7 +78,8 @@
     { label: 'Profile', icon: '☺' },
     { label: 'Settings', icon: '⚙' },
     { label: 'Trollbox', icon: '▣' },
-    { label: 'Napstrfy', icon: '▯' }
+    { label: 'Napstrfy', icon: '▯' },
+    { label: 'Covers', icon: '▨' }
   ];
 
   type NativeFile = { fileId: string; filename: string; path: string; folder: string; size: number; format: string; status: string; title: string; artist: string; album: string; mime: string; license: string; description: string; tags: string };
@@ -189,6 +209,24 @@
   let activePlayerAudiobook: Audiobook | null = null;
   let playerQueue: PlayerTrack[] = [];
   let playerQueueIndex = -1;
+  /**
+   * The queue in the order it was chosen, so shuffle can be undone. Kept apart
+   * from `playerQueue` because a shuffled queue is the same tracks in another
+   * order, not a different queue.
+   */
+  let playerQueueOrder: PlayerTrack[] = [];
+  /** True while the queue came from a phone rather than from this window. */
+  let playerQueueRemote = false;
+  let playerRepeat: RemoteRepeat = 'off';
+  let playerShuffle = false;
+  /** What the bridge was last told, so a change is the only thing that is sent. */
+  let publishedQueueFacts = '';
+  let queueFacts: { len: number; index: number; repeat: RemoteRepeat; shuffle: boolean } = {
+    len: 0,
+    index: -1,
+    repeat: 'off',
+    shuffle: false
+  };
   let currentTrack: PlayerTrack | null = null;
   let playerPlaying = false;
   let playerLoading = false;
@@ -439,15 +477,23 @@
     return folder || '(Napstr folder)';
   }
 
-  function libraryFolders() {
-    return [...new Set(sharedFiles.map((file) => file.folder))]
+  function libraryFolders(files = sharedFiles) {
+    return [...new Set(files.map((file) => file.folder))]
       .sort((left, right) => folderName(left).localeCompare(folderName(right)));
   }
 
-  function visibleSharedFiles() {
-    return libraryFolderView === '*'
-      ? sharedFiles
-      : sharedFiles.filter((file) => file.folder === libraryFolderView);
+  /**
+   * The template reads the shared list through derived values rather than
+   * calling these directly: in legacy mode a template expression that only
+   * names a function is never re-run, so a library that changed underneath it
+   * went on drawing the rows it already had. The defaults keep every existing
+   * call working, and naming the state in the derived statement is what makes
+   * it a dependency.
+   */
+  function visibleSharedFiles(files = sharedFiles, folderView = libraryFolderView) {
+    return folderView === '*'
+      ? files
+      : files.filter((file) => file.folder === folderView);
   }
 
   function audiobookFolderFiles() {
@@ -467,9 +513,8 @@
     return sharedFiles.slice(start, start + LOCAL_PAGE_SIZE);
   }
 
-  function paginatedSharedFiles() {
-    const files = visibleSharedFiles();
-    const start = sharedLibraryPage * LOCAL_PAGE_SIZE;
+  function paginatedSharedFiles(files = visibleSharedFiles(), page = sharedLibraryPage) {
+    const start = page * LOCAL_PAGE_SIZE;
     return files.slice(start, start + LOCAL_PAGE_SIZE);
   }
 
@@ -528,31 +573,49 @@
     };
   }
 
-  function resultPageCount() {
-    return Math.max(1, Math.ceil(results.length / SEARCH_PAGE_SIZE));
+  // Every one of these takes its state as an argument rather than reading it
+  // out of the component. Svelte decides what a template expression depends on
+  // from the identifiers written in that expression, so `{resultRange()}` names
+  // only a function and the state read inside the body is invisible to it: the
+  // expression runs once and never again. The list would sit frozen while the
+  // caption beside it counted thousands of results. Passing the state in makes
+  // the dependency visible, and costs nothing over a hundred rows.
+  function resultPageCount(source: Result[]) {
+    return Math.max(1, Math.ceil(source.length / SEARCH_PAGE_SIZE));
   }
 
-  function paginatedResults() {
-    const start = resultPage * SEARCH_PAGE_SIZE;
-    return results.slice(start, start + SEARCH_PAGE_SIZE);
+  function paginatedResults(source: Result[], page: number) {
+    const start = page * SEARCH_PAGE_SIZE;
+    return source.slice(start, start + SEARCH_PAGE_SIZE);
   }
 
-  function resultRange() {
-    if (!results.length) return '0';
-    const start = resultPage * SEARCH_PAGE_SIZE + 1;
-    return `${start}–${Math.min(start + SEARCH_PAGE_SIZE - 1, results.length)}`;
+  function resultRange(source: Result[], page: number) {
+    if (!source.length) return '0';
+    const start = page * SEARCH_PAGE_SIZE + 1;
+    return `${start}–${Math.min(start + SEARCH_PAGE_SIZE - 1, source.length)}`;
   }
 
-  function availableResultTotal() {
-    return Math.max(results.length, browseTotalAvailable);
+  function availableResultTotal(source: Result[], totalAvailable: number) {
+    return Math.max(source.length, totalAvailable);
   }
+
+  // What the template reads. Each derivation names the state it comes from, so
+  // each one re-runs when that state changes.
+  $: resultPageTotal = resultPageCount(results);
+  $: resultPageItems = paginatedResults(results, resultPage);
+  $: resultRangeLabel = resultRange(results, resultPage);
+  $: resultAvailableTotal = availableResultTotal(results, browseTotalAvailable);
+  $: sharedVisible = visibleSharedFiles(sharedFiles, libraryFolderView);
+  $: sharedRows = paginatedSharedFiles(sharedVisible, sharedLibraryPage);
+  $: sharedPageCount = localPageCount(sharedVisible);
+  $: sharedFolders = libraryFolders(sharedFiles);
 
   async function changeResultPage(nextPage: number) {
-    if (nextPage >= resultPageCount() && browseCursor && !browseLoading) {
+    if (nextPage >= resultPageCount(results) && browseCursor && !browseLoading) {
       await loadNextBrowsePage();
     }
-    resultPage = Math.max(0, Math.min(nextPage, resultPageCount() - 1));
-    selectResult(paginatedResults()[0] ?? null);
+    resultPage = Math.max(0, Math.min(nextPage, resultPageCount(results) - 1));
+    selectResult(paginatedResults(results, resultPage)[0] ?? null);
   }
 
   function toPlayerTrack(file: NativeFile): PlayerTrack {
@@ -697,7 +760,9 @@
     activePlayerAudiobook = null;
     playerOrigin = origin;
     playerMode = indexed ? mode : 'single';
-    playerQueue = queueForTrack(track, playerMode, playerOrigin);
+    playerQueueRemote = false;
+    playerQueueOrder = queueForTrack(track, playerMode, playerOrigin);
+    playerQueue = playerShuffle ? shuffledQueue(playerQueueOrder, fileId) : playerQueueOrder;
     const index = Math.max(0, playerQueue.findIndex((item) => item.fileId === fileId));
     await loadPlayerTrack(index);
   }
@@ -744,17 +809,141 @@
   async function playerTrackEnded() {
     playerPlaying = false;
     playerEnded = true;
+    // Repeating one track is the whole answer: the queue is irrelevant.
+    if (playerRepeat === 'one') {
+      await loadPlayerTrack(playerQueueIndex);
+      return;
+    }
     if (playerMode !== 'single' && playerQueueIndex + 1 < playerQueue.length) {
       await loadPlayerTrack(playerQueueIndex + 1);
+      return;
     }
+    // The end of the queue, which is only the end when repeat says it is.
+    if (playerRepeat === 'all' && playerQueue.length > 1) await loadPlayerTrack(0);
   }
 
   function changePlayerMode() {
     window.localStorage.setItem('napstr-player-mode', playerMode);
     if (!currentTrack) return;
-    playerQueue = queueForTrack(currentTrack, playerMode, playerOrigin);
+    // A queue a phone chose is not a function of this window's mode, so it is
+    // left exactly as the phone sent it.
+    if (!playerQueueRemote) playerQueueOrder = queueForTrack(currentTrack, playerMode, playerOrigin);
+    applyPlayerQueueOrder();
+  }
+
+  /** Lay the chosen order out for playing, honouring shuffle. */
+  function applyPlayerQueueOrder() {
+    if (!currentTrack) return;
+    playerQueue = playerShuffle
+      ? shuffledQueue(playerQueueOrder, currentTrack.fileId)
+      : playerQueueOrder;
     playerQueueIndex = Math.max(0, playerQueue.findIndex((item) => item.fileId === currentTrack?.fileId));
   }
+
+  /** The track being played first, everything else shuffled after it. */
+  function shuffledQueue(order: PlayerTrack[], fileId: string) {
+    const playing = order.find((item) => item.fileId === fileId);
+    if (!playing) return shuffled(order);
+    return [playing, ...shuffled(order.filter((item) => item.fileId !== fileId))];
+  }
+
+  /**
+   * Play the track a phone asked for, from the list the phone was looking at.
+   *
+   * The list arrives as file ids in the phone's order and is used in that order.
+   * Tracks this computer does not hold are dropped, exactly as they are from its
+   * own search results: it can only play what it has, and a queue that stops on
+   * something unplayable is worse than a shorter one.
+   */
+  async function playRemoteQueue(fileId: string, fileIds: string[]) {
+    const order: PlayerTrack[] = [];
+    for (const id of fileIds) {
+      const file = sharedFiles.find((candidate) => candidate.fileId === id);
+      if (file) order.push(toPlayerTrack(file));
+    }
+    if (!order.some((item) => item.fileId === fileId)) {
+      activityMessage = 'That phone asked for a track this computer does not have';
+      return;
+    }
+    activePlayerAudiobook = null;
+    playerOrigin = 'direct';
+    playerQueueRemote = true;
+    // A list was asked for, so it is meant to play through. Leaving "Stop" in
+    // force would end playback after the first track, which contradicts what the
+    // phone just asked for, so the mode moves with it — and is written down so
+    // the window's own select does not show a mode that is not in force.
+    if (order.length > 1 && playerMode === 'single') {
+      playerMode = 'all';
+      window.localStorage.setItem('napstr-player-mode', playerMode);
+    }
+    playerQueueOrder = order;
+    playerQueue = playerShuffle ? shuffledQueue(order, fileId) : order;
+    await loadPlayerTrack(Math.max(0, playerQueue.findIndex((item) => item.fileId === fileId)));
+  }
+
+  /**
+   * Carry out a transport command a phone sent.
+   *
+   * Only what the native player cannot manage alone arrives here, which is why
+   * there is nothing to do for pause, stop, seek or volume.
+   */
+  async function handleRemoteCommand(command: RemotePlaybackCommand) {
+    switch (command.type) {
+      case 'play':
+        if (!playerPlaying) await togglePlayer();
+        break;
+      case 'toggle':
+        await togglePlayer();
+        break;
+      case 'next':
+        await nextPlayerTrack();
+        break;
+      case 'previous':
+        await previousPlayerTrack();
+        break;
+      case 'repeat':
+        playerRepeat = command.mode;
+        break;
+      case 'shuffle':
+        playerShuffle = command.enabled;
+        applyPlayerQueueOrder();
+        break;
+      case 'playTrack':
+        await playRemoteQueue(command.fileId, command.queue);
+        break;
+    }
+  }
+
+  /**
+   * Tell the bridge what the queue looks like. It cannot see any of this, and a
+   * phone shows a queue length and enables "next" from it.
+   */
+  async function publishPlayerQueueFacts(facts: {
+    len: number;
+    index: number;
+    repeat: RemoteRepeat;
+    shuffle: boolean;
+  }) {
+    const key = `${facts.len}:${facts.index}:${facts.repeat}:${facts.shuffle}`;
+    if (key === publishedQueueFacts) return;
+    publishedQueueFacts = key;
+    try {
+      await invoke('publish_playback_state', { snapshot: facts });
+    } catch {
+      // A phone that hears nothing simply sees no queue, as it did before.
+    }
+  }
+
+  // Re-runs whenever the queue or its state changes. The facts are assembled in
+  // the statement rather than inside the call, because a function that reads the
+  // variables itself never makes this depend on them.
+  $: queueFacts = {
+    len: playerQueue.length,
+    index: playerQueueIndex,
+    repeat: playerRepeat,
+    shuffle: playerShuffle
+  };
+  $: if (nativeReady) void publishPlayerQueueFacts(queueFacts);
 
   async function seekPlayer(event: Event) {
     try {
@@ -802,7 +991,7 @@
     } else {
       results = results.filter((result) => isLocalFile(result.fileId));
     }
-    resultPage = Math.min(resultPage, resultPageCount() - 1);
+    resultPage = Math.min(resultPage, resultPageCount(results) - 1);
     reconcileResultSelection();
   }
 
@@ -979,10 +1168,212 @@
     }
   }
 
+  // ---- Album covers (kind 30427) -------------------------------------------
+  //
+  // Reading the covers other people published needs no opt-in: it is an
+  // ordinary relay query, and it happens as results appear. The two switches
+  // here are the parts that leave Napstr — asking a central service, and
+  // signing with the user's own key. Both are stored by the backend, and the
+  // backend's worker acts on them by itself: there is no button to press for a
+  // pass to happen, and leaving one on means it resumes after a restart.
+  type CoverCandidate = { key: string; artist: string; album: string; trackCount: number; source: string };
+  type CoverStatus = {
+    lookupExternal: boolean;
+    publishClaims: boolean;
+    running: boolean;
+    current: string;
+    pending: number;
+    remaining: number;
+    published: number;
+    resolved: number;
+    alreadyCovered: number;
+    noArt: number;
+    failed: number;
+    backedOff: number;
+    stopped: boolean;
+    message: string;
+  };
+  /** How many albums the Covers tab previews. The worker itself is unbounded. */
+  const COVER_QUEUE_PREVIEW = 25;
+  // Deliberately plain `let`s, like every other variable in this file. A single
+  // rune anywhere in the component compiles the whole thing in runes mode, which
+  // silently makes every plain `let` here non-reactive - including the
+  // `desktopRuntime` gate that draws the window. The result is a blank white
+  // screen with no error in the console, which is exactly what a stray `$state`
+  // in this file cost once already.
+  let coverQueue: CoverCandidate[] = [];
+  let coverStatus: CoverStatus | null = null;
+  let coverLoading = false;
+  let coverError = '';
+  // Bumped when the worker produces art, which is what makes the tiles ask
+  // again. A long pass would otherwise leave every square blank until it ended.
+  let coverRevision = 0;
+  let lastCoverRevisionAt = 0;
+
+  // ---- Results presentation ------------------------------------------------
+  //
+  // A view preference rather than a privacy one, so it lives beside the player
+  // mode in the webview's own storage rather than in the database.
+  const RESULTS_VIEW_KEY = 'napstr-results-view';
+  let resultsView: 'list' | 'thumb' = 'list';
+
+  function setResultsView(view: 'list' | 'thumb') {
+    resultsView = view;
+    try {
+      window.localStorage.setItem(RESULTS_VIEW_KEY, view);
+    } catch {
+      // A preference that cannot be stored is still honoured for this session.
+    }
+  }
+
+  /** Are either of the two cover switches on? Passed the status it reads for the
+   *  same reason `paginatedResults` is passed the results: a helper that reads
+   *  component state itself is invisible to the template's dependency tracking. */
+  function coverOptIn(status: CoverStatus | null) {
+    return Boolean(status?.lookupExternal || status?.publishClaims);
+  }
+
+  /** The worker changed what art exists, so nothing cached may survive it.
+   *  Throttled: a pass resolving hundreds of albums must not make the window
+   *  re-ask for a page of tiles that many times. */
+  function refreshCoverArtwork() {
+    const now = Date.now();
+    if (now - lastCoverRevisionAt < 5000) return;
+    lastCoverRevisionAt = now;
+    clearCoverCache();
+    coverRevision += 1;
+  }
+
+  async function refreshCoverStatus() {
+    try {
+      coverStatus = await invoke<CoverStatus>('cover_status');
+    } catch {
+      // The Covers tab reports its own errors; this is only for the switches.
+    }
+  }
+
+  async function refreshCovers() {
+    coverLoading = true;
+    coverError = '';
+    try {
+      coverStatus = await invoke<CoverStatus>('cover_status');
+      coverQueue = await invoke<CoverCandidate[]>('cover_candidates', { limit: COVER_QUEUE_PREVIEW });
+    } catch (error) {
+      coverError = String(error);
+    } finally {
+      coverLoading = false;
+    }
+  }
+
+  async function setCoverPreferences(lookupExternal: boolean, publishClaims: boolean) {
+    coverError = '';
+    try {
+      coverStatus = await invoke<CoverStatus>('set_cover_preferences', { lookupExternal, publishClaims });
+    } catch (error) {
+      coverError = String(error);
+    }
+  }
+
+  /** Skip the wait: ask the worker to look at whatever is new right now. */
+  async function lookForCoversNow() {
+    coverError = '';
+    try {
+      await invoke('nudge_cover_worker');
+    } catch (error) {
+      coverError = String(error);
+    }
+  }
+
+  async function stopCoverPass() {
+    try {
+      await invoke('cancel_cover_scan');
+    } catch (error) {
+      coverError = String(error);
+    }
+  }
+
+  /** Report the albums the results pane is drawing.
+   *
+   * Silent and debounced — this is not a button. It is what makes "albums seen
+   * in search results" reach the cover worker without scanning the catalogue
+   * cache, which on a used install holds thousands of albums nobody looked at.
+   * Pages are accumulated so flicking quickly through results still reports
+   * every page that was actually drawn. */
+  let noteVisibleHandle: number | null = null;
+  const notedAlbums = new Map<string, CoverAlbum>();
+
+  function noteVisibleAlbums(currentResults: Result[], page: number) {
+    if (!desktopRuntime || activeView !== 'Search') return;
+    for (const album of albumsFor(paginatedResults(currentResults, page))) {
+      notedAlbums.set(`${album.artist}\u0000${album.album}`, album);
+    }
+    if (noteVisibleHandle !== null) window.clearTimeout(noteVisibleHandle);
+    noteVisibleHandle = window.setTimeout(flushNotedAlbums, 800);
+  }
+
+  function flushNotedAlbums() {
+    noteVisibleHandle = null;
+    if (!notedAlbums.size) return;
+    const albums = [...notedAlbums.values()];
+    notedAlbums.clear();
+    // One write per page of results, whether or not a switch is on: reporting
+    // is harmless, and it means switching lookups on covers what is on screen.
+    void invoke('note_visible_albums', { albums }).catch(() => {
+      // A window that cannot report says nothing about the results themselves.
+    });
+  }
+
+  // Re-runs whenever the page of results the pane is showing changes.
+  $: noteVisibleAlbums(results, resultPage);
+
+  /** The album whose art is being chosen by hand, or null when the tool is shut. */
+  let coverPicker: { artist: string; album: string; currentArt: string } | null = null;
+
+  /** Open the manual art tool for one album, showing the art in use now so the
+   *  person can compare it against what MusicBrainz offers. */
+  async function openCoverPicker(artist: string, album: string) {
+    const trimmedArtist = artist.trim();
+    const trimmedAlbum = album.trim();
+    if (!trimmedArtist || !trimmedAlbum) return;
+    coverPicker = { artist: trimmedArtist, album: trimmedAlbum, currentArt: '' };
+    try {
+      const cover = await coverFor(trimmedArtist, trimmedAlbum);
+      if (coverPicker && coverPicker.artist === trimmedArtist && coverPicker.album === trimmedAlbum) {
+        coverPicker = { ...coverPicker, currentArt: artUrl(cover, false) };
+      }
+    } catch {
+      // The art is only here for comparison; the tool works without it.
+    }
+  }
+
+  /** A pick was filed, so every cached answer for it is now wrong. */
+  function coverPickApplied() {
+    clearCoverCache();
+    coverRevision += 1;
+    void refreshCoverStatus();
+  }
+
+  /** The cover being reported, or null. Reporting is about the claim that is
+   *  actually winning for this album, which is why only the key travels. */
+  let coverReport: { key: string; label: string } | null = null;
+
+  function openCoverReport(artist: string, album: string) {
+    const key = coverKey(artist, album);
+    if (!key) {
+      activityMessage = 'This album names no artist and album to report.';
+      return;
+    }
+    coverReport = {
+      key,
+      label: `${album.trim() || 'Untitled'} · ${artist.trim() || 'Unknown artist'}`
+    };
+  }
+
   function activateView(view: View) {
     activeView = view;
     if (view === 'Trollbox') void refreshTrollbox();
     if (view === 'Napstrfy') void openMobileConnect();
+    if (view === 'Covers') void refreshCovers();
   }
 
   async function openMobileConnect() {
@@ -1101,7 +1492,7 @@
 
   function reconcileResultSelection(forceSubscribe = false) {
     const remaining = results.filter((item) => selectedResultIds.has(item.fileId));
-    const next = remaining.find((item) => item.fileId === selected?.fileId) ?? remaining[0] ?? paginatedResults()[0] ?? null;
+    const next = remaining.find((item) => item.fileId === selected?.fileId) ?? remaining[0] ?? paginatedResults(results, resultPage)[0] ?? null;
     selectedResultIds = new Set(remaining.length ? remaining.map((item) => item.fileId) : next ? [next.fileId] : []);
     if (!results.some((item) => item.fileId === resultSelectionAnchor)) resultSelectionAnchor = next?.fileId ?? null;
     selectResult(next, forceSubscribe, true);
@@ -1461,7 +1852,7 @@
           activityMessage = format === 'Audiobooks'
             ? msg("{p0} audiobook collections found", { p0: results.length })
             : !trimmedQuery
-            ? msg("{p0} loaded of {p1} currently available file IDs, ranked by active seeders", { p0: results.length, p1: availableResultTotal() })
+            ? msg("{p0} loaded of {p1} currently available file IDs, ranked by active seeders", { p0: results.length, p1: availableResultTotal(results, browseTotalAvailable) })
             : msg("{p0} available file IDs, ranked by active seeders", { p0: results.length });
         }
         // Audiobook manifests are additive. Let ordinary track results render
@@ -1480,7 +1871,7 @@
           activityMessage = format === 'Audiobooks'
             ? msg("{p0} audiobook collections found", { p0: results.length })
             : !trimmedQuery
-            ? msg("{p0} loaded of {p1} currently available file IDs, ranked by active seeders", { p0: results.length, p1: availableResultTotal() })
+            ? msg("{p0} loaded of {p1} currently available file IDs, ranked by active seeders", { p0: results.length, p1: availableResultTotal(results, browseTotalAvailable) })
             : msg("{p0} available file IDs, ranked by active seeders", { p0: results.length });
         });
         }
@@ -1522,8 +1913,8 @@
       resultsAreNetwork = true;
       reconcileResultSelection();
       activityMessage = user
-        ? msg("{p0} loaded of {p1} tracks shared by {p2}", { p0: results.length, p1: availableResultTotal(), p2: user.displayName })
-        : msg("{p0} loaded of {p1} currently available file IDs, ranked by active seeders", { p0: results.length, p1: availableResultTotal() });
+        ? msg("{p0} loaded of {p1} tracks shared by {p2}", { p0: results.length, p1: availableResultTotal(results, browseTotalAvailable), p2: user.displayName })
+        : msg("{p0} loaded of {p1} currently available file IDs, ranked by active seeders", { p0: results.length, p1: availableResultTotal(results, browseTotalAvailable) });
     } catch (error) {
       if (generation === browseGeneration) activityMessage = msg("Could not load the next catalogue page: {p0}", { p0: String(error) });
     } finally {
@@ -2121,7 +2512,11 @@
     setTransferPaneHeight(Number.isFinite(savedTransferHeight) && savedTransferHeight > 0 ? savedTransferHeight : window.innerHeight < 700 ? 94 : 119);
     const clampTransferPane = () => setTransferPaneHeight(transferPaneHeight);
     window.addEventListener('resize', clampTransferPane);
+    if (window.localStorage.getItem(RESULTS_VIEW_KEY) === 'thumb') resultsView = 'thumb';
     refreshSnapshot().then(connectNetwork);
+    // The two cover switches live in the database, so the window can show their
+    // real state straight away instead of only after a visit to the Covers tab.
+    void refreshCoverStatus();
     void getVersion()
       .then((version) => {
         appVersion = version;
@@ -2146,6 +2541,12 @@
       if (destroyed) unlisten();
       else eventUnlisteners.push(unlisten);
     });
+    void listen<RemotePlaybackCommand>('napstr-remote-playback', ({ payload }) => {
+      void handleRemoteCommand(payload);
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
+    });
     void listen('napstr-transfers-changed', () => {
       void invoke<NativeTransfer[]>('get_transfers')
         .then(async (items) => {
@@ -2154,6 +2555,20 @@
           if (audiobookDownloads.length) await advanceAudiobookDownloads();
         })
         .catch(() => {});
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
+    });
+    void listen<CoverStatus>('napstr-cover-status', ({ payload }) => {
+      const grew =
+        payload.published > (coverStatus?.published ?? 0) ||
+        payload.resolved > (coverStatus?.resolved ?? 0);
+      const finished = Boolean(coverStatus?.running) && !payload.running;
+      coverStatus = payload;
+      // New art exists, so the tiles are stale. On a long pass this also lets
+      // covers appear as they are found instead of all at the end.
+      if (grew || finished) refreshCoverArtwork();
+      if (finished && activeView === 'Covers') void refreshCovers();
     }).then((unlisten) => {
       if (destroyed) unlisten();
       else eventUnlisteners.push(unlisten);
@@ -2340,6 +2755,25 @@
       <label class="player-volume">{$t("Vol")} <input aria-label={$t("Volume")} type="range" min="0" max="1" step="0.05" value={playerVolume} oninput={changePlayerVolume} /></label>
     </section>
 
+    {#if coverPicker}
+      <CoverPicker
+        artist={coverPicker.artist}
+        album={coverPicker.album}
+        currentArt={coverPicker.currentArt}
+        onClose={() => (coverPicker = null)}
+        onApplied={coverPickApplied}
+      />
+    {/if}
+
+    {#if coverReport}
+      <CoverReport
+        albumKey={coverReport.key}
+        label={coverReport.label}
+        onClose={() => (coverReport = null)}
+        onReported={(message: string) => (activityMessage = message)}
+      />
+    {/if}
+
     <div class="workspace">
       {#if activeView === 'Search'}
         <section class="panel search-panel">
@@ -2371,12 +2805,44 @@
 
         <div class="split-content">
           <section class="results-pane" aria-label={$t("Search results")}>
-            <div class="section-caption"><span>{$t("Results for “{p0}”", { p0: ["All audio", "All audiobooks", "local catalogue", "Surprise me"].includes(searchedQuery) ? $t(searchedQuery) : searchedQuery })}</span><small>{format === 'Audiobooks' ? $t("Audiobooks found: {p0}", { p0: results.length }) : browseTotalAvailable ? $t("{p0} loaded of {p1} available", { p0: results.length, p1: availableResultTotal() }) : $t("{p0} file IDs found", { p0: results.length })}</small></div>
+            <div class="section-caption">
+              <span>{$t("Results for “{p0}”", { p0: ["All audio", "All audiobooks", "local catalogue", "Surprise me"].includes(searchedQuery) ? $t(searchedQuery) : searchedQuery })}</span>
+              <div class="results-caption-tools">
+                <small>{format === 'Audiobooks' ? $t("Audiobooks found: {p0}", { p0: results.length }) : browseTotalAvailable ? $t("{p0} loaded of {p1} available", { p0: results.length, p1: resultAvailableTotal }) : $t("{p0} file IDs found", { p0: results.length })}</small>
+                <button type="button" class="view-toggle" class:active={resultsView === 'list'} title={$t("Show these results as a list")} aria-pressed={resultsView === 'list'} onclick={() => setResultsView('list')}>▤</button>
+                <button type="button" class="view-toggle" class:active={resultsView === 'thumb'} title={$t("Show these results as thumbnails, with album art")} aria-pressed={resultsView === 'thumb'} onclick={() => setResultsView('thumb')}>▦</button>
+              </div>
+            </div>
+            {#if resultsView === 'thumb'}
+              <div class="result-grid" aria-label={$t("Search results as thumbnails")}>
+                {#each resultPageItems as item}
+                  <button
+                    type="button"
+                    class="result-card"
+                    class:selected={selectedResultIds.has(item.fileId)}
+                    aria-pressed={selectedResultIds.has(item.fileId)}
+                    onclick={(event) => selectResultRange(item, event)}
+                    ondblclick={(event) => { if (!event.shiftKey) void activateSelected(); }}
+                  >
+                    {#if item.audiobook}
+                      <span class="cover-art medium empty" aria-hidden="true">▥</span>
+                    {:else}
+                      <CoverArt artist={item.artist ?? ''} album={item.album ?? ''} preferThumb size="medium" revision={coverRevision} />
+                    {/if}
+                    <b title={item.name}>{item.name}</b>
+                    <small title={item.artist || undefined}>{item.artist || $t('Unknown artist')}</small>
+                    <small class="result-card-album" title={item.album || undefined}>{item.album || '—'}</small>
+                    <span class="result-card-meta"><i class="source-dot"></i>{item.sources} {item.sources === 1 ? $t('seeder') : $t('seeders')} · {item.size}</span>
+                  </button>
+                {/each}
+                {#if results.length === 0}<p class="empty-state">{$t("Nothing to show yet.")}</p>{/if}
+              </div>
+            {:else}
             <div class="table-wrap">
               <table class="file-table search-results-table">
                 <thead><tr><th class="name-col">{$t("Name")}</th><th>{$t("Type")}</th><th class="number">{$t("Size")}</th><th class="number">{$t("Seeders")}</th><th>{$t("Line speed")}</th><th>{$t("Length")}</th></tr></thead>
                 <tbody>
-                  {#each paginatedResults() as item}
+                  {#each resultPageItems as item}
                     <tr class:selected={selectedResultIds.has(item.fileId)} aria-selected={selectedResultIds.has(item.fileId)} tabindex="0"
                       onclick={(event) => selectResultRange(item, event)}
                       onkeydown={(event) => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); selectResultRange(item, event); } }}
@@ -2387,10 +2853,11 @@
                 </tbody>
               </table>
             </div>
+            {/if}
             <div class="results-pager">
               <button onclick={() => void changeResultPage(resultPage - 1)} disabled={resultPage === 0}>{$t("◀ Previous")}</button>
-              <span>{$t("Showing {range} of {count} loaded", { range: resultRange(), count: results.length })}{browseTotalAvailable ? $t(" · {p0} available", { p0: availableResultTotal() }) : ''} · {$t("Page {page} of {pages}", { page: resultPage + 1, pages: resultPageCount() })}{browseCursor ? '+' : ''}</span>
-              <button onclick={() => void changeResultPage(resultPage + 1)} disabled={browseLoading || (resultPage + 1 >= resultPageCount() && !browseCursor)}>{browseLoading ? $t("Loading…") : $t("Next ▶")}</button>
+              <span>{$t("Showing {range} of {count} loaded", { range: resultRangeLabel, count: results.length })}{browseTotalAvailable ? $t(" · {p0} available", { p0: resultAvailableTotal }) : ''} · {$t("Page {page} of {pages}", { page: resultPage + 1, pages: resultPageTotal })}{browseCursor ? '+' : ''}</span>
+              <button onclick={() => void changeResultPage(resultPage + 1)} disabled={browseLoading || (resultPage + 1 >= resultPageTotal && !browseCursor)}>{browseLoading ? $t("Loading…") : $t("Next ▶")}</button>
             </div>
           </section>
 
@@ -2425,6 +2892,12 @@
                 <div class="detail-actions">{#if selectedAudiobookComplete()}<button class="classic-button primary" onclick={playSelectedAudiobook}>{$t("▶ Play book")}</button><button class="classic-button" onclick={openNapstrFolder}>{$t("Open folder")}</button>{:else}<button class="classic-button primary" disabled={selectedAudiobookDownloading()} onclick={downloadSelectedAudiobook}>⇩ {selectedAudiobookDownloading() ? $t("Downloading…") : $t("Download book")}</button>{/if}</div>
                 {#if !selected.audiobook.local}<p class="privacy-note"><span>♜</span> {$t("Chapters download first-to-last through private Tor onion services. Play each chapter as soon as it shows Ready.")}</p>{:else}<p class="privacy-note"><span>♬</span> {$t("This complete audiobook is ready to play.")}</p>{/if}
               {:else}
+              <div class="detail-cover">
+                <CoverArt artist={selected.artist ?? ''} album={selected.album ?? ''} size="large" revision={coverRevision} />
+              </div>
+              {#if selected.artist && selected.album}
+                <div class="detail-actions"><button class="classic-button" onclick={() => void openCoverPicker(selected?.artist ?? '', selected?.album ?? '')}>{$t("Fix album art…")}</button><button class="classic-button" title={$t("Report the cover published for this album as a NIP-56 report")} onclick={() => openCoverReport(selected?.artist ?? '', selected?.album ?? '')}>{$t("Report cover…")}</button></div>
+              {/if}
               <div class="selected-file">
                 <div class="large-file-icon">▶</div>
                 <div><strong>{selected.name}</strong><span>{selected.format} · {selected.size} · {selected.length}</span><small>{$t("File ID:")} {selected.fileId}</small></div>
@@ -2510,18 +2983,18 @@
               {#if libraryFolderMenuOpen}
                 <div class="folder-picker-menu" role="listbox" aria-label={$t("View folder")}>
                   <button type="button" role="option" aria-selected={libraryFolderView === '*'} class:selected={libraryFolderView === '*'} onclick={() => selectLibraryFolder('*')}>{$t("All folders")}</button>
-                  {#each libraryFolders() as folder}
+                  {#each sharedFolders as folder}
                     <button type="button" role="option" aria-selected={libraryFolderView === folder} class:selected={libraryFolderView === folder} onclick={() => selectLibraryFolder(folder)} title={folderName(folder)}>{folderName(folder)}</button>
                   {/each}
                 </div>
               {/if}
             </div>
-            <span class="library-song-count">{$t("Songs shown: {p0}", { p0: visibleSharedFiles().length })}</span>
+            <span class="library-song-count">{$t("Songs shown: {p0}", { p0: sharedVisible.length })}</span>
           </div>
           {#if !currentFolderAudiobook() && libraryFolderView.toLowerCase().includes('audiobook') && audiobookFolderFiles().length >= 1}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>{$t("Possible audiobook detected")}</b><small>{$t("Review the natural chapter order before making the collection public.")}</small></div><button class="classic-button primary" onclick={openAudiobookEditor}>{$t("Group as audiobook…")}</button></div>{/if}
           {#if currentFolderAudiobook()}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>{currentFolderAudiobook()?.title}</b><small>{currentFolderAudiobook()?.author || $t("Unknown author")} · {currentFolderAudiobook()?.chapters.length} {$t("ordered chapters · published as one audiobook")}</small></div><button class="classic-button primary" onclick={() => playAudiobook(currentFolderAudiobook()!)}>{$t("▶ Play book")}</button></div>{/if}
-          <table class="file-table shared-table"><thead><tr><th>{$t("Name")}</th><th>{$t("Folder")}</th><th>{$t("Size")}</th><th>{$t("Catalogue")}</th><th>{$t("Active peers")}</th></tr></thead><tbody>{#each paginatedSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? $t("Published") : $t("Indexed")}</td><td>{file.peers}</td></tr>{/each}</tbody></table>
-          {#if visibleSharedFiles().length > LOCAL_PAGE_SIZE}<div class="results-pager"><button disabled={sharedLibraryPage === 0} onclick={() => changeSharedLibraryPage(sharedLibraryPage - 1)}>{$t("◀ Previous")}</button><span>{$t("Showing {range} of {count} loaded", { range: localPageRange(sharedLibraryPage, visibleSharedFiles().length), count: visibleSharedFiles().length })} · {$t("Page {page} of {pages}", { page: sharedLibraryPage + 1, pages: localPageCount(visibleSharedFiles()) })}</span><button disabled={sharedLibraryPage + 1 >= localPageCount(visibleSharedFiles())} onclick={() => changeSharedLibraryPage(sharedLibraryPage + 1)}>{$t("Next ▶")}</button></div>{/if}
+          <table class="file-table shared-table"><thead><tr><th>{$t("Name")}</th><th>{$t("Folder")}</th><th>{$t("Size")}</th><th>{$t("Catalogue")}</th><th>{$t("Active peers")}</th></tr></thead><tbody>{#each sharedRows as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? $t("Published") : $t("Indexed")}</td><td>{file.peers}</td></tr>{/each}</tbody></table>
+          {#if sharedVisible.length > LOCAL_PAGE_SIZE}<div class="results-pager"><button disabled={sharedLibraryPage === 0} onclick={() => changeSharedLibraryPage(sharedLibraryPage - 1)}>{$t("◀ Previous")}</button><span>{$t("Showing {range} of {count} loaded", { range: localPageRange(sharedLibraryPage, sharedVisible.length), count: sharedVisible.length })} · {$t("Page {page} of {pages}", { page: sharedLibraryPage + 1, pages: sharedPageCount })}</span><button disabled={sharedLibraryPage + 1 >= sharedPageCount} onclick={() => changeSharedLibraryPage(sharedLibraryPage + 1)}>{$t("Next ▶")}</button></div>{/if}
           <p class="privacy-note wide"><span>♜</span> {$t("Only validated MP3, FLAC, WAV, Ogg Vorbis, and Opus audio is indexed recursively. Put book folders or complete one-file books inside Audiobooks for automatic grouping. Existing contents are never replaced. Folder names remain local and embedded cover artwork is allowed.")}</p>
         </section>
       {:else if activeView === 'Trollbox'}
@@ -2539,6 +3012,59 @@
           <div class="trollbox-compose">
             <input bind:value={trollboxDraft} maxlength="500" autocomplete="off" placeholder={networkConnected ? $t("Type a public message…") : $t("Connect to Nostr to chat")} disabled={!networkConnected || trollboxSending} aria-label={$t("Trollbox message")} onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void sendTrollboxMessage(); } }} />
             <button class="classic-button primary" type="button" disabled={!networkConnected || trollboxSending || !trollboxDraft.trim()} onclick={() => void sendTrollboxMessage()}>{trollboxSending ? $t("Sending…") : $t("Send")}</button>
+          </div>
+        </section>
+      {:else if activeView === 'Covers'}
+        <section class="full-panel cover-scan-view">
+          <div class="panel-title"><span></span><b>{$t("Album covers")}</b><span></span></div>
+          <p class="privacy-note wide"><span>i</span> {$t("Napstr finds album art in two steps. Reading the kind")} <code>30427</code> {$t("claims other people published needs nothing switched on: it is an ordinary relay query, and it happens by itself as results appear. The two switches below are the steps that leave Napstr. Napstr acts on them on its own — there is nothing else to press — and they are stored, so leaving one on means it carries on after a restart.")}</p>
+
+          <div class="cover-scan-controls">
+            <label class="cover-scan-toggle">
+              <input type="checkbox" checked={coverStatus?.lookupExternal ?? false} onchange={(event) => void setCoverPreferences(event.currentTarget.checked, coverStatus?.publishClaims ?? false)} />
+              <span>{$t("Look up art automatically")}<small>{$t("Asks MusicBrainz and the Cover Art Archive about every album without a cover: the ones on this computer, and the albums the results pane has shown you")}</small></span>
+            </label>
+            <label class="cover-scan-toggle">
+              <input type="checkbox" checked={coverStatus?.publishClaims ?? false} onchange={(event) => void setCoverPreferences(coverStatus?.lookupExternal ?? false, event.currentTarget.checked)} />
+              <span>{$t("Sign and publish the covers I resolve")}<small>{$t("A kind")} <code>30427</code> {$t("claim signed with your own identity and sent to your relays, as fast as they can be signed")}</small></span>
+            </label>
+            {#if coverStatus?.running}
+              <button class="classic-button" onclick={() => void stopCoverPass()}>{$t("Stop")}</button>
+            {:else}
+              <button class="classic-button" onclick={() => void lookForCoversNow()} disabled={!coverOptIn(coverStatus)}>{$t("Look now")}</button>
+            {/if}
+            <button class="classic-button" onclick={() => void refreshCovers()} disabled={coverLoading}>{$t("Refresh")}</button>
+          </div>
+
+          {#if coverError}<div class="trollbox-error">{coverError}</div>{/if}
+
+          {#if coverStatus}
+            <div class="cover-scan-status">
+              <span><b>{coverStatus.running ? coverStatus.remaining : coverStatus.pending}</b> {coverStatus.running ? 'left in this pass' : 'in the last pass'}</span>
+              <span><b>{coverStatus.published}</b> {$t("published")}</span>
+              <span><b>{coverStatus.resolved}</b> {$t("resolved, not signed")}</span>
+              <span><b>{coverStatus.alreadyCovered}</b> {$t("covered by others")}</span>
+              <span><b>{coverStatus.noArt}</b> {$t("no art anywhere")}</span>
+              {#if coverStatus.failed}<span><b>{coverStatus.failed}</b> {$t("failed")}</span>{/if}
+              {#if coverStatus.backedOff}<span><b>{coverStatus.backedOff}</b> {$t("throttled waits")}</span>{/if}
+            </div>
+            {#if coverStatus.current}<p class="cover-scan-current">{$t("Working on")} {coverStatus.current}</p>{/if}
+            {#if coverStatus.message}<p class="cover-scan-message">{coverStatus.message}</p>{/if}
+          {/if}
+
+          <div class="cover-candidate-list">
+            {#each coverQueue as candidate (candidate.key)}
+              <div class="cover-candidate">
+                <div><b>{candidate.album}</b><small>{candidate.artist}</small></div>
+                <span>{candidate.trackCount} {candidate.trackCount === 1 ? 'track' : 'tracks'} · {candidate.source}</span>
+                <code title={candidate.key}>{candidate.key}</code>
+                <button class="classic-button" onclick={() => void openCoverPicker(candidate.artist, candidate.album)}>{$t("Find art…")}</button>
+                <button class="classic-button" title={$t("Report the cover published for this album")} onclick={() => openCoverReport(candidate.artist, candidate.album)}>{$t("Report")}</button>
+              </div>
+            {/each}
+            {#if !coverLoading && coverQueue.length === 0}
+              <p class="empty-state compact">{coverOptIn(coverStatus) ? 'Nothing is waiting. New music and new browsing wake Napstr by themselves.' : 'Switch one of these on and Napstr starts on its own.'}</p>
+            {/if}
           </div>
         </section>
       {:else if activeView === 'Napstrfy'}

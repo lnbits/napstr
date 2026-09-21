@@ -4,10 +4,14 @@ use public_http::{podcast_http_client, safe_public_https_url};
 use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
-    ClientRequest, PairingTicket, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack,
-    RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES,
+    ClientRequest, PairingTicket, PlaybackCommand, RemoteAlbumCover, RemoteAudiobook,
+    RemoteAudiobookSummary, RemotePlaybackState, RemoteTrack, RemoteTransfer, ServerResponse,
+    ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES,
+    MAX_REPORT_NOTE_CHARS,
+    REPORT_REASONS,
 };
 use quick_xml::{events::Event, Reader};
+use qrcode::{render::svg, QrCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -46,6 +50,9 @@ struct CompanionStatus {
     desktop_name: String,
     endpoint_id: String,
     library_revision: u64,
+    /// Moves when the host's art changes, so cached covers - including "the host
+    /// has none" - are asked about again instead of being trusted forever.
+    cover_revision: u64,
     error: String,
 }
 
@@ -90,6 +97,26 @@ struct AudiobookLibraryPage {
 struct CachedAudio {
     url: String,
     track: RemoteTrack,
+}
+
+/// A read-only pairing code, minted by the host, for this phone to show.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadOnlyTicketOffer {
+    uri: String,
+    /// Empty when the host drew no QR, or drew something this app is not willing
+    /// to insert into its own page.
+    qr_svg: String,
+    expires_at: i64,
+    desktop_name: String,
+}
+
+/// What the host signed and published on this phone's behalf.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoverReport {
+    report_id: String,
+    queued: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1381,6 +1408,17 @@ impl RemoteClient {
         Err(last_error)
     }
 
+    /// True when this pairing may only browse and play, which is what keeps the
+    /// phone from offering controls the host would refuse anyway.
+    async fn stream_only(&self) -> bool {
+        self.desktop
+            .read()
+            .await
+            .as_ref()
+            .map(|desktop| desktop.stream_only)
+            .unwrap_or(false)
+    }
+
     async fn status(&self) -> CompanionStatus {
         let desktop = self.desktop.read().await.clone();
         if desktop.is_none() {
@@ -1391,6 +1429,7 @@ impl RemoteClient {
                 desktop_name: String::new(),
                 endpoint_id: String::new(),
                 library_revision: 0,
+                cover_revision: 0,
                 error: String::new(),
             };
         }
@@ -1405,10 +1444,12 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error: "Napstr did not answer yet".into(),
             },
             Ok(Ok(ServerResponse::Status {
                 library_revision,
+                cover_revision,
                 stream_only,
             })) => {
                 if stream_only != desktop.stream_only {
@@ -1428,6 +1469,7 @@ impl RemoteClient {
                     desktop_name: desktop.desktop_name,
                     endpoint_id: desktop.endpoint_id,
                     library_revision,
+                    cover_revision,
                     error: String::new(),
                 }
             }
@@ -1441,6 +1483,7 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error: unexpected_response(&other),
             },
             Ok(Err(error)) => CompanionStatus {
@@ -1450,6 +1493,7 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error,
             },
         }
@@ -1465,6 +1509,7 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error: String::new(),
             },
             Ok(Ok(other)) => CompanionStatus {
@@ -1474,6 +1519,7 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error: unexpected_response(&other),
             },
             Ok(Err(error)) => CompanionStatus {
@@ -1483,6 +1529,7 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error,
             },
             Err(_) => CompanionStatus {
@@ -1492,6 +1539,7 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error: "Napstr did not answer yet".into(),
             },
         }
@@ -1791,6 +1839,224 @@ async fn remote_library(
 #[tauri::command]
 async fn cached_library(state: State<'_, AppState>) -> Result<OfflineLibrary, String> {
     state.remote.offline_library().await
+}
+
+/// Album artwork for the given `artist|album` keys, resolved by the paired
+/// Napstr host from kind `30427` cover events.
+///
+/// The phone never talks to relays itself: the host owns the relay pool, the
+/// catalogue, and the availability heartbeats that decide which claim wins.
+/// Requests are chunked so each one, and each answer, fits inside a single
+/// control frame.
+async fn companion_covers(
+    remote: &RemoteClient,
+    keys: Vec<String>,
+) -> Result<Vec<RemoteAlbumCover>, String> {
+    let keys = normalise_cover_request(&keys);
+    let mut covers = Vec::new();
+    for batch in keys.chunks(MAX_COVER_KEYS) {
+        let response = remote
+            .request(ClientRequest::AlbumCovers {
+                keys: batch.to_vec(),
+            })
+            .await?;
+        match response {
+            ServerResponse::AlbumCovers {
+                covers: batch_covers,
+            } => covers.extend(batch_covers),
+            response => return Err(unexpected_response(&response)),
+        }
+    }
+    Ok(covers)
+}
+
+#[tauri::command]
+async fn remote_covers(
+    keys: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<RemoteAlbumCover>, String> {
+    companion_covers(&state.remote, keys).await
+}
+
+/// Cover keys are `trim(artist)|trim(album)`, lowercased, exactly one
+/// separator, at most 300 characters, exactly as the cover NIP defines them.
+/// Rewriting here means the phone and the host always agree on the key, and a
+/// sloppy caller cannot silently match nothing.
+fn normalise_cover_request(keys: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalised = Vec::new();
+    for key in keys {
+        let Some(key) = normalise_cover_key(key) else {
+            continue;
+        };
+        if seen.insert(key.clone()) {
+            normalised.push(key);
+        }
+        if normalised.len() >= MAX_COVER_KEYS * 4 {
+            break;
+        }
+    }
+    normalised
+}
+
+fn normalise_cover_key(value: &str) -> Option<String> {
+    let mut halves = value.split('|');
+    let artist = halves.next()?.trim().to_lowercase();
+    let album = halves.next()?.trim().to_lowercase();
+    if halves.next().is_some() || artist.is_empty() || album.is_empty() {
+        return None;
+    }
+    let key = format!("{artist}|{album}");
+    (key.chars().count() <= 300).then_some(key)
+}
+
+/// What the paired Napstr desktop is playing, if anything.
+///
+/// A read-only pairing may ask this too: seeing what the computer is doing is
+/// not a way of changing it.
+#[tauri::command]
+async fn remote_playback_state(
+    state: State<'_, AppState>,
+) -> Result<RemotePlaybackState, String> {
+    let response = state
+        .remote
+        .request(ClientRequest::PlaybackState)
+        .await
+        .map_err(|error| friendly_if_missing(error, PLAYBACK_UNAVAILABLE))?;
+    match response {
+        ServerResponse::Playback { state: playing } => Ok(playing),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// Drive the desktop's own player from this phone.
+#[tauri::command]
+async fn remote_playback(
+    command: PlaybackCommand,
+    state: State<'_, AppState>,
+) -> Result<RemotePlaybackState, String> {
+    // Refuse the nonsense here rather than letting the host guess: a seek past a
+    // day, a volume over 100%, or more of a queue than one request carries, is a
+    // bug in the caller and not a preference.
+    match &command {
+        PlaybackCommand::Seek { position_ms } if *position_ms > MAX_SEEK_MS => {
+            return Err("That position is out of range".into());
+        }
+        PlaybackCommand::Volume { percent } if *percent > 100 => {
+            return Err("Volume is a percentage".into());
+        }
+        PlaybackCommand::PlayTrack { queue, .. } if queue.len() > MAX_PLAY_QUEUE => {
+            return Err("That is more tracks than the computer can take at once".into());
+        }
+        _ => {}
+    }
+    if state.remote.stream_only().await {
+        return Err("This pairing is read only. It cannot control the computer.".into());
+    }
+    let response = state
+        .remote
+        .request(ClientRequest::Playback { command })
+        .await
+        .map_err(|error| friendly_if_missing(error, PLAYBACK_UNAVAILABLE))?;
+    match response {
+        ServerResponse::Playback { state: playing } => Ok(playing),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// Ask the host for a read-only pairing code to hand to another device.
+///
+/// Only a host that knows this phone has write access will mint one, and what it
+/// mints is read-only, so access can be lent on but never widened.
+#[tauri::command]
+async fn remote_read_only_ticket(
+    state: State<'_, AppState>,
+) -> Result<ReadOnlyTicketOffer, String> {
+    let response = state
+        .remote
+        .request(ClientRequest::ReadOnlyTicket)
+        .await
+        .map_err(|error| friendly_if_missing(error, READ_ONLY_CODE_UNAVAILABLE))?;
+    match response {
+        ServerResponse::ReadOnlyTicket {
+            uri,
+            qr_svg,
+            expires_at,
+            desktop_name,
+        } => Ok(ReadOnlyTicketOffer {
+            uri,
+            qr_svg: safe_qr_svg(&qr_svg),
+            expires_at,
+            desktop_name,
+        }),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// A track URI is a scheme, a path and a SHA-256, so anything of this length or
+/// more is not one.
+const MAX_TRACK_URI_BYTES: usize = 256;
+
+/// Draw the code that carries a track's own URI, for another client to scan.
+///
+/// Unlike a pairing code this one never crosses the network: the page builds
+/// the URI and this process draws the markup, so it is trusted by construction.
+/// It still goes through the same sanitiser as a host's code, because that is
+/// what guarantees only a QR renderer's own elements ever reach the page.
+#[tauri::command]
+fn track_code(uri: String) -> Result<String, String> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_TRACK_URI_BYTES {
+        return Err("invalid track code".into());
+    }
+    let drawn = QrCode::new(trimmed.as_bytes())
+        .map_err(|error| format!("could not create the track code: {error}"))?
+        .render::<svg::Color>()
+        .min_dimensions(240, 240)
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+    let safe = safe_qr_svg(&drawn);
+    if safe.is_empty() {
+        return Err("could not draw the track code".into());
+    }
+    Ok(safe)
+}
+
+/// Ask the host to sign and publish a NIP-56 `1984` report about an album cover.
+///
+/// This app holds no Nostr keys, and that is worth keeping: the report is the
+/// user's words, but the signature is the host's to make.
+#[tauri::command]
+async fn remote_report_cover(
+    key: String,
+    reason: String,
+    note: String,
+    state: State<'_, AppState>,
+) -> Result<CoverReport, String> {
+    let key = normalise_cover_key(&key).ok_or("That album has no cover key")?;
+    let reason = reason.trim().to_lowercase();
+    if !REPORT_REASONS.contains(&reason.as_str()) {
+        return Err("Choose a reason for the report".into());
+    }
+    let note = note.trim().to_string();
+    if note.chars().count() > MAX_REPORT_NOTE_CHARS {
+        return Err(format!(
+            "Keep the note under {MAX_REPORT_NOTE_CHARS} characters"
+        ));
+    }
+    let response = state
+        .remote
+        .request(ClientRequest::ReportCover { key, reason, note })
+        .await
+        .map_err(|error| friendly_if_missing(error, REPORT_UNAVAILABLE))?;
+    match response {
+        ServerResponse::CoverReported { report } => Ok(CoverReport {
+            report_id: report.report_id,
+            queued: report.queued,
+        }),
+        response => Err(unexpected_response(&response)),
+    }
 }
 
 #[tauri::command]
@@ -2185,6 +2451,81 @@ fn chrono_timestamp() -> i64 {
         .as_secs() as i64
 }
 
+/// The message an older Napstr answers with when it cannot parse a request it
+/// has never heard of.
+const UNKNOWN_REQUEST: &str = "invalid Napstrfy request";
+/// The longest seek that can be meant: nothing Napstr plays is a day long.
+const MAX_SEEK_MS: u64 = 24 * 60 * 60 * 1000;
+const PLAYBACK_UNAVAILABLE: &str =
+    "This Napstr cannot be driven from a phone yet. Update Napstr on your computer.";
+const READ_ONLY_CODE_UNAVAILABLE: &str =
+    "This Napstr cannot create read-only codes yet. Update Napstr on your computer.";
+const REPORT_UNAVAILABLE: &str =
+    "This Napstr cannot publish reports yet. Update Napstr on your computer.";
+
+/// A host that does not know a request answers with a parse error, which says
+/// nothing useful to the person holding the phone.
+fn friendly_if_missing(error: String, suggestion: &str) -> String {
+    if error.contains(UNKNOWN_REQUEST) || error.contains("unknown variant") {
+        suggestion.to_string()
+    } else {
+        error
+    }
+}
+
+/// Accept only the elements a QR renderer emits.
+///
+/// The markup is drawn by the host, but it arrives over the network and is about
+/// to be inserted into this app's own page, so anything with a script, a link or
+/// an event handler in it is dropped. The caller falls back to the code as text.
+fn safe_qr_svg(value: &str) -> String {
+    let trimmed = value.trim();
+    // The renderer prefixes an XML prolog, which means nothing once the markup
+    // is part of a page, so drop it before looking at the rest.
+    let body = match trimmed.strip_prefix("<?xml") {
+        Some(_) => match trimmed.find("?>") {
+            Some(end) => trimmed[end + 2..].trim_start(),
+            None => return String::new(),
+        },
+        None => trimmed,
+    };
+    if body.is_empty()
+        || body.len() > MAX_QR_SVG_BYTES
+        || !body.starts_with("<svg")
+        || !body.ends_with("</svg>")
+    {
+        return String::new();
+    }
+    let lowercase = body.to_lowercase();
+    if ["<script", "<!--", "href", "xlink", " on", "&#"]
+        .iter()
+        .any(|forbidden| lowercase.contains(forbidden))
+    {
+        return String::new();
+    }
+    let mut rest = body;
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('>') else {
+            return String::new();
+        };
+        let name = rest[..end]
+            .trim_start_matches('/')
+            .split(|character: char| character.is_whitespace() || character == '/')
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        if !matches!(
+            name.as_str(),
+            "svg" | "path" | "rect" | "g" | "circle" | "polygon" | "polyline"
+        ) {
+            return String::new();
+        }
+        rest = &rest[end + 1..];
+    }
+    body.to_string()
+}
+
 fn unexpected_response(response: &ServerResponse) -> String {
     match response {
         ServerResponse::Error { message } => message.clone(),
@@ -2263,11 +2604,32 @@ pub fn run() {
     // before Tauri or any Iroh background task can construct a TLS client.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Single instance has to be registered before anything else, so that a link
+    // opened while the companion is running reaches that window instead of
+    // starting a second copy of it. The plugin's deep-link feature is what turns
+    // the second launch's `napstrfy://` argument into an open-url event.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|_app, argv, _cwd| {
+        // The integration has already delivered any link in `argv`; this only
+        // keeps the launch visible while developing.
+        eprintln!("Napstrfy is already running; opened with {argv:?}");
+    }));
+    builder
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_os::init())
         .setup(|app| {
             #[cfg(mobile)]
             app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
+            #[cfg(desktop)]
+            {
+                // A link only reaches an installed app, so registering on every
+                // launch is what makes `napstrfy://` work while developing.
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Err(error) = app.deep_link().register_all() {
+                    eprintln!("could not register the napstrfy link scheme: {error}");
+                }
+            }
             let app_data = app
                 .path()
                 .app_data_dir()
@@ -2287,6 +2649,12 @@ pub fn run() {
             forget_desktop,
             remote_library,
             cached_library,
+            remote_covers,
+            remote_playback_state,
+            remote_playback,
+            remote_read_only_ticket,
+            track_code,
+            remote_report_cover,
             reconcile_audio_cache,
             remote_search,
             remote_audiobooks,
@@ -2309,6 +2677,48 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The QR the host draws has to survive the sanitiser, and nothing that
+    /// could run in this page may.
+    #[test]
+    fn only_qr_markup_reaches_the_page() {
+        // The hash in a colour literal needs a two-hash raw string: `"#` would
+        // otherwise end it early.
+        let drawn = r##"<?xml version="1.0" standalone="yes"?><svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="4" height="4" viewBox="0 0 4 4" shape-rendering="crispEdges"><rect x="0" y="0" width="4" height="4" fill="#ffffff"/><path fill="#000000" d="M0 0h1v1H0V0"/></svg>"##;
+        let accepted = safe_qr_svg(drawn);
+        assert!(accepted.starts_with("<svg"));
+        assert!(accepted.ends_with("</svg>"));
+        assert!(!accepted.contains("<?xml"));
+        assert!(safe_qr_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>"#
+        )
+        .is_empty());
+        assert!(safe_qr_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><path onload="x" d=""/></svg>"#
+        )
+        .is_empty());
+        assert!(safe_qr_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><a href="https://x">y</a></svg>"#
+        )
+        .is_empty());
+        assert!(safe_qr_svg("<html></html>").is_empty());
+        assert!(safe_qr_svg("").is_empty());
+    }
+
+    /// A track code is drawn by this process rather than fetched, but it reaches
+    /// the page through the same sanitiser a host's code does, so it has to come
+    /// out of that intact or there would be no code to show.
+    #[test]
+    fn track_codes_are_drawn_and_validated() {
+        let uri = format!("napstrfy://track/{}", "a".repeat(64));
+        let svg = track_code(uri).expect("a track code");
+        assert!(svg.starts_with("<svg"), "the sanitiser kept the markup");
+        assert!(svg.ends_with("</svg>"));
+        assert!(!svg.contains("<?xml"));
+        assert!(track_code(String::new()).is_err());
+        assert!(track_code("   ".to_string()).is_err());
+        assert!(track_code("x".repeat(MAX_TRACK_URI_BYTES + 1)).is_err());
+    }
 
     #[test]
     fn read_only_playback_caches_verified_audio_and_works_offline() {
@@ -2493,6 +2903,43 @@ mod tests {
     #[test]
     fn mobile_names_drop_direction_overrides() {
         assert_eq!(clean_device_name("My\u{202e}Phone"), "MyPhone");
+    }
+
+    #[test]
+    fn cover_keys_match_the_cover_nip_normalisation() {
+        assert_eq!(
+            normalise_cover_key("  Pink Floyd |Animals ").as_deref(),
+            Some("pink floyd|animals")
+        );
+        assert_eq!(
+            normalise_cover_key("BEYONCÉ|Lemonade").as_deref(),
+            Some("beyoncé|lemonade")
+        );
+        // Edition markers are preserved: matching is against the catalogue's own
+        // display strings, and the host handles the canonical alias.
+        assert_eq!(
+            normalise_cover_key("Artist|Album (Deluxe Edition)").as_deref(),
+            Some("artist|album (deluxe edition)")
+        );
+        // A key that is not addressable is dropped rather than sent on.
+        assert_eq!(normalise_cover_key("artist"), None);
+        assert_eq!(normalise_cover_key("artist|"), None);
+        assert_eq!(normalise_cover_key("|album"), None);
+        assert_eq!(normalise_cover_key("a|b|c"), None);
+        assert_eq!(normalise_cover_key(&format!("{}|album", "a".repeat(299))), None);
+
+        let request = normalise_cover_request(&[
+            " Artist | Album ".into(),
+            "artist|album".into(),
+            "junk".into(),
+        ]);
+        assert_eq!(request, vec!["artist|album".to_string()]);
+
+        // A caller cannot buy an unbounded amount of relay work in one go.
+        let many = (0..MAX_COVER_KEYS * 5)
+            .map(|index| format!("artist|album{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(normalise_cover_request(&many).len(), MAX_COVER_KEYS * 4);
     }
 
     #[test]

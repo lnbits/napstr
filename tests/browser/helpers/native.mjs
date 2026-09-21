@@ -43,6 +43,8 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'remote_search': if (window.searchError) throw window.searchError; return [track];
           case 'remote_transfers': return [{ ...transfers[1], fileId: track.fileId }];
           case 'reconcile_audio_cache': return true;
+          // The native side draws the track code, so answer the way it does.
+          case 'track_code': return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><rect width="4" height="4" fill="#ffffff"/><path fill="#000000" d="M0 0h1v1H0z"/></svg>';
           case 'cache_remote_audio': return { url: location.origin + (window.nextMediaSource || '/fixture.wav'), track: args.track };
           case 'podcast_playback_url': return { url: location.origin + '/fixture.wav', downloaded: false };
           case 'prefetch_remote_audio': return;

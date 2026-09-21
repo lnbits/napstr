@@ -18,8 +18,11 @@ use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
 mod audio;
+mod cover;
+mod cover_publish;
 mod mobile;
 mod network;
+mod playback_bridge;
 mod player;
 mod protocol;
 mod tor;
@@ -46,6 +49,10 @@ struct AppState {
     scan_cancel: Arc<AtomicBool>,
     app_handle: tauri::AppHandle,
     player: Arc<player::NativePlayer>,
+    /// Reached by a paired, write-capable phone.
+    playback: Arc<playback_bridge::PlaybackBridge>,
+    /// Resolves album art for this computer's library and publishes it.
+    covers: Arc<cover_publish::CoverPublisher>,
     mobile: Arc<mobile::MobileService>,
     recovering_after_sleep: Arc<AtomicBool>,
 }
@@ -285,6 +292,12 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         ),
         ("profile_picture", "".to_string()),
         ("profile_event_fingerprint", "".to_string()),
+        // The two cover opt-ins: one is a question to a central server, the
+        // other is a signature with the user's own key. Both start off, and
+        // both are stored rather than remembered in memory, because a choice
+        // about either should outlive the session that made it.
+        ("cover_lookup_external", "0".to_string()),
+        ("cover_publish_claims", "0".to_string()),
     ] {
         connection
             .execute(
@@ -1181,6 +1194,7 @@ fn run_index_job(
     scan_cancel: &AtomicBool,
     app_handle: &tauri::AppHandle,
     network: &Arc<network::NetworkService>,
+    covers: &Arc<cover_publish::CoverPublisher>,
 ) -> Result<IndexReport, String> {
     let _scan_guard = scan_lock.lock().map_err(|_| "library scan lock poisoned")?;
     scan_cancel.store(false, Ordering::SeqCst);
@@ -1224,6 +1238,8 @@ fn run_index_job(
             if report.changed_files > 0 {
                 let _ = app_handle.emit(LIBRARY_CHANGED_EVENT, report.clone());
                 network.queue_catalogue_publish(false);
+                // New music means albums the cover worker has never seen.
+                covers.nudge();
             }
             let _ = app_handle.emit(
                 INDEX_PROGRESS_EVENT,
@@ -1254,6 +1270,7 @@ fn start_folder_watcher(
     folder: PathBuf,
     db_path: PathBuf,
     network: Arc<network::NetworkService>,
+    covers: Arc<cover_publish::CoverPublisher>,
     scan_lock: Arc<Mutex<()>>,
     scan_cancel: Arc<AtomicBool>,
     app_handle: tauri::AppHandle,
@@ -1283,6 +1300,7 @@ fn start_folder_watcher(
                     &scan_cancel,
                     &app_handle,
                     &network,
+                    &covers,
                 );
             }
         })
@@ -1424,6 +1442,7 @@ async fn set_napstr_folder(
         folder,
         db_path.clone(),
         state.network.clone(),
+        state.covers.clone(),
         state.scan_lock.clone(),
         state.scan_cancel.clone(),
         state.app_handle.clone(),
@@ -1432,6 +1451,7 @@ async fn set_napstr_folder(
     let scan_cancel = state.scan_cancel.clone();
     let app_handle = state.app_handle.clone();
     let network = state.network.clone();
+    let covers = state.covers.clone();
     tauri::async_runtime::spawn_blocking(move || {
         run_index_job(
             &db_path,
@@ -1440,6 +1460,7 @@ async fn set_napstr_folder(
             &scan_cancel,
             &app_handle,
             &network,
+            &covers,
         )
     })
     .await
@@ -1460,6 +1481,7 @@ async fn rescan_napstr_folder(state: State<'_, AppState>) -> Result<IndexReport,
     let scan_cancel = state.scan_cancel.clone();
     let app_handle = state.app_handle.clone();
     let network = state.network.clone();
+    let covers = state.covers.clone();
     tauri::async_runtime::spawn_blocking(move || {
         run_index_job(
             &db_path,
@@ -1468,6 +1490,7 @@ async fn rescan_napstr_folder(state: State<'_, AppState>) -> Result<IndexReport,
             &scan_cancel,
             &app_handle,
             &network,
+            &covers,
         )
     })
     .await
@@ -1844,6 +1867,10 @@ async fn start_network(state: State<'_, AppState>) -> Result<network::NetworkSta
     });
     let mut status = state.network.start().await?;
     apply_tor_status(&mut status, state.tor.status().await);
+    // A publish pass waits for the relay pool, so hand it the news that it is up.
+    if status.connected {
+        state.covers.nudge();
+    }
     Ok(status)
 }
 
@@ -1918,7 +1945,11 @@ async fn network_search(
     query: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<network::CatalogueResult>, String> {
-    state.network.search(&query).await
+    let results = state.network.search(&query).await?;
+    // Browsing puts new albums in the catalogue, which is work for the cover
+    // worker when it is switched on.
+    state.covers.nudge();
+    Ok(results)
 }
 
 #[tauri::command]
@@ -1929,6 +1960,16 @@ async fn network_search_audiobooks(
     state.network.search_audiobooks(&query).await
 }
 
+/// Covers to draw for `keys`: a published `30427` where somebody made one, and
+/// otherwise the art this computer resolved for itself.
+#[tauri::command]
+async fn cover_art(
+    keys: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::AlbumCover>, String> {
+    state.network.best_known_covers(keys).await
+}
+
 #[tauri::command]
 async fn network_browse(
     cursor: Option<network::CatalogueBrowseCursor>,
@@ -1937,7 +1978,7 @@ async fn network_browse(
     unowned_only: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<network::CatalogueBrowsePage, String> {
-    state
+    let page = state
         .network
         .browse(
             cursor,
@@ -1945,7 +1986,9 @@ async fn network_browse(
             cache_limit.unwrap_or(10_000),
             unowned_only.unwrap_or(false),
         )
-        .await
+        .await?;
+    state.covers.nudge();
+    Ok(page)
 }
 
 #[tauri::command]
@@ -1954,7 +1997,9 @@ async fn network_browse_user(
     cursor: Option<network::CatalogueBrowseCursor>,
     state: State<'_, AppState>,
 ) -> Result<network::CatalogueBrowsePage, String> {
-    state.network.browse_user(&pubkey, cursor).await
+    let page = state.network.browse_user(&pubkey, cursor).await?;
+    state.covers.nudge();
+    Ok(page)
 }
 
 #[tauri::command]
@@ -2117,8 +2162,129 @@ async fn close_window(window: tauri::Window, state: State<'_, AppState>) -> Resu
     window.close().map_err(|error| error.to_string())
 }
 
+/// The desktop's window reports what its queue holds, which is the only way a
+/// phone can be told what comes next or move through it.
+#[tauri::command]
+fn publish_playback_state(snapshot: playback_bridge::QueueSnapshot, state: State<'_, AppState>) {
+    state.playback.publish_queue(snapshot);
+}
+
+/// The albums the cover worker would act on next, for the Covers tab.
+#[tauri::command]
+fn cover_candidates(
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<cover_publish::CoverCandidate>, String> {
+    state.covers.preview(limit)
+}
+
+#[tauri::command]
+fn cover_status(state: State<'_, AppState>) -> cover_publish::CoverStatus {
+    state.covers.status()
+}
+
+/// Both cover switches, stored for good.
+///
+/// `lookup_external` allows MusicBrainz and the Cover Art Archive to be asked
+/// about an album; `publish_claims` allows a kind `30427` claim to be signed
+/// with the user's own key. They are separate because either one alone is a
+/// reasonable choice, and neither is turned on by default. Switching one on
+/// starts a pass at once; there is nothing else to press.
+#[tauri::command]
+fn set_cover_preferences(
+    lookup_external: bool,
+    publish_claims: bool,
+    state: State<'_, AppState>,
+) -> Result<cover_publish::CoverStatus, String> {
+    state.covers.set_preferences(cover_publish::CoverPreferences {
+        lookup_external,
+        publish_claims,
+    })
+}
+
+/// Wake the cover worker. It looks at whatever is new and stops again, so this
+/// is safe to call from anywhere that notices a change.
+#[tauri::command]
+fn nudge_cover_worker(state: State<'_, AppState>) {
+    state.covers.nudge();
+}
+
+/// Albums the results pane is showing, reported as it draws them.
+///
+/// This is how "albums seen in search results" reaches the cover worker: the
+/// pane reports silently — there is no button — and it is a local write that is
+/// harmless with both switches off.
+#[tauri::command]
+fn note_visible_albums(
+    albums: Vec<cover_publish::CoverAlbumNote>,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    state.covers.note_visible(&albums)
+}
+
+/// Ask a running pass to stop at the next album.
+#[tauri::command]
+fn cancel_cover_scan(state: State<'_, AppState>) {
+    state.covers.cancel();
+}
+
+/// The MusicBrainz query the automatic lookup sends for one album.
+///
+/// The manual art tool opens on this, so a person edits the search Napstr
+/// actually asked rather than retyping one from scratch.
+#[tauri::command]
+fn cover_default_query(artist: String, album: String) -> String {
+    cover_publish::default_query(&artist, &album)
+}
+
+/// MusicBrainz release groups for one album, for choosing art by hand.
+///
+/// `query` is the person's own edited search; leaving it empty uses the query
+/// the automatic lookup sends, so the tool opens on what Napstr already asked.
+#[tauri::command]
+async fn cover_search_candidates(
+    artist: String,
+    album: String,
+    query: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<cover_publish::CoverSearchHit>, String> {
+    state.covers.search_candidates(&artist, &album, query).await
+}
+
+/// Use the art a person picked for an album.
+///
+/// The choice is filed locally so it shows at once and survives a restart, and
+/// when the publishing switch is on it is signed as a kind `30427` claim under
+/// the same `d` value the automatic lookup computes, so it can be found again.
+#[tauri::command]
+async fn cover_apply_pick(
+    pick: cover_publish::CoverManualPick,
+    state: State<'_, AppState>,
+) -> Result<cover_publish::CoverPickResult, String> {
+    state.covers.apply_pick(pick).await
+}
+
+/// NIP-56: report the cover published for one album, as the user's own identity.
+///
+/// The window sends an album key and the reason a person chose. Which event to
+/// report, and who wrote it, is decided here from the claim that actually wins,
+/// because the window has no business naming a pubkey it cannot verify.
+#[tauri::command]
+async fn report_cover(
+    key: String,
+    reason: String,
+    note: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    state.network.report_cover(key, reason, note).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // reqwest is built without a TLS provider, so one has to be installed before
+    // anything constructs an HTTPS client. Ignoring the result is deliberate:
+    // another part of the process may already have installed one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let shutdown_services = Arc::new(Mutex::new(None::<ShutdownServices>));
     let setup_shutdown_services = shutdown_services.clone();
     let app = tauri::Builder::default()
@@ -2139,8 +2305,31 @@ pub fn run() {
             let transfers = Arc::new(transfer::TransferService::new(db_path.clone(), tor.clone()));
             let network =
                 network::NetworkService::new(db_path.clone(), transfers, app.handle().clone());
-            let mobile =
-                mobile::MobileService::new(db_path.clone(), app_data.clone(), network.clone())?;
+            // The audio player owns the sound and the window owns the queue, so
+            // the bridge is what lets a paired phone reach either of them.
+            let player = Arc::new(player::NativePlayer::default());
+            let playback =
+                playback_bridge::PlaybackBridge::new(player.clone(), app.handle().clone());
+            // Created before the phone service, because a phone's search results
+            // join the same cover queue the window fills.
+            let covers = cover_publish::CoverPublisher::new(
+                db_path.clone(),
+                network.clone(),
+                app.handle().clone(),
+            );
+            let mobile = mobile::MobileService::new(
+                db_path.clone(),
+                app_data.clone(),
+                network.clone(),
+                covers.clone(),
+                playback.clone(),
+            )?;
+            // The worker runs for the life of the process. The switches are
+            // stored, so nudging it here resumes whatever was left on when the
+            // window last closed — which is also what keeps a paired phone's
+            // artwork flowing without the phone asking for anything.
+            covers.start();
+            covers.nudge();
             let scan_lock = Arc::new(Mutex::new(()));
             let scan_cancel = Arc::new(AtomicBool::new(false));
             *setup_shutdown_services
@@ -2171,6 +2360,7 @@ pub fn run() {
                     folder,
                     db_path.clone(),
                     network.clone(),
+                    covers.clone(),
                     scan_lock.clone(),
                     scan_cancel.clone(),
                     app.handle().clone(),
@@ -2185,7 +2375,9 @@ pub fn run() {
                 scan_lock: scan_lock.clone(),
                 scan_cancel: scan_cancel.clone(),
                 app_handle: app.handle().clone(),
-                player: Arc::new(player::NativePlayer::default()),
+                player: player.clone(),
+                playback: playback.clone(),
+                covers: covers.clone(),
                 mobile: mobile.clone(),
                 recovering_after_sleep: Arc::new(AtomicBool::new(false)),
             });
@@ -2201,6 +2393,7 @@ pub fn run() {
                     .map_err(|error| error.to_string())?
                     .join("napstr.sqlite3");
                 let startup_handle = app.handle().clone();
+                let startup_covers = covers.clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     let _ = run_index_job(
                         &startup_db_path,
@@ -2209,6 +2402,7 @@ pub fn run() {
                         &scan_cancel,
                         &startup_handle,
                         &network,
+                        &startup_covers,
                     );
                 });
             }
@@ -2235,6 +2429,17 @@ pub fn run() {
             player::seek_audio,
             player::set_audio_volume,
             player::audio_status,
+            publish_playback_state,
+            cover_candidates,
+            cover_status,
+            set_cover_preferences,
+            nudge_cover_worker,
+            note_visible_albums,
+            cancel_cover_scan,
+            cover_default_query,
+            cover_search_candidates,
+            cover_apply_pick,
+            report_cover,
             set_downloads_paused,
             clear_all_transfers,
             start_network,
@@ -2244,6 +2449,7 @@ pub fn run() {
             publish_profile,
             network_search,
             network_search_audiobooks,
+            cover_art,
             network_browse,
             network_browse_user,
             resolve_catalogue_user,

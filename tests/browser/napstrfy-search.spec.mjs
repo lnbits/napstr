@@ -32,7 +32,15 @@ function track(id, local = true) {
     format: 'WAV', mime: 'audio/wav', size: 1234567, tags: '', local, sources: [] };
 }
 
+// Our shell does not put the field in the header: it lives on the second
+// `.bottom-nav` tab, so a search always starts by opening that tab.
+async function openSearchTab(page) {
+  await page.locator('.bottom-nav button').nth(1).click();
+  await expect(page.getByRole('textbox', { name: 'Search tracks', exact: true })).toBeVisible();
+}
+
 async function search(page, query) {
+  await openSearchTab(page);
   const input = page.getByRole('textbox', { name: 'Search tracks', exact: true });
   await input.fill(query);
   await input.press('Enter');
@@ -43,12 +51,16 @@ async function finish(page, cmd, query, tracks = [], error) {
   await page.evaluate(({ cmd, query, tracks, error }) => window.finishSearch(cmd, query, tracks, error), { cmd, query, tracks, error });
 }
 
+// We have no `.network-search-status` line: the search field spins for as long as
+// either half is still out, and the rows carry `aria-busy` alongside it.
+const networkPending = (page) => expect(page.locator('.search-spinner')).toBeVisible();
+
 test('Napstrfy full access plays host matches while network search waits, then appends without duplicates or losing selection', async ({ page }) => {
   await openSearch(page);
   await search(page, 'music');
   await finish(page, 'remote_library', 'music', [track('b'), track('c')]);
   await expect(page.locator('.track-row strong')).toHaveText(['Track b', 'Track c']);
-  await expect(page.locator('.network-search-status')).toBeVisible();
+  await networkPending(page);
   await page.locator('.track-open').nth(1).click();
   await expect.poll(() => page.locator('audio').evaluate((audio) => audio.paused)).toBe(false);
   await finish(page, 'remote_search', 'music', [track('b', false), track('d', false)]);
@@ -64,7 +76,10 @@ test('Napstrfy keeps host matches when the network search fails', async ({ page 
   await finish(page, 'remote_library', 'music', [track('b')]);
   await finish(page, 'remote_search', 'music', [], 'Network search timed out');
   await expect(page.locator('.track-row strong')).toHaveText(['Track b']);
-  await expect(page.locator('.error-banner')).toContainText('Network search timed out');
+  // Only the network half failed, so this is the softer "host results only"
+  // notice rather than the error banner.
+  await expect(page.locator('.toast')).toContainText('Network search timed out');
+  await expect(page.locator('.error-banner')).toHaveCount(0);
   await expect(page.locator('.track-list')).toHaveAttribute('aria-busy', 'false');
 });
 
@@ -93,7 +108,7 @@ test('Napstrfy does not show an empty result until both searches finish', async 
   await search(page, 'music');
   await finish(page, 'remote_library', 'music');
   await expect(page.locator('.empty-library')).toHaveCount(0);
-  await expect(page.locator('.network-search-status')).toBeVisible();
+  await networkPending(page);
   await finish(page, 'remote_search', 'music');
   await expect(page.locator('.empty-library')).toBeVisible();
 });

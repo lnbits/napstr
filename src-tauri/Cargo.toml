@@ -43,3 +43,7 @@ lofty = "0.25.1"
 iroh = { version = "1.0.3", default-features = false, features = ["tls-ring", "portmapper"] }
 napstr-remote-protocol = { path = "../remote-protocol" }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Album art lookups talk to MusicBrainz and the Cover Art Archive. The same
+# feature set the companion uses, so both sides share one reqwest build.
+reqwest = { version = "0.13", default-features = false, features = ["hickory-dns", "rustls-no-provider", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

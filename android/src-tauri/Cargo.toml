@@ -19,6 +19,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri-plugin-os = "2"
+tauri-plugin-deep-link = "2"
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,6 +33,15 @@ reqwest = { version = "0.13", default-features = false, features = ["hickory-dns
 futures-util = "0.3"
 quick-xml = "0.41"
 chrono = { version = "0.4", default-features = false }
+# The same renderer the desktop draws its pairing codes with, so a track code
+# and a pairing code are the same shape of markup for the sanitiser to check.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2.4.5"
+
+# A link opened while the companion is already running has to reach that window
+# rather than start a second copy of it, which is what the deep-link feature of
+# the single-instance plugin arranges.
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
