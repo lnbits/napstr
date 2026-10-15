@@ -197,6 +197,8 @@
   let playerVolume = 0.85;
   let playerEnded = false;
   let lastPlayerError = '';
+  let compactMode = false;
+  let compactModePending = false;
   let transferPaneHeight = 119;
   let stopTransferResize = () => {};
   let transfers: Transfer[] = [];
@@ -2061,6 +2063,20 @@
     if (nativeReady) await invoke(command);
   };
 
+  async function toggleCompactMode() {
+    if (!nativeReady || compactModePending) return;
+    compactModePending = true;
+    const compact = !compactMode;
+    try {
+      await invoke('set_compact_mode', { compact });
+      compactMode = compact;
+    } catch (error) {
+      activityMessage = msg("Could not switch window mode: {p0}", { p0: String(error) });
+    } finally {
+      compactModePending = false;
+    }
+  }
+
   function beginWindowResize(event: PointerEvent, direction: WindowResizeDirection) {
     if (event.button !== 0) return;
     event.preventDefault();
@@ -2267,7 +2283,7 @@
 
 {#if desktopRuntime}
 <main class="desktop">
-  <section class="app-window" style={`--transfer-height: ${transferPaneHeight}px`} aria-label={$t("Napstr application window")}>
+  <section class:compact={compactMode} class="app-window" style={`--transfer-height: ${transferPaneHeight}px`} aria-label={$t("Napstr application window")}>
     <button class="window-resize-handle resize-n" aria-label={$t("Resize window from top")} onpointerdown={(event) => beginWindowResize(event, 'North')}></button>
     <button class="window-resize-handle resize-e" aria-label={$t("Resize window from right")} onpointerdown={(event) => beginWindowResize(event, 'East')}></button>
     <button class="window-resize-handle resize-s" aria-label={$t("Resize window from bottom")} onpointerdown={(event) => beginWindowResize(event, 'South')}></button>
@@ -2278,9 +2294,12 @@
     <button class="window-resize-handle resize-nw" aria-label={$t("Resize window from top left")} onpointerdown={(event) => beginWindowResize(event, 'NorthWest')}></button>
 
     <header class="titlebar" data-tauri-drag-region>
-      <div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>{$t("Napstr - own your music again")}</span></div>
-      <div class="window-controls" aria-hidden="true">
-        <button tabindex="-1" onclick={() => windowCommand('minimise_window')}>_</button><button tabindex="-1" onclick={() => windowCommand('toggle_maximise')}>□</button><button tabindex="-1" onclick={() => windowCommand('close_window')}>×</button>
+      <div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>{compactMode ? (currentTrack?.name ?? $t("Napstr audio player")) : $t("Napstr - own your music again")}</span></div>
+      <div class="title-actions">
+        <button class="compact-toggle" disabled={compactModePending} onclick={toggleCompactMode} aria-label={compactMode ? $t("Restore full window") : $t("Switch to compact player")} title={compactMode ? $t("Restore full window") : $t("Switch to compact player")}>{compactMode ? '↗' : '▁'}</button>
+        <div class="window-controls" aria-hidden="true">
+          <button tabindex="-1" onclick={() => windowCommand('minimise_window')}>_</button>{#if !compactMode}<button tabindex="-1" onclick={() => windowCommand('toggle_maximise')}>□</button>{/if}<button tabindex="-1" onclick={() => windowCommand('close_window')}>×</button>
+        </div>
       </div>
     </header>
 

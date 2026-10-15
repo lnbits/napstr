@@ -48,6 +48,14 @@ struct AppState {
     player: Arc<player::NativePlayer>,
     mobile: Arc<mobile::MobileService>,
     recovering_after_sleep: Arc<AtomicBool>,
+    full_window_geometry: Mutex<Option<WindowGeometry>>,
+}
+
+#[derive(Clone, Copy)]
+struct WindowGeometry {
+    size: tauri::PhysicalSize<u32>,
+    position: Option<tauri::PhysicalPosition<i32>>,
+    maximized: bool,
 }
 
 struct ShutdownServices {
@@ -2109,6 +2117,91 @@ fn toggle_maximise(window: tauri::Window) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 #[tauri::command]
+fn set_compact_mode(
+    compact: bool,
+    window: tauri::Window,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    const FULL_MIN_WIDTH: f64 = 560.0;
+    const FULL_MIN_HEIGHT: f64 = 400.0;
+    const COMPACT_HEIGHT: f64 = 84.0;
+
+    let mut saved = state
+        .full_window_geometry
+        .lock()
+        .map_err(|_| "window geometry lock poisoned".to_string())?;
+
+    if compact {
+        if saved.is_some() {
+            return Ok(());
+        }
+        let geometry = WindowGeometry {
+            size: window.outer_size().map_err(|error| error.to_string())?,
+            // Wayland compositors do not expose absolute window positions.
+            position: window.outer_position().ok(),
+            maximized: window.is_maximized().map_err(|error| error.to_string())?,
+        };
+        let scale_factor = window.scale_factor().map_err(|error| error.to_string())?;
+        let logical_width = (f64::from(geometry.size.width) / scale_factor).max(FULL_MIN_WIDTH);
+        let maximum_width = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .map(|monitor| {
+                f64::from(monitor.work_area().size.width) / monitor.scale_factor()
+            })
+            .unwrap_or(logical_width)
+            .max(logical_width);
+        let compact_size = tauri::LogicalSize::new(logical_width, COMPACT_HEIGHT);
+        if geometry.maximized {
+            window.unmaximize().map_err(|error| error.to_string())?;
+        }
+        window
+            .set_min_size(Some(tauri::LogicalSize::new(
+                FULL_MIN_WIDTH,
+                COMPACT_HEIGHT,
+            )))
+            .map_err(|error| error.to_string())?;
+        window
+            .set_max_size(Some(tauri::LogicalSize::new(
+                maximum_width,
+                COMPACT_HEIGHT,
+            )))
+            .map_err(|error| error.to_string())?;
+        window
+            .set_size(compact_size)
+            .map_err(|error| error.to_string())?;
+        *saved = Some(geometry);
+        return Ok(());
+    }
+
+    let Some(geometry) = *saved else {
+        return Ok(());
+    };
+    window
+        .set_max_size(None::<tauri::LogicalSize<f64>>)
+        .map_err(|error| error.to_string())?;
+    window
+        .set_min_size(Some(tauri::LogicalSize::new(
+            FULL_MIN_WIDTH,
+            FULL_MIN_HEIGHT,
+        )))
+        .map_err(|error| error.to_string())?;
+    window
+        .set_size(geometry.size)
+        .map_err(|error| error.to_string())?;
+    if let Some(position) = geometry.position {
+        window
+            .set_position(position)
+            .map_err(|error| error.to_string())?;
+    }
+    if geometry.maximized {
+        window.maximize().map_err(|error| error.to_string())?;
+    }
+    *saved = None;
+    Ok(())
+}
+#[tauri::command]
 async fn close_window(window: tauri::Window, state: State<'_, AppState>) -> Result<(), String> {
     state.network.stop().await;
     state.network.preserve_interrupted_downloads()?;
@@ -2188,6 +2281,7 @@ pub fn run() {
                 player: Arc::new(player::NativePlayer::default()),
                 mobile: mobile.clone(),
                 recovering_after_sleep: Arc::new(AtomicBool::new(false)),
+                full_window_geometry: Mutex::new(None),
             });
             if mobile.has_devices() {
                 tauri::async_runtime::spawn(async move {
@@ -2260,6 +2354,7 @@ pub fn run() {
             report_catalogue,
             minimise_window,
             toggle_maximise,
+            set_compact_mode,
             close_window
         ])
         .build(tauri::generate_context!())
