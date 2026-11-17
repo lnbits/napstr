@@ -1,0 +1,29 @@
+[package]
+name = "napstrd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT"
+description = "Headless Napstr music seeder for Linux servers"
+
+[dependencies]
+hex = "0.4"
+iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring", "portmapper"] }
+napstr-remote-protocol = { path = "../remote-protocol" }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+lofty = "0.25.1"
+nostr-sdk = { version = "0.44.1", features = ["nip44", "nip59"] }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-socks = "0.5"
+tokio-util = "0.7"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+
+[profile.release]
+strip = true
+

@@ -948,6 +948,32 @@ fn validate_and_hash_index_file(
     Ok((path.to_path_buf(), Some(audio), file_id, size))
 }
 
+fn begin_index_transaction(
+    connection: &mut Connection,
+) -> Result<rusqlite::Transaction<'_>, String> {
+    for attempt in 0..3 {
+        // Reserve the writer before reading: a deferred read transaction cannot
+        // safely upgrade after a background catalogue/transfer write in WAL mode.
+        // The shared borrow allows retrying BEGIN; the caller still lends us
+        // exclusive access to this connection for the returned transaction.
+        match rusqlite::Transaction::new_unchecked(connection, TransactionBehavior::Immediate) {
+            Ok(transaction) => return Ok(transaction),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) && attempt < 2 =>
+            {
+                // Each attempt already uses the connection's busy timeout.
+                // No batch data or progress has been changed at this point.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    unreachable!("the final transaction attempt returns its result")
+}
+
 fn commit_index_batch(
     connection: &mut Connection,
     folder: &Path,
@@ -957,9 +983,7 @@ fn commit_index_batch(
     if batch.is_empty() {
         return Ok(Vec::new());
     }
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Deferred)
-        .map_err(|error| error.to_string())?;
+    let transaction = begin_index_transaction(connection)?;
     let mut changed_ids = Vec::new();
     let mut changed_ids_seen = HashSet::new();
     for (path, audio, file_id, size) in batch.drain(..) {
@@ -1147,9 +1171,7 @@ fn index_path_with_progress(
     }
     progress(processed_files, report.file_count);
 
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+    let transaction = begin_index_transaction(connection)?;
     report.changed_files += transaction
         .execute(
             "DELETE FROM files WHERE file_id NOT IN (SELECT file_id FROM napstr_seen)",
@@ -2590,6 +2612,118 @@ mod tests {
     }
 
     #[test]
+    fn indexing_retries_a_background_writer_without_losing_the_batch() {
+        use std::time::{Duration, Instant};
+        static CONTENDED: AtomicBool = AtomicBool::new(false);
+        static RELEASED: AtomicBool = AtomicBool::new(false);
+
+        let directory = test_directory("index-concurrent-writer-test");
+        fs::create_dir_all(&directory).unwrap();
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data\x04\0\0\0song");
+        fs::write(directory.join("track.wav"), bytes).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut background = open_connection(&db_path).unwrap();
+        let transaction = background
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE settings SET value='background' WHERE key='display_name'",
+                [],
+            )
+            .unwrap();
+
+        let scan_directory = directory.clone();
+        let scan_db = db_path.clone();
+        let scanner = std::thread::spawn(move || {
+            let mut connection = open_connection(&scan_db).unwrap();
+            connection
+                .busy_handler(Some(|_| {
+                    CONTENDED.store(true, Ordering::SeqCst);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !RELEASED.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    // Simulate the busy timeout expiring, exercising our retry.
+                    false
+                }))
+                .unwrap();
+            index_path(&mut connection, &scan_directory)
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !CONTENDED.load(Ordering::SeqCst)
+            && !scanner.is_finished()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        transaction.commit().unwrap();
+        RELEASED.store(true, Ordering::SeqCst);
+        let report = scanner.join().unwrap().unwrap();
+        assert!(CONTENDED.load(Ordering::SeqCst));
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.changed_files, 1);
+        assert_eq!(load_files(&background, None).unwrap().len(), 1);
+        assert_eq!(
+            get_setting(&background, "display_name").unwrap(),
+            "background"
+        );
+
+        // Restarting the scan reuses committed files without duplicating them.
+        let restarted = index_path(&mut background, &directory).unwrap();
+        assert_eq!(restarted.file_count, 1);
+        assert_eq!(restarted.changed_files, 0);
+        assert_eq!(load_files(&background, None).unwrap().len(), 1);
+        drop(background);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn indexing_stops_after_three_lock_attempts_without_consuming_the_batch() {
+        use std::sync::atomic::AtomicUsize;
+        static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+        let directory = test_directory("index-lock-retry-limit-test");
+        fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut background = open_connection(&db_path).unwrap();
+        let transaction = background
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let mut scanner = open_connection(&db_path).unwrap();
+        scanner
+            .busy_handler(Some(|_| {
+                ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+                false
+            }))
+            .unwrap();
+        let mut batch = vec![(directory.join("track.wav"), None, "test-hash".into(), 48)];
+        let mut report = IndexReport {
+            file_count: 0,
+            total_bytes: 0,
+            errors: Vec::new(),
+            error_count: 0,
+            changed_files: 0,
+        };
+        let error =
+            commit_index_batch(&mut scanner, &directory, &mut batch, &mut report).unwrap_err();
+        assert_eq!(error, "database is locked");
+        assert_eq!(ATTEMPTS.load(Ordering::SeqCst), 3);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(report.file_count, 0);
+        assert_eq!(report.total_bytes, 0);
+        assert_eq!(report.changed_files, 0);
+        transaction.rollback().unwrap();
+        drop(scanner);
+        drop(background);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn cancelling_after_a_batch_keeps_only_verified_commits() {
         let directory = test_directory("progressive-cancel-test");
         fs::create_dir_all(&directory).unwrap();
@@ -2617,6 +2751,13 @@ mod tests {
         assert_eq!(
             load_files(&connection, None).unwrap().len(),
             INDEX_COMMIT_BATCH_SIZE
+        );
+        let restarted = index_path(&mut connection, &directory).unwrap();
+        assert_eq!(restarted.file_count, INDEX_COMMIT_BATCH_SIZE + 1);
+        assert_eq!(restarted.changed_files, 1);
+        assert_eq!(
+            load_files(&connection, None).unwrap().len(),
+            INDEX_COMMIT_BATCH_SIZE + 1
         );
         drop(connection);
         fs::remove_dir_all(directory).unwrap();

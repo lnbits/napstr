@@ -1,0 +1,33 @@
+[Unit]
+Description=Napstr private music seeder
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=napstrd
+Group=napstrd
+EnvironmentFile=/etc/napstrd.env
+ExecStart=/usr/local/bin/napstrd
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+StateDirectory=napstrd
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ReadWritePaths=/srv/napstr/music
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

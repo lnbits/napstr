@@ -1,0 +1,133 @@
+name: Build Napstr VPS daemon
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to attach to (leave empty for a test artifact)
+        required: false
+        type: string
+  release:
+    types: [published]
+  pull_request:
+    paths:
+      - 'daemon/**'
+      - 'remote-protocol/**'
+      - 'src-tauri/src/audio.rs'
+      - 'src-tauri/src/protocol.rs'
+      - 'src-tauri/src/tor.rs'
+      - '.github/workflows/daemon.yml'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
+
+jobs:
+  build:
+    name: napstrd Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Validate release version and source
+        shell: bash
+        run: |
+          if [[ -n "$RELEASE_TAG" ]]; then
+            if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+              echo 'Invalid release tag' >&2
+              exit 1
+            fi
+            if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+              test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
+            fi
+            echo "NAPSTR_DAEMON_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
+          else
+            echo "NAPSTR_DAEMON_VERSION=dev-${GITHUB_SHA:0:12}" >> "$GITHUB_ENV"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt
+      - name: Install static build dependencies
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daemon
+          key: daemon-${{ matrix.target }}
+      - name: Check daemon formatting
+        run: rustfmt --edition 2021 --check --config skip_children=true daemon/src/*.rs daemon/tests/*.rs
+      - name: Test daemon and reused core modules
+        run: cargo test --manifest-path daemon/Cargo.toml --locked --target '${{ matrix.target }}'
+      - name: Build standalone static binary
+        run: cargo build --manifest-path daemon/Cargo.toml --locked --release --target '${{ matrix.target }}'
+      - name: Smoke test and package
+        env:
+          DAEMON_TARGET: ${{ matrix.target }}
+          DAEMON_ARCH: ${{ matrix.arch }}
+        run: |
+          binary="daemon/target/$DAEMON_TARGET/release/napstrd"
+          "$binary" --help
+          test "$("$binary" --version)" = "napstrd $NAPSTR_DAEMON_VERSION"
+          if readelf -l "$binary" | grep -q INTERP; then
+            echo 'The daemon must not require a dynamic loader' >&2
+            exit 1
+          fi
+          bash daemon/package.sh "$binary" "$NAPSTR_DAEMON_VERSION" "$DAEMON_ARCH" dist
+          (cd dist && sha256sum --check -- *.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Napstr-daemon-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Attach daemon archives to release
+    needs: build
+    if: github.event_name != 'pull_request' && (inputs.release_tag != '' || github.event_name == 'release')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Napstr-daemon-*
+          path: dist
+          merge-multiple: true
+      - name: Verify and attach archives
+        shell: bash
+        run: |
+          (cd dist && sha256sum --check -- *.sha256)
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            args=(release create "$RELEASE_TAG" --target "$GITHUB_SHA" --draft --title "Napstr $RELEASE_TAG" --notes 'Napstr release, including the standalone VPS daemon.')
+            if [[ "$RELEASE_TAG" == *-* ]]; then args+=(--prerelease); fi
+            # Desktop/Android jobs may create the same draft concurrently.
+            gh "${args[@]}" || gh release view "$RELEASE_TAG" >/dev/null
+          fi
+          gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/*.sha256 --clobber

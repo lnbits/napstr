@@ -394,3 +394,12 @@ jobs:
           fi
 
           gh release upload "$RELEASE_TAG" "$asset" --clobber
+
+  daemon:
+    name: Build standalone VPS daemon
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    permissions:
+      contents: write
+    uses: ./.github/workflows/daemon.yml
+    with:
+      release_tag: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}

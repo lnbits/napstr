@@ -8,6 +8,9 @@ https://napstr.net
 
 The cross-platform Napstrfy phone companion lives in [`android/`](android/README.md).
 
+For an always-on Linux VPS seeder, see the separate [Napstr daemon](daemon/README.md).
+Release builds include standalone x86_64 and ARM64 daemon archives.
+
 ## Build your own Napstr!
 
 See the complete [Napstr protocol specification](PROTOCOL.md) for everything
