@@ -1221,6 +1221,7 @@
   async function refreshLocalLibrary() {
     try {
       const snapshot = await invoke<Snapshot>('get_snapshot');
+      napstrFolder = snapshot.settings.napstrFolder;
       indexedBytes = snapshot.indexedBytes;
       localAudiobooks = snapshot.audiobooks;
       const nextFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: 0 }));
@@ -2013,8 +2014,12 @@
       const selectedPath = await open({ directory: true, multiple: false, title: $t("Choose the folder Napstr uses for downloads and sharing"), defaultPath: napstrFolder || undefined });
       if (!selectedPath || Array.isArray(selectedPath)) return;
       activityMessage = msg("Indexing files and calculating SHA-256 hashes…");
-      const report = await invoke<{ fileCount: number; totalBytes: number; errors: string[]; errorCount: number; changedFiles: number }>('set_napstr_folder', { path: selectedPath });
-      activityMessage = msg("Indexed {p0} files, {p1}{p2}", { p0: report.fileCount, p1: readableSize(report.totalBytes), p2: report.errorCount ? ` · ${report.errorCount} skipped` : '' });
+      try {
+        const report = await invoke<{ fileCount: number; totalBytes: number; errors: string[]; errorCount: number; changedFiles: number }>('set_napstr_folder', { path: selectedPath });
+        activityMessage = msg("Indexed {p0} files, {p1}{p2}", { p0: report.fileCount, p1: readableSize(report.totalBytes), p2: report.errorCount ? ` · ${report.errorCount} skipped` : '' });
+      } finally {
+        await refreshLocalLibrary();
+      }
     } catch (error) { activityMessage = msg("Folder selection failed: {p0}", { p0: String(error) }); }
   }
 

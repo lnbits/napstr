@@ -28,7 +28,7 @@ function fixture({ failedFile, localFiles = [], existingFiles = [] } = {}) {
   const context = vm.createContext({
     results, selectedResultIds: new Set(results.map((item) => item.fileId)),
     nativeReady: true, downloadingSelection: false, clearingTransfers: false, paused: false,
-    downloadLibraryRefreshNeeded: false,
+    downloadLibraryRefreshNeeded: false, napstrFolder: '/old-music',
     downloadGeneration: 0, nextOptimisticTransferId: 1000,
     pendingDownloadRequests: new Map(), downloadAttempts: new Map(), cancellingFiles: new Set(),
     startingDownloads: new Set(), removingTransfers: new Set(), audiobookDownloads: [],
@@ -49,7 +49,7 @@ function fixture({ failedFile, localFiles = [], existingFiles = [] } = {}) {
         return args.fileId;
       }
       if (command === 'get_transfers') return rows.map((row) => ({ ...row }));
-      if (command === 'get_snapshot') return { files: localFiles.map((fileId) => ({ fileId, filename: fileId, size: 100 })), audiobooks: [], indexedBytes: 100 };
+      if (command === 'get_snapshot') return { settings: { napstrFolder: '/music' }, files: localFiles.map((fileId) => ({ fileId, filename: fileId, size: 100 })), audiobooks: [], indexedBytes: 100 };
       if (command === 'remove_transfer') { rows = rows.filter((row) => row.id !== args.id); return; }
       if (command === 'clear_all_transfers') { rows = []; return; }
       throw new Error(command);
@@ -147,6 +147,7 @@ test('100% keeps polling until verified completion and disappearance updates Tor
   localFiles.push('song-0');
   // This is the same update path used by events, polling and request refreshes.
   await f.context.applyTransferUpdate([]);
+  assert.equal(f.context.napstrFolder, '/music');
   assert.equal(f.context.results[0].speed, 'Local');
   assert.equal(f.context.results[0].remote, false);
   assert.equal(f.context.isLocalFile('song-0'), true);
@@ -166,5 +167,6 @@ test('failed library refresh is retried even after the last transfer has disappe
   f.context.invoke = invoke;
   await f.context.applyTransferUpdate([]);
   assert.equal(f.context.downloadLibraryRefreshNeeded, false);
+  assert.equal(f.context.napstrFolder, '/music');
   assert.equal(f.context.results[0].speed, 'Local');
 });

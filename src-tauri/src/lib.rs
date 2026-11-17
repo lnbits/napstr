@@ -1516,8 +1516,9 @@ async fn save_settings(
         let profile_changed = get_setting(&connection, "display_name")? != settings.display_name
             || get_setting(&connection, "profile_about")? != settings.profile_about
             || get_setting(&connection, "profile_picture")? != settings.profile_picture;
+        // Folder changes belong to set_napstr_folder, which also updates the
+        // watcher and index. An older settings snapshot must not undo them.
         for (key, value) in [
-            ("shared_folder", settings.napstr_folder),
             ("nostr_relays", settings.nostr_relays),
             ("display_name", settings.display_name),
             ("profile_about", settings.profile_about),

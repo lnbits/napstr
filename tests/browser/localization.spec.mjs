@@ -303,8 +303,10 @@ for (const app of ['napstr', 'napstrfy']) {
       await expect(page.locator('.track-copy strong').first()).toHaveText('Search');
       await page.locator('.app-nav button').nth(1).click();
       await page.locator('.podcast-open').first().click();
-      await expect(page.locator('.episode-download')).toBeDisabled();
-      await expect(page.locator('.episode-download')).toHaveAttribute('title', 'Downloading');
+      const progress = page.getByRole('progressbar');
+      await expect(progress).toHaveAttribute('aria-valuenow', '20');
+      await expect(progress).toHaveAttribute('aria-valuetext', `${catalogs.ur['Downloading…']} 20%`);
+      await expect(page.locator('button.episode-download')).toHaveCount(0);
     }
     await page.reload();
     await expect(page.locator('html')).toHaveAttribute('lang', 'ur');

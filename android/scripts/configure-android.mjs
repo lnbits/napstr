@@ -1,10 +1,14 @@
-import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 const main = resolve('src-tauri/gen/android/app/src/main');
 const native = resolve('native/android');
 const manifestPath = resolve(main, 'AndroidManifest.xml');
 let manifest = await readFile(manifestPath, 'utf8');
+
+// Android init supplies template launcher resources. Refresh them on every build,
+// including existing generated projects, with the app's complete icon set.
+await cp(resolve('src-tauri/icons/android'), resolve(main, 'res'), { recursive: true });
 
 const internetPermission = '    <uses-permission android:name="android.permission.INTERNET" />';
 const mediaPermissions = [

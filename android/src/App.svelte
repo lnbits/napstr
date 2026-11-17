@@ -1158,8 +1158,15 @@
     error = '';
     try {
       await invoke('podcast_download', { episode });
+      // The worker has started. Keep polling even if this first refresh fails.
+      podcastDownloads = [
+        ...podcastDownloads.filter((download) => download.episode.id !== episode.id),
+        { episode, progress: 0, status: 'Downloading', ready: false }
+      ];
       await refreshPodcastDownloads();
-      notice = msg("{p0} is downloading for offline listening", { p0: episode.title });
+      if (podcastDownloadFor(episode.id)?.status === 'Downloading') {
+        notice = msg("{p0} is downloading for offline listening", { p0: episode.title });
+      }
     } catch (nextError) {
       error = msg("Could not download {p0}: {p1}", { p0: episode.title, p1: String(nextError) });
     }
@@ -1167,7 +1174,16 @@
 
   async function refreshPodcastDownloads() {
     try {
-      podcastDownloads = await invoke<PodcastDownload[]>('podcast_downloads');
+      const downloads = await invoke<PodcastDownload[]>('podcast_downloads');
+      const failed = downloads.find((download) => download.status.startsWith('Failed:')
+        && podcastDownloadFor(download.episode.id)?.status !== download.status);
+      podcastDownloads = downloads;
+      if (failed) {
+        notice = '';
+        error = msg("Could not download {p0}: {p1}", {
+          p0: failed.episode.title, p1: failed.status.slice('Failed:'.length).trim()
+        });
+      }
     } catch { /* the next foreground poll retries */ }
   }
 
@@ -1338,6 +1354,7 @@
           {#each podcastEpisodes as episode (episode.id)}
             {@const download = podcastDownloadFor(episode.id)}
             {@const episodeImage = episode.image || selectedPodcast.image}
+            {@const downloadProgress = Math.max(0, Math.min(100, Math.round(download?.progress || 0)))}
             <article class="episode-row">
               <button class="episode-art" onclick={() => playPodcast(episode)} aria-label={$t("Play {p0}", { p0: episode.title })}>
                 <span class="podcast-art-fallback">◉</span>
@@ -1349,7 +1366,22 @@
                 {#if episode.description}<span>{episode.description}</span>{/if}
                 <small>{podcastDate(episode.datePublished)}{episode.duration ? ` · ${clock(episode.duration)}` : ''}</small>
               </button>
-              <button class:ready={download?.ready} class="episode-download" onclick={() => downloadPodcast(episode)} disabled={download?.status === 'Downloading'} aria-label={$t("Download {p0}", { p0: episode.title })} title={download?.status || $t("Download for offline listening")}>{download?.ready ? '✓' : download?.status === 'Downloading' ? `${Math.round(download.progress)}%` : '⇩'}</button>
+              {#if download?.status === 'Downloading' && !download.ready}
+                <div class="episode-download downloading" role="progressbar" aria-label={$t("Download {p0}", { p0: episode.title })} aria-valuemin="0" aria-valuemax="100" aria-valuenow={downloadProgress} aria-valuetext={`${$t("Downloading…")} ${downloadProgress}%`}>
+                  <svg class="episode-download-ring" viewBox="0 0 36 36" aria-hidden="true">
+                    <circle class="episode-download-track" cx="18" cy="18" r="15" />
+                    <circle class="episode-download-progress" cx="18" cy="18" r="15" pathLength="100" stroke-dasharray="100" stroke-dashoffset={100 - downloadProgress} transform="rotate(-90 18 18)" />
+                  </svg>
+                  <span class="episode-download-label" aria-hidden="true">{downloadProgress}%</span>
+                </div>
+              {:else}
+                <button class:ready={download?.ready} class="episode-download" onclick={() => downloadPodcast(episode)} aria-label={download?.ready ? `${$t("Ready to play")}: ${episode.title}` : $t("Download {p0}", { p0: episode.title })} title={download?.status || $t("Download for offline listening")}>
+                  {#if download?.ready}<span class="episode-download-complete" aria-hidden="true">✓</span>{:else}⇩{/if}
+                </button>
+              {/if}
+              {#if download?.status.startsWith('Failed:')}
+                <p class="episode-download-error" role="alert">{$t(msg("Could not download {p0}: {p1}", { p0: episode.title, p1: download.status.slice('Failed:'.length).trim() }))}</p>
+              {/if}
             </article>
           {/each}
           {#if !podcastLoading && podcastEpisodes.length === 0}<div class="empty-library"><h2>{$t("No playable episodes")}</h2><p>{$t("This feed may not currently expose supported HTTPS audio.")}</p></div>{/if}

@@ -16,7 +16,7 @@
     "bundle:macos": "npm run macos-build",
     "macos-build": "node ../scripts/macos-release.mjs --app napstrfy",
     "macos-build:signed": "node ../scripts/macos-release.mjs --app napstrfy --signed",
-    "android:init": "tauri icon ../src-tauri/icons/icon.png && tauri android init && node scripts/configure-android.mjs",
+    "android:init": "tauri android init && tauri icon ../src-tauri/icons/icon.png && node scripts/configure-android.mjs",
     "android:dev": "node scripts/configure-android.mjs && tauri android dev",
     "android:dev:usb": "node scripts/configure-android.mjs && adb reverse tcp:1421 tcp:1421 && tauri android dev --host 127.0.0.1",
     "android:build": "node scripts/configure-android.mjs && tauri android build",
