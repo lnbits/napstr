@@ -469,14 +469,14 @@
 
   async function refreshLibrarySilently(revision: number) {
     if (silentLibraryRefresh || loading || loadingMore || !status.connected) return;
-    if (showingLikedMusic || query.trim()) {
-      // These views issue a fresh request when the user opens or submits them.
-      loadedLibraryRevision = revision;
-      return;
-    }
     silentLibraryRefresh = true;
     const viewVersion = musicViewVersion;
     try {
+      if (showingLikedMusic || query.trim()) {
+        await refreshTrackAvailability(tracks);
+        if (viewVersion === musicViewVersion) loadedLibraryRevision = revision;
+        return;
+      }
       const page = await invoke<LibraryPage>('remote_library', { query: '', offset: 0, limit: 100 });
       if (viewVersion !== musicViewVersion) return;
       tracks = page.tracks;
@@ -525,7 +525,14 @@
       .finally(() => { if (viewVersion === musicViewVersion) loading = false; });
     const networkSearch = searchingNetwork
       ? invoke<RemoteTrack[]>('remote_search', { query: searchQuery })
-        .then(mergeResults)
+        .then(async (results) => {
+          mergeResults(results);
+          if (viewVersion === musicViewVersion) {
+            // A host download can finish after the search began. Check hashes,
+            // since the publisher's title/filename may differ from local tags.
+            await refreshTrackAvailability(results).catch(() => {});
+          }
+        })
         .catch(failed)
         .finally(() => { if (viewVersion === musicViewVersion) searchingNetwork = false; })
       : Promise.resolve();
@@ -643,6 +650,52 @@
     return `${title} [${book.audiobookId.slice(0, 8)}]`;
   }
 
+  async function refreshTrackAvailability(candidates: RemoteTrack[]) {
+    const viewVersion = musicViewVersion;
+    const endpointId = status.endpointId;
+    const ids = [...new Set(candidates.filter((track) => !track.local).map((track) => track.fileId))];
+    const available = new Set<string>();
+    for (let offset = 0; offset < ids.length; offset += 200) {
+      const batch = ids.slice(offset, offset + 200);
+      const confirmed = await invoke<string[]>('remote_available', { fileIds: batch });
+      for (const fileId of confirmed) if (batch.includes(fileId)) available.add(fileId);
+    }
+    if (viewVersion !== musicViewVersion || endpointId !== status.endpointId) return new Set<string>();
+    const promote = (track: RemoteTrack) => available.has(track.fileId) ? { ...track, local: true } : track;
+    tracks = tracks.map(promote);
+    if (selected) selected = promote(selected);
+    if (selectedAudiobook) selectedAudiobook = { ...selectedAudiobook, chapters: selectedAudiobook.chapters.map(promote) };
+    if (likedMusic.some((track) => !track.local && available.has(track.fileId))) {
+      likedMusic = likedMusic.map(promote);
+      saveLikes(likedMusicKey, likedMusic);
+    }
+    return available;
+  }
+
+  function clearPendingDownload(fileId: string) {
+    const next = new Map(pending);
+    next.delete(fileId);
+    pending = next;
+    const nextAudiobooks = new Map(pendingAudiobooks);
+    nextAudiobooks.delete(fileId);
+    pendingAudiobooks = nextAudiobooks;
+  }
+
+  async function playIfAvailable(track: RemoteTrack, audiobookId: string | null) {
+    const available = await refreshTrackAvailability([track]).catch(() => new Set<string>());
+    if (!available.has(track.fileId)) return false;
+    clearPendingDownload(track.fileId);
+    if (activeMedia === 'music' && selected?.fileId === track.fileId) {
+      const local = { ...track, local: true };
+      if (audiobookId && selectedAudiobook?.audiobookId === audiobookId) {
+        await activateAudiobookChapter(selectedAudiobook, local);
+      } else if (!audiobookId) {
+        await activateTrack(local);
+      }
+    }
+    return true;
+  }
+
   async function requestDownload(
     track: RemoteTrack,
     destinationFolder: string | null = null,
@@ -657,6 +710,7 @@
     if (audiobookId) pendingAudiobooks = new Map(pendingAudiobooks).set(track.fileId, audiobookId);
     error = '';
     try {
+      if (await playIfAvailable(track, audiobookId)) return;
       await invoke<string>('remote_download', {
         fileId: track.fileId,
         sourcePubkeys: track.sources.map((source) => source.pubkey),
@@ -665,12 +719,9 @@
       notice = msg("Napstr is downloading {p0} over Tor", { p0: title(track) });
       await refreshTransfers();
     } catch (nextError) {
-      const next = new Map(pending);
-      next.delete(track.fileId);
-      pending = next;
-      const nextAudiobooks = new Map(pendingAudiobooks);
-      nextAudiobooks.delete(track.fileId);
-      pendingAudiobooks = nextAudiobooks;
+      // Close the race where the host finished between our check and request.
+      if (await playIfAvailable(track, audiobookId)) return;
+      clearPendingDownload(track.fileId);
       error = String(nextError);
     }
   }
@@ -702,8 +753,14 @@
           local = refreshed.chapters.find((item) => item.fileId === pendingFileId && item.local);
           if (selectedAudiobook?.audiobookId === audiobookId) selectedAudiobook = refreshed;
         } else {
-          const page = await invoke<LibraryPage>('remote_library', { query: original?.filename || transfer?.filename || pendingFilename, offset: 0, limit: 20 });
-          local = page.tracks.find((item) => item.fileId === pendingFileId);
+          const available = original ? await refreshTrackAvailability([original]).catch(() => null) : null;
+          if (original && (original.local || available?.has(pendingFileId))) {
+            local = { ...original, local: true };
+          } else if (!available) {
+            // Retain compatibility with hosts predating hash availability.
+            const page = await invoke<LibraryPage>('remote_library', { query: original?.filename || transfer?.filename || pendingFilename, offset: 0, limit: 20 });
+            local = page.tracks.find((item) => item.fileId === pendingFileId);
+          }
         }
         if (!local) continue;
         tracks = tracks.map((item) => item.fileId === pendingFileId ? local : item);

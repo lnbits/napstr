@@ -1,4 +1,4 @@
-name: Build Napstr desktop and Napstrfy Android installers
+name: Build Napstr desktop and Napstrfy mobile installers
 
 on:
   workflow_dispatch:
@@ -403,3 +403,13 @@ jobs:
     uses: ./.github/workflows/daemon.yml
     with:
       release_tag: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+
+  ios:
+    name: Build and attach Napstrfy iPhone package
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    permissions:
+      contents: write
+    uses: ./.github/workflows/napstrfy-ios.yml
+    with:
+      release_tag: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+    secrets: inherit

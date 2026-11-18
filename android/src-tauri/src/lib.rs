@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
     ClientRequest, PairingTicket, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack,
-    RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES,
+    RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_PAGE_SIZE,
 };
 use quick_xml::{events::Event, Reader};
 use serde::{Deserialize, Serialize};
@@ -1643,6 +1643,28 @@ impl RemoteClient {
         })
     }
 
+    async fn available_file_ids(&self, file_ids: Vec<String>) -> Result<Vec<String>, String> {
+        if file_ids.len() > MAX_PAGE_SIZE {
+            return Err("Too many files in availability request".into());
+        }
+        for file_id in &file_ids {
+            validate_file_id(file_id)?;
+        }
+        if file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self
+            .request(ClientRequest::Available { file_ids: file_ids.clone() })
+            .await?
+        {
+            ServerResponse::Available { file_ids: available } => Ok(available
+                .into_iter()
+                .filter(|file_id| file_ids.contains(file_id))
+                .collect()),
+            response => Err(unexpected_response(&response)),
+        }
+    }
+
     async fn reconcile_cache(
         &self,
         media: Arc<MediaServer>,
@@ -1806,6 +1828,14 @@ async fn reconcile_audio_cache(
         .remote
         .reconcile_cache(state.media.clone(), protected)
         .await
+}
+
+#[tauri::command]
+async fn remote_available(
+    file_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    state.remote.available_file_ids(file_ids).await
 }
 
 #[tauri::command]
@@ -2289,6 +2319,7 @@ pub fn run() {
             cached_library,
             reconcile_audio_cache,
             remote_search,
+            remote_available,
             remote_audiobooks,
             remote_audiobook_library,
             remote_audiobook,
@@ -2365,6 +2396,22 @@ mod tests {
                         let mut payload = vec![0; u32::from_be_bytes(length) as usize];
                         receive.read_exact(&mut payload).await.unwrap();
                         let request: ClientRequest = serde_json::from_slice(&payload).unwrap();
+                        if let ClientRequest::Available { ref file_ids } = request {
+                            let response = ServerResponse::Available {
+                                file_ids: file_ids
+                                    .iter()
+                                    .filter(|file_id| **file_id == server_track.file_id)
+                                    .cloned()
+                                    .collect(),
+                            };
+                            let payload = serde_json::to_vec(&response).unwrap();
+                            send.write_all(&(payload.len() as u32).to_be_bytes())
+                                .await
+                                .unwrap();
+                            send.write_all(&payload).await.unwrap();
+                            send.finish().unwrap();
+                            continue;
+                        }
                         let ClientRequest::FetchAudio { file_id } = request else {
                             panic!("read-only playback requested a host operation: {request:?}");
                         };
@@ -2391,6 +2438,19 @@ mod tests {
                     stream_only: true,
                 });
                 *remote.connection.write().await = Some(connection);
+                assert_eq!(
+                    remote
+                        .available_file_ids(vec![track.file_id.clone(), "0".repeat(64)])
+                        .await
+                        .unwrap(),
+                    vec![track.file_id.clone()]
+                );
+                assert!(remote.available_file_ids(Vec::new()).await.unwrap().is_empty());
+                assert!(remote.available_file_ids(vec!["../secret".into()]).await.is_err());
+                assert!(remote
+                    .available_file_ids(vec![track.file_id.clone(); MAX_PAGE_SIZE + 1])
+                    .await
+                    .is_err());
                 let media = MediaServer::start().unwrap();
                 let playback = remote
                     .cache_audio(track.clone(), media.clone(), true)

@@ -261,6 +261,48 @@ struct SessionGrant {
     _onion_lease: Option<Arc<OnionLease>>,
 }
 
+fn register_offer(
+    grants: &mut HashMap<String, SessionGrant>,
+    onion_lease: Arc<OnionLease>,
+    request_id: String,
+    file_id: String,
+    requester: String,
+) -> Result<DownloadOffer, String> {
+    let now = Utc::now().timestamp();
+    // Old services cannot accept these offers after Tor restarts.
+    grants.retain(|_, grant| {
+        grant.expires_at > now
+            && grant._onion_lease.as_ref().is_some_and(|lease| Arc::ptr_eq(lease, &onion_lease))
+    });
+    if grants.len() >= 64 {
+        return Err("this peer is already serving the maximum number of private offers".into());
+    }
+    if grants.values().any(|grant| grant.file_id == file_id && grant.requester == requester) {
+        return Err("an offer for this requester and file is already active".into());
+    }
+    let mut random = [0u8; 32];
+    rand::rng().fill_bytes(&mut random);
+    let capability = hex::encode(random);
+    let expires_at = now + 15 * 60;
+    grants.insert(
+        capability_key(&capability),
+        SessionGrant {
+            file_id: file_id.clone(),
+            requester,
+            expires_at,
+            _onion_lease: Some(onion_lease.clone()),
+        },
+    );
+    Ok(DownloadOffer {
+        request_id,
+        file_id,
+        onion: onion_lease.onion.clone(),
+        port: 80,
+        capability,
+        expires_at,
+    })
+}
+
 struct ListenerRuntime {
     port: u16,
     _task: JoinHandle<()>,
@@ -332,12 +374,18 @@ impl TransferService {
     }
 
     pub async fn warm_for_sharing(&self) -> Result<(), String> {
-        let port = self.ensure_listener().await?;
         let mut session_onion = self.session_onion.lock().await;
-        if session_onion.is_none() {
-            *session_onion = Some(self.tor.create_onion(port).await?);
-        }
-        Ok(())
+        self.sharing_onion(&mut session_onion).await.map(|_| ())
+    }
+
+    async fn sharing_onion(
+        &self,
+        session_onion: &mut Option<Arc<OnionLease>>,
+    ) -> Result<Arc<OnionLease>, String> {
+        let port = self.ensure_listener().await?;
+        let lease = self.tor.ensure_onion(port, session_onion.as_ref()).await?;
+        *session_onion = Some(lease.clone());
+        Ok(lease)
     }
 
     pub async fn create_offer(
@@ -370,62 +418,25 @@ impl TransferService {
         };
         crate::audio::validate_audio(Path::new(&path))
             .map_err(|error| format!("shared file failed the audio-only policy: {error}"))?;
-        {
-            let now = Utc::now().timestamp();
-            let mut grants = self.grants.write().await;
-            grants.retain(|_, grant| grant.expires_at > now);
-            if grants.len() >= 64 {
-                return Err(
-                    "this peer is already serving the maximum number of private offers".into(),
-                );
-            }
-            if grants
-                .values()
-                .any(|grant| grant.file_id == file_id && grant.requester == requester)
-            {
-                return Err("an offer for this requester and file is already active".into());
-            }
-        }
-
-        let port = self.ensure_listener().await?;
-        let onion_lease = {
-            let mut session_onion = self.session_onion.lock().await;
-            if session_onion.is_none() {
-                *session_onion = Some(self.tor.create_onion(port).await?);
-            }
-            session_onion
-                .as_ref()
-                .cloned()
-                .ok_or("Tor session onion disappeared")?
-        };
-        let mut random = [0u8; 32];
-        rand::rng().fill_bytes(&mut random);
-        let capability = hex::encode(random);
-        let key = capability_key(&capability);
-        let expires_at = Utc::now().timestamp() + 15 * 60;
-        self.grants.write().await.insert(
-            key,
-            SessionGrant {
-                file_id: file_id.clone(),
-                requester,
-                expires_at,
-                _onion_lease: Some(onion_lease.clone()),
-            },
-        );
+        // Keep service replacement and offer registration in the same critical
+        // section: an older request must never prune a newer service's grants.
+        let mut session_onion = self.session_onion.lock().await;
+        let onion_lease = self.sharing_onion(&mut session_onion).await?;
+        let offer = register_offer(
+            &mut *self.grants.write().await,
+            onion_lease,
+            request_id,
+            file_id,
+            requester,
+        )?;
+        drop(session_onion);
         let grants = self.grants.clone();
-        let expiring_key = capability_key(&capability);
+        let expiring_key = capability_key(&offer.capability);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(15 * 60 + 1)).await;
             grants.write().await.remove(&expiring_key);
         });
-        Ok(DownloadOffer {
-            request_id,
-            file_id,
-            onion: onion_lease.onion.clone(),
-            port: 80,
-            capability,
-            expires_at,
-        })
+        Ok(offer)
     }
 
     async fn ensure_listener(&self) -> Result<u16, String> {
@@ -1133,6 +1144,31 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use tokio::io::{duplex, DuplexStream};
+
+    #[tokio::test]
+    async fn service_replacement_releases_old_offers_but_preserves_current_limits() {
+        let control = crate::tor::tests::TestControl::start().await;
+        let first = control.lease(uuid::Uuid::new_v4(), None).await.unwrap();
+        let replacement = control.lease(uuid::Uuid::new_v4(), Some(&first)).await.unwrap();
+        let mut grants = HashMap::new();
+        let issue = |grants: &mut HashMap<String, SessionGrant>, lease, file: &str| {
+            register_offer(grants, lease, "request".into(), file.into(), "requester".into())
+        };
+        let old = issue(&mut grants, first.clone(), "song").unwrap();
+        assert!(issue(&mut grants, first, "song").is_err());
+        let fresh = issue(&mut grants, replacement.clone(), "song").unwrap();
+        assert_eq!(grants.len(), 1);
+        assert!(!grants.contains_key(&capability_key(&old.capability)));
+        assert!(grants.contains_key(&capability_key(&fresh.capability)));
+        assert!(issue(&mut grants, replacement.clone(), "song").is_err());
+        for index in 1..64 {
+            issue(&mut grants, replacement.clone(), &format!("song-{index}")).unwrap();
+        }
+        assert!(issue(&mut grants, replacement.clone(), "overflow").is_err());
+        grants.get_mut(&capability_key(&fresh.capability)).unwrap().expires_at = 0;
+        assert!(issue(&mut grants, replacement, "song").is_ok());
+        assert_eq!(grants.len(), 64);
+    }
 
     #[test]
     fn cancellation_during_file_creation_cleans_up() {

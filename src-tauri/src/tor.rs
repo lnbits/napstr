@@ -19,6 +19,7 @@ use tokio_socks::tcp::Socks5Stream;
 use tokio_util::sync::CancellationToken;
 
 struct RunningTor {
+    generation: uuid::Uuid,
     child: Child,
     socks_port: u16,
     control_port: u16,
@@ -28,7 +29,9 @@ struct RunningTor {
 
 pub struct OnionLease {
     pub onion: String,
-    _control: TcpStream,
+    generation: uuid::Uuid,
+    target_port: u16,
+    control: Mutex<TcpStream>,
 }
 
 pub struct TorManager {
@@ -214,6 +217,7 @@ impl TorManager {
             let (cookie, control_port, socks_port) = ready
                 .ok_or_else(|| "Tor did not complete bootstrap within 120 seconds".to_string())?;
             *guard = Some(RunningTor {
+                generation: uuid::Uuid::new_v4(),
                 child,
                 socks_port,
                 control_port,
@@ -277,34 +281,27 @@ impl TorManager {
     }
 
     pub async fn create_onion(&self, target_port: u16) -> Result<Arc<OnionLease>, String> {
+        self.ensure_onion(target_port, None).await
+    }
+
+    pub async fn ensure_onion(
+        &self,
+        target_port: u16,
+        cached: Option<&Arc<OnionLease>>,
+    ) -> Result<Arc<OnionLease>, String> {
         self.start().await?;
-        let (control_port, cookie) = {
-            let guard = self.runtime.lock().await;
-            let runtime = guard.as_ref().ok_or("Tor runtime disappeared")?;
-            (runtime.control_port, runtime.cookie.clone())
-        };
-        let mut stream = TcpStream::connect(("127.0.0.1", control_port))
-            .await
-            .map_err(|error| error.to_string())?;
-        control_command(
-            &mut stream,
-            &format!("AUTHENTICATE {}", hex::encode(cookie)),
+        // Keep stop/restart from replacing the runtime during the control check
+        // or ADD_ONION. Every newly bootstrapped process gets a fresh generation.
+        let guard = self.runtime.lock().await;
+        let runtime = guard.as_ref().ok_or("Tor runtime disappeared")?;
+        ensure_runtime_onion(
+            runtime.generation,
+            runtime.control_port,
+            &runtime.cookie,
+            target_port,
+            cached,
         )
-        .await?;
-        let response = control_command(
-            &mut stream,
-            &format!("ADD_ONION NEW:BEST Flags=DiscardPK Port=80,127.0.0.1:{target_port}"),
-        )
-        .await?;
-        let service_id = response
-            .iter()
-            .find_map(|line| line.strip_prefix("250-ServiceID="))
-            .ok_or("Tor did not return a ServiceID")?
-            .to_string();
-        Ok(Arc::new(OnionLease {
-            onion: format!("{service_id}.onion"),
-            _control: stream,
-        }))
+        .await
     }
 
     pub async fn connect_onion(
@@ -452,6 +449,57 @@ fn bootstrap_progress(lines: &[String]) -> Option<u8> {
     })
 }
 
+async fn ensure_runtime_onion(
+    generation: uuid::Uuid,
+    control_port: u16,
+    cookie: &[u8],
+    target_port: u16,
+    cached: Option<&Arc<OnionLease>>,
+) -> Result<Arc<OnionLease>, String> {
+    if let Some(lease) = cached.filter(|lease| {
+        lease.generation == generation && lease.target_port == target_port
+    }) {
+        // This connection owns the ephemeral service. A live process alone is
+        // insufficient: losing the control connection also deletes the onion.
+        let alive = timeout(Duration::from_secs(3), async {
+            let mut control = lease.control.lock().await;
+            control_command(&mut control, "GETINFO version").await
+        })
+        .await;
+        if matches!(alive, Ok(Ok(_))) {
+            return Ok(lease.clone());
+        }
+    }
+
+    timeout(Duration::from_secs(5), async {
+        let mut stream = TcpStream::connect(("127.0.0.1", control_port))
+            .await
+            .map_err(|error| error.to_string())?;
+        control_command(&mut stream, &format!("AUTHENTICATE {}", hex::encode(cookie))).await?;
+        let response = control_command(
+            &mut stream,
+            &format!("ADD_ONION NEW:BEST Flags=DiscardPK Port=80,127.0.0.1:{target_port}"),
+        )
+        .await?;
+        let service_id = response
+            .iter()
+            .find_map(|line| line.strip_prefix("250-ServiceID="))
+            .ok_or("Tor did not return a ServiceID")?;
+        let onion = format!("{service_id}.onion");
+        if !is_v3_onion(&onion) {
+            return Err("Tor returned an invalid onion service address".into());
+        }
+        Ok(Arc::new(OnionLease {
+            onion,
+            generation,
+            target_port,
+            control: Mutex::new(stream),
+        }))
+    })
+    .await
+    .map_err(|_| "Tor onion service creation timed out".to_string())?
+}
+
 async fn control_command(stream: &mut TcpStream, command: &str) -> Result<Vec<String>, String> {
     stream
         .write_all(format!("{command}\r\n").as_bytes())
@@ -519,10 +567,140 @@ fn prepend_library_path(command: &mut Command, directory: &Path) {
 fn prepend_library_path(_command: &mut Command, _directory: &Path) {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
+
+    // A local control-protocol fixture exercises connection ownership without
+    // a Tor binary, public network access, or real keys.
+    pub(crate) struct TestControl {
+        port: u16,
+        created: Arc<std::sync::atomic::AtomicUsize>,
+        reject_creation: Arc<AtomicBool>,
+        stall_probe: Arc<AtomicBool>,
+        connections: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+        listener: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestControl {
+        pub(crate) async fn start() -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let reject_creation = Arc::new(AtomicBool::new(false));
+            let stall_probe = Arc::new(AtomicBool::new(false));
+            let connections = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (count, reject, stall, clients) = (
+                created.clone(), reject_creation.clone(), stall_probe.clone(), connections.clone(),
+            );
+            let listener = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (count, reject, stall) = (count.clone(), reject.clone(), stall.clone());
+                    let task = tokio::spawn(async move {
+                        let mut stream = BufReader::new(stream);
+                        loop {
+                            let mut command = String::new();
+                            if !matches!(stream.read_line(&mut command).await, Ok(n) if n > 0) {
+                                break;
+                            }
+                            let response = if command.starts_with("AUTHENTICATE ") {
+                                "250 OK\r\n".to_string()
+                            } else if command.starts_with("ADD_ONION ") {
+                                if reject.load(Ordering::SeqCst) {
+                                    "551 creation failed\r\n".to_string()
+                                } else {
+                                    let n = count.fetch_add(1, Ordering::SeqCst);
+                                    let id = char::from(b'a' + n as u8).to_string().repeat(56);
+                                    format!("250-ServiceID={id}\r\n250 OK\r\n")
+                                }
+                            } else if command.trim() == "GETINFO version" {
+                                if stall.load(Ordering::SeqCst) { continue; }
+                                "250-version=test\r\n250 OK\r\n".to_string()
+                            } else {
+                                panic!("unexpected test control command");
+                            };
+                            if stream.get_mut().write_all(response.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    clients.lock().unwrap().push(task.abort_handle());
+                }
+            });
+            Self { port, created, reject_creation, stall_probe, connections, listener }
+        }
+
+        fn disconnect_services(&self) {
+            for connection in self.connections.lock().unwrap().drain(..) {
+                connection.abort();
+            }
+        }
+
+        pub(crate) async fn lease(&self, generation: uuid::Uuid, cached: Option<&Arc<OnionLease>>) -> Result<Arc<OnionLease>, String> {
+            ensure_runtime_onion(generation, self.port, b"test-cookie", 12345, cached).await
+        }
+    }
+
+    impl Drop for TestControl {
+        fn drop(&mut self) {
+            self.listener.abort();
+            self.disconnect_services();
+        }
+    }
+
+    #[tokio::test]
+    async fn onion_cache_reuses_live_service_but_not_a_previous_tor_generation() {
+        let control = TestControl::start().await;
+        let generation = uuid::Uuid::new_v4();
+        let first = control.lease(generation, None).await.unwrap();
+        let reused = control.lease(generation, Some(&first)).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert_eq!(control.created.load(Ordering::SeqCst), 1);
+        // Even if an old TCP socket still appears live, it belongs to the old
+        // process. Reusing a control port must not make its onion valid again.
+        let restarted = control.lease(uuid::Uuid::new_v4(), Some(&first)).await.unwrap();
+        assert_ne!(first.onion, restarted.onion);
+        assert!(!Arc::ptr_eq(&first, &restarted));
+        assert_eq!(control.created.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn onion_cache_replaces_a_lost_control_connection() {
+        let control = TestControl::start().await;
+        let generation = uuid::Uuid::new_v4();
+        let first = control.lease(generation, None).await.unwrap();
+        control.disconnect_services();
+        let replacement = control.lease(generation, Some(&first)).await.unwrap();
+        assert_ne!(first.onion, replacement.onion);
+        let reused = control.lease(generation, Some(&replacement)).await.unwrap();
+        assert!(Arc::ptr_eq(&replacement, &reused));
+        assert_eq!(control.created.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn onion_cache_never_falls_back_to_a_dead_service_when_creation_fails() {
+        let control = TestControl::start().await;
+        let generation = uuid::Uuid::new_v4();
+        let first = control.lease(generation, None).await.unwrap();
+        control.disconnect_services();
+        control.reject_creation.store(true, Ordering::SeqCst);
+        assert!(control.lease(generation, Some(&first)).await.is_err());
+        control.reject_creation.store(false, Ordering::SeqCst);
+        let replacement = control.lease(generation, Some(&first)).await.unwrap();
+        assert_ne!(first.onion, replacement.onion);
+    }
+
+    #[tokio::test]
+    async fn onion_cache_probe_has_a_deadline() {
+        let control = TestControl::start().await;
+        let generation = uuid::Uuid::new_v4();
+        let first = control.lease(generation, None).await.unwrap();
+        control.stall_probe.store(true, Ordering::SeqCst);
+        let replacement = timeout(Duration::from_secs(6), control.lease(generation, Some(&first)))
+            .await.unwrap().unwrap();
+        assert_ne!(first.onion, replacement.onion);
+    }
 
     #[test]
     fn accepts_only_v3_onion_hostnames() {
@@ -530,6 +708,46 @@ mod tests {
         assert!(!is_v3_onion("example.com"));
         assert!(!is_v3_onion("short.onion"));
         assert!(!is_v3_onion(&format!("{}.onion.example", "a".repeat(56))));
+    }
+
+    #[tokio::test]
+    async fn rejects_ssrf_destinations_before_starting_tor() {
+        let directory = std::env::temp_dir().join(format!("napstr-ssrf-test-{}", uuid::Uuid::new_v4()));
+        let tor = TorManager::new(directory.clone(), directory.clone());
+        let onion = format!("{}.onion", "a".repeat(56));
+        let destinations = [
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+            "10.0.0.1".to_string(),
+            "192.168.1.1".to_string(),
+            "169.254.169.254".to_string(),
+            "::1".to_string(),
+            "[::ffff:127.0.0.1]".to_string(),
+            "2130706433".to_string(),
+            "0x7f000001".to_string(),
+            "example.com".to_string(),
+            format!("http://{onion}"),
+            format!("{onion}.example.com"),
+            format!("{onion}@127.0.0.1"),
+            format!("127.0.0.1@{onion}"),
+            format!("{onion}:80"),
+            format!("{onion}/path"),
+            format!("{onion}.exit"),
+            format!("{onion}\0.example.com"),
+            format!("{onion}\r\nGET / HTTP/1.1"),
+            format!("{}.onion", "a".repeat(55)),
+            format!("{}.onion", "0".repeat(56)),
+        ];
+        for destination in destinations {
+            let result = timeout(Duration::from_secs(1), tor.connect_onion(&destination, 80))
+                .await
+                .expect("invalid destination reached Tor startup");
+            assert!(matches!(result, Err(ref error) if error ==
+                "refusing a destination that is not a valid Tor v3 onion"),
+                "destination was not rejected: {destination:?}");
+        }
+        assert!(tor.runtime.lock().await.is_none());
+        assert!(!directory.exists());
     }
 
     #[test]

@@ -43,7 +43,9 @@ export async function loadLatestRelease(t, locale) {
       'macos-intel': safeAssets.find((asset) =>
         /\.dmg$/i.test(asset.name) && /(x86_64|x64|amd64|intel)/i.test(asset.name)
       ),
-      'napstrfy-android': safeAssets.find((asset) => /\.apk$/i.test(asset.name))
+      'napstrfy-android': safeAssets.find((asset) => /\.apk$/i.test(asset.name)),
+      'napstrfy-ios': safeAssets.find((asset) => /\.ipa$/i.test(asset.name) && !/unsigned/i.test(asset.name))
+        || safeAssets.find((asset) => /\.ipa$/i.test(asset.name))
     };
   }
 
@@ -51,6 +53,7 @@ export async function loadLatestRelease(t, locale) {
     if (!asset) return false;
     document.querySelectorAll(`[data-release-platform="${platform}"]`).forEach((link) => {
       link.href = asset.browser_download_url;
+      if (platform === 'napstrfy-ios') link.textContent = /unsigned/i.test(asset.name) ? t('Download unsigned IPA') : t('Download IPA');
       link.removeAttribute('aria-disabled');
       link.title = `${asset.name} — ${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(asset.size / 1024 / 1024)} MB`;
     });
@@ -94,7 +97,7 @@ export async function loadLatestRelease(t, locale) {
       });
       const napstrfyPage = document.body.dataset.releaseProduct === 'napstrfy';
       const expectedPlatforms = napstrfyPage
-        ? ['windows', 'linux', 'macos-arm64', 'macos-intel', 'napstrfy-android']
+        ? ['windows', 'linux', 'macos-arm64', 'macos-intel', 'napstrfy-android', 'napstrfy-ios']
         : ['windows', 'linux', 'macos-arm64', 'macos-intel'];
       const available = Object.entries(matched)
         .filter(([platform, asset]) => expectedPlatforms.includes(platform) && enableLinks(platform, asset))

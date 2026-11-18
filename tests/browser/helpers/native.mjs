@@ -41,6 +41,7 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'cached_library': return { ...status(), tracks: paired ? [track] : [], total: paired ? 1 : 0 };
           case 'remote_library': return { tracks: [track], total: 1 };
           case 'remote_search': if (window.searchError) throw window.searchError; return [track];
+          case 'remote_available': return [];
           case 'remote_transfers': return [{ ...transfers[1], fileId: track.fileId }];
           case 'reconcile_audio_cache': return true;
           case 'cache_remote_audio': return { url: location.origin + (window.nextMediaSource || '/fixture.wav'), track: args.track };

@@ -20,10 +20,11 @@
     "android:dev": "node scripts/configure-android.mjs && tauri android dev",
     "android:dev:usb": "node scripts/configure-android.mjs && adb reverse tcp:1421 tcp:1421 && tauri android dev --host 127.0.0.1",
     "android:build": "node scripts/configure-android.mjs && tauri android build",
-    "ios:init": "tauri icon ../src-tauri/icons/icon.png && tauri ios init",
+    "ios:init": "tauri ios init --ci && node scripts/ios-release.mjs prepare",
     "ios:dev": "tauri ios dev",
     "ios:build": "tauri ios build",
-    "test": "npm --prefix .. test"
+    "test": "npm --prefix .. test",
+    "ios:package": "bash scripts/package-ios.sh"
   },
   "dependencies": {
     "@napstr/i18n": "file:../shared/i18n",
@@ -35,6 +36,7 @@
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
     "@tauri-apps/cli": "^2.3.1",
     "@types/node": "^22.0.0",
+    "pngjs": "7.0.0",
     "svelte": "^5.20.0",
     "svelte-check": "^4.1.0",
     "typescript": "^5.7.0",

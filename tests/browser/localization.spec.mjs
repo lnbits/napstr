@@ -423,10 +423,10 @@ test('Napstrfy downloads follow newly published assets and keep unavailable clie
   await expect(page.locator('[data-release-platform="napstrfy-android"]')).toHaveAttribute('href', /Napstrfy_0.2.1_android.apk$/);
   await expect(page.locator('#release-status')).toContainText('some installers are not available');
   version = '0.2.2';
-  clients = ['android.apk', 'x64.exe', 'amd64.AppImage', 'aarch64.dmg', 'x64.dmg'];
+  clients = ['android.apk', 'x64.exe', 'amd64.AppImage', 'aarch64.dmg', 'x64.dmg', 'ios.ipa'];
   await page.reload();
   await expect(page.locator('#release-status')).toHaveText('Napstrfy 0.2.2 downloads are ready.');
-  for (const [platform, file] of Object.entries({ windows: 'x64.exe', linux: 'amd64.AppImage', 'macos-arm64': 'aarch64.dmg', 'macos-intel': 'x64.dmg', 'napstrfy-android': 'android.apk' })) {
+  for (const [platform, file] of Object.entries({ windows: 'x64.exe', linux: 'amd64.AppImage', 'macos-arm64': 'aarch64.dmg', 'macos-intel': 'x64.dmg', 'napstrfy-android': 'android.apk', 'napstrfy-ios': 'ios.ipa' })) {
     await expect(page.locator(`[data-release-platform="${platform}"]`)).toHaveAttribute('href', `https://github.com/lnbits/napstr/releases/download/v0.2.2/Napstrfy_0.2.2_${file}`);
     await expect(page.locator(`[data-release-version="${platform}"]`)).toHaveText('0.2.2');
   }
@@ -463,4 +463,25 @@ test('switching language during playback preserves audio and updates Android med
   expect(await page.locator('audio').evaluate((audio) => audio.paused)).toBe(false);
   await expect(page.locator('audio')).toHaveAttribute('src', source);
   expect(await page.evaluate(() => window.calls.filter((call) => call.cmd === 'cache_remote_audio').length)).toBe(1);
+});
+
+test('Napstrfy labels unsigned iOS packages and prefers a signed IPA when available', async ({ page }) => {
+  let names = ['Napstr_1.2.3_ios.ipa', 'Napstrfy_1.2.3_ios-unsigned.ipa'];
+  await page.route('https://api.github.com/**', (route) => route.fulfill({ json: {
+    tag_name: 'v1.2.3', assets: names.map((name) => ({ name, size: 1024,
+      browser_download_url: `https://github.com/lnbits/napstr/releases/download/v1.2.3/${name}` }))
+  } }));
+  await page.goto('http://127.0.0.1:15175/napstrfy.html');
+  const link = page.locator('[data-release-platform="napstrfy-ios"]');
+  await expect(link).toHaveText('Download unsigned IPA');
+  await expect(link).toHaveAttribute('href', /Napstrfy_1.2.3_ios-unsigned.ipa$/);
+  await expect(page.getByText('IPA installation requires suitable signing and provisioning. This is not an App Store or TestFlight link.')).toBeVisible();
+  names.push('Napstrfy_1.2.3_ios.ipa');
+  await page.reload();
+  await expect(link).toHaveText('Download IPA');
+  await expect(link).toHaveAttribute('href', /Napstrfy_1.2.3_ios.ipa$/);
+  names = ['Napstr_1.2.3_ios.ipa'];
+  await page.reload();
+  await expect(link).toHaveAttribute('aria-disabled', 'true');
+  await expect(link).not.toHaveAttribute('href');
 });

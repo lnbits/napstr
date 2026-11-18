@@ -35,3 +35,13 @@ chrono = { version = "0.4", default-features = false }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2.4.5"
+
+# Narrow iOS fixes; see vendor/README.md for provenance and patch details.
+[patch.crates-io]
+hickory-resolver = { path = "vendor/hickory-resolver-0.26.1" }
+netwatch = { path = "vendor/netwatch-0.19.3" }
+netdev = { path = "vendor/netdev-0.46.1" }
+
+[dev-dependencies]
+hickory-resolver = { version = "=0.26.1", default-features = false }
+hickory-proto = { version = "=0.26.1", default-features = false }

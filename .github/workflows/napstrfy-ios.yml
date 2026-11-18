@@ -1,0 +1,131 @@
+name: Build Napstrfy iOS package
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        required: true
+  pull_request:
+    paths:
+      - 'android/**'
+      - 'remote-protocol/**'
+      - 'shared/i18n/**'
+      - 'src-tauri/icons/icon.png'
+      - '.github/workflows/napstrfy-ios.yml'
+      - 'tests/ios-release.test.mjs'
+
+# Builds are read-only; only the release attachment job can write release assets.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: android
+        shell: bash
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+      APPLE_DEVELOPMENT_TEAM: ${{ github.event_name != 'pull_request' && secrets.APPLE_TEAM_ID || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: android/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android/src-tauri -> target
+          key: napstrfy-ios
+      - run: npm ci
+      - run: npm run check
+      - name: Test iOS packaging helpers
+        run: |
+          node --test ../tests/ios-release.test.mjs
+          python3 -B -m unittest discover -s scripts -p 'test_ios_release.py'
+      - name: Configure iOS version and build number
+        run: |
+          if [[ -n "$RELEASE_TAG" && ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo 'Invalid release tag' >&2
+            exit 1
+          fi
+          node scripts/ios-release.mjs version
+      - name: Install Xcode tooling
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+      - name: Test the iOS DNS bridge against Apple SDK headers
+        run: |
+          xcrun clang -Wall -Wextra -Werror scripts/test-ios-dns.c -o "$RUNNER_TEMP/napstrfy-ios-dns-test"
+          "$RUNNER_TEMP/napstrfy-ios-dns-test"
+      - name: Generate iPhone project and Napstrfy icons
+        run: |
+          if [[ -z "$APPLE_DEVELOPMENT_TEAM" ]]; then unset APPLE_DEVELOPMENT_TEAM; fi
+          npm run ios:init
+      - name: Build unsigned package for pull requests
+        if: github.event_name == 'pull_request'
+        run: npm run ios:package -- --unsigned
+      - name: Build iPhone package (signed when credentials are configured)
+        if: github.event_name != 'pull_request'
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+          IOS_EXPORT_METHOD: ${{ vars.IOS_EXPORT_METHOD || 'app-store-connect' }}
+        run: npm run ios:package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Napstrfy-iOS${{ github.event_name == 'pull_request' && '-unsigned' || '' }}
+          path: android/ios-installers/
+          if-no-files-found: error
+
+  release:
+    name: Attach iPhone package to release
+    needs: build
+    if: github.event_name != 'pull_request' && (inputs.release_tag != '' || github.ref_type == 'tag')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Napstrfy-iOS
+          path: installers
+      - name: Verify package checksum
+        working-directory: installers
+        shell: bash
+        run: |
+          shopt -s nullglob
+          packages=(Napstrfy_*.ipa)
+          checksums=(Napstrfy_*.ipa.sha256)
+          if [[ ${#packages[@]} -ne 1 || ${#checksums[@]} -ne 1 || "${checksums[0]}" != "${packages[0]}.sha256" ]]; then
+            echo 'Expected one iOS package and its checksum' >&2
+            exit 1
+          fi
+          sha256sum --check --strict "${checksums[0]}"
+      - name: Attach IPA and checksum to GitHub release
+        working-directory: installers
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            create_args=(release create "$RELEASE_TAG" --target "$GITHUB_SHA" --draft --title "Napstr $RELEASE_TAG" --notes "Napstr installers and Napstrfy companion packages.")
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              create_args+=(--prerelease)
+            fi
+            gh "${create_args[@]}" || gh release view "$RELEASE_TAG" >/dev/null
+          fi
+          gh release upload "$RELEASE_TAG" Napstrfy_*.ipa Napstrfy_*.ipa.sha256 --clobber

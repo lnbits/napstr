@@ -18,3 +18,6 @@ test-results/
 playwright-report/
 
 .env.macos-release
+
+android/src-tauri/tauri.ios.ci.conf.json
+android/ios-installers/
